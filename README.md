@@ -1,5 +1,8 @@
 # SMDA
 
+[![x86_64](https://github.com/marirs/smda-rs/actions/workflows/linux_x86-64.yml/badge.svg)](https://github.com/marirs/smda-rs/actions/workflows/linux_x86-64.yml)
+[![Arm7](https://github.com/marirs/smda-rs/actions/workflows/linux_arm7.yml/badge.svg)](https://github.com/marirs/smda-rs/actions/workflows/linux_arm7.yml)
+
 SMDA is a minimalist recursive disassembler library that is 
 optimized for accurate Control Flow Graph (CFG) recovery 
 from memory dumps. It is based on Capstone and currently 
