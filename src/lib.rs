@@ -2,6 +2,7 @@
 #[macro_use]
 extern crate maplit;
 
+mod elf;
 pub mod function;
 mod function_analysis_state;
 mod function_candidate;
@@ -12,7 +13,6 @@ mod label_provider;
 mod label_providers;
 mod mnemonic_tf_idf;
 mod pe;
-mod elf;
 pub mod report;
 mod statistics;
 mod tail_call_analyser;
@@ -30,7 +30,7 @@ use mnemonic_tf_idf::MnemonicTfIdf;
 use regex::bytes::Regex;
 use report::DisassemblyReport;
 use ring::digest::{Context, SHA256};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     convert::TryInto,
@@ -648,7 +648,11 @@ impl Disassembler {
                     .iter()
                     .map(|s| {
                         (
-                            if let Some(ss) = elf.shdr_strtab.get_at(s.sh_name) {ss.to_string()} else {"..".to_string()},
+                            if let Some(ss) = elf.shdr_strtab.get_at(s.sh_name) {
+                                ss.to_string()
+                            } else {
+                                "..".to_string()
+                            },
                             s.sh_addr as u64,
                             s.sh_size as usize,
                         )
@@ -727,7 +731,7 @@ impl Disassembler {
         // binary_info.binary_size, binary_info.base_addr)
         self.update_label_providers(&bin)?;
         self.disassembly.init(bin)?;
-        if ![32u32, 64u32].contains(&self.disassembly.binary_info.bitness){
+        if ![32u32, 64u32].contains(&self.disassembly.binary_info.bitness) {
             self.disassembly.binary_info.bitness = self.determine_bitness()?;
         }
         self.tailcall_analyzer.init()?;
