@@ -2,27 +2,27 @@ use crate::{DisassemblyResult, Result};
 
 #[derive(Debug)]
 pub struct DisassemblyStatistics {
-    num_functions: usize,
-    num_recursive_functions: usize,
-    num_leaf_functions: usize,
-    num_basic_blocks: usize,
-    num_instructions: usize,
-    num_api_calls: usize,
-    num_function_calls: usize,
-    num_failed_functions: usize,
+    _num_functions: usize,
+    _num_recursive_functions: usize,
+    _num_leaf_functions: usize,
+    _num_basic_blocks: usize,
+    _num_instructions: usize,
+    _num_api_calls: usize,
+    _num_function_calls: usize,
+    _num_failed_functions: usize,
 }
 
 impl DisassemblyStatistics {
     pub fn new(disassembly_result: &mut DisassemblyResult) -> Result<DisassemblyStatistics> {
         Ok(DisassemblyStatistics {
-            num_functions: disassembly_result.functions.len(),
-            num_recursive_functions: disassembly_result.recursive_functions.len(),
-            num_leaf_functions: disassembly_result.leaf_functions.len(),
-            num_basic_blocks: DisassemblyStatistics::count_blocks(disassembly_result)?,
-            num_instructions: DisassemblyStatistics::count_instructions(disassembly_result)?,
-            num_api_calls: DisassemblyStatistics::count_api_calls(disassembly_result)?,
-            num_function_calls: DisassemblyStatistics::count_function_calls(disassembly_result)?,
-            num_failed_functions: disassembly_result.failed_analysis_addr.len(),
+            _num_functions: disassembly_result.functions.len(),
+            _num_recursive_functions: disassembly_result.recursive_functions.len(),
+            _num_leaf_functions: disassembly_result.leaf_functions.len(),
+            _num_basic_blocks: DisassemblyStatistics::count_blocks(disassembly_result)?,
+            _num_instructions: DisassemblyStatistics::count_instructions(disassembly_result)?,
+            _num_api_calls: DisassemblyStatistics::count_api_calls(disassembly_result)?,
+            _num_function_calls: DisassemblyStatistics::count_function_calls(disassembly_result)?,
+            _num_failed_functions: disassembly_result.failed_analysis_addr.len(),
         })
     }
 

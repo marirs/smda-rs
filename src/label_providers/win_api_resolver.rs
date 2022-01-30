@@ -61,8 +61,10 @@ impl OrdinalHelper {
     }
 }
 
-static API_COLLECTION_FILES: &[&(&str, &str)] =
-    &[&("win_7", "assets/apiscout_win7_prof-n_sp1.json")];
+static API_COLLECTION_FILES: &[&(&str, &str)] = &[&(
+    "win_7",
+    include_str!("../../assets/apiscout_win7_prof-n_sp1.json"),
+)];
 
 #[derive(Debug)]
 pub struct WinApiResolver {
@@ -84,8 +86,8 @@ impl WinApiResolver {
         };
         war.api_map
             .insert("lief".to_string(), std::collections::HashMap::new());
-        for (os_n, db_filepath) in API_COLLECTION_FILES {
-            war.load_db_file(os_n, db_filepath)?;
+        for (os_n, contents) in API_COLLECTION_FILES {
+            war.load_db(os_n, contents)?;
             war.os_name = Some(os_n.to_string());
         }
         Ok(war)
@@ -121,8 +123,7 @@ impl WinApiResolver {
         Ok(())
     }
 
-    pub fn load_db_file(&mut self, os_name: &str, db_filepath: &str) -> Result<()> {
-        let data = std::fs::read_to_string(db_filepath)?;
+    pub fn load_db(&mut self, os_name: &str, data: &str) -> Result<()> {
         let api_db: serde_json::Value = serde_json::from_str(&data)?;
         //        let mut num_apis_loaded = 0;
         let mut api_map = std::collections::HashMap::new();

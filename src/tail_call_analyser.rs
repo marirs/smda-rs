@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 
 #[derive(Debug)]
 pub struct TailCall {
-    source_addr: u64,
+    _source_addr: u64,
     destination_addr: u64,
     destination_function: u64,
 }
@@ -169,7 +169,7 @@ impl TailCallAnalyser {
                     flag2
                 {
                     result.push(TailCall {
-                        source_addr: *source,
+                        _source_addr: *source,
                         destination_addr: *destination,
                         destination_function: function.start_addr,
                     });

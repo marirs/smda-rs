@@ -119,7 +119,7 @@ pub struct BinaryInfo {
     is_library: bool,
     is_buffer: bool,
     sha256: String,
-    entry_point: u64,
+    _entry_point: u64,
     sections: Vec<(String, u64, usize)>,
     imports: Vec<(String, String, usize)>,
     exports: Vec<(String, usize)>,
@@ -148,7 +148,7 @@ impl BinaryInfo {
             is_library: false,
             is_buffer: false,
             sha256: String::from(""),
-            entry_point: 0,
+            _entry_point: 0,
             sections: vec![],
             imports: vec![],
             exports: vec![],
@@ -198,7 +198,7 @@ impl BinaryInfo {
 pub struct DisassemblyResult {
     analysis_start_ts: SystemTime,
     analysis_end_ts: SystemTime,
-    analysis_timeout: bool,
+    _analysis_timeout: bool,
     binary_info: BinaryInfo,
     identified_alignment: usize,
     code_map: HashMap<u64, u64>,
@@ -212,7 +212,7 @@ pub struct DisassemblyResult {
     function_borders: HashMap<u64, (u64, u64)>,
     instructions: HashMap<u64, (String, u32)>,
     ins2fn: HashMap<u64, u64>,
-    language: HashMap<i32, Vec<u8>>,
+    _language: HashMap<i32, Vec<u8>>,
     data_refs_from: HashMap<u64, Vec<u64>>,
     data_refs_to: HashMap<u64, Vec<u64>>,
     code_refs_from: HashMap<u64, Vec<u64>>,
@@ -222,7 +222,7 @@ pub struct DisassemblyResult {
     function_symbols: HashMap<u64, String>,
     candidates: HashMap<u64, FunctionCandidate>,
     confidence_threshold: f32,
-    code_areas: Vec<u8>,
+    _code_areas: Vec<u8>,
 }
 
 impl Default for DisassemblyResult {
@@ -236,7 +236,7 @@ impl DisassemblyResult {
         DisassemblyResult {
             analysis_start_ts: SystemTime::now(),
             analysis_end_ts: SystemTime::now(),
-            analysis_timeout: false,
+            _analysis_timeout: false,
             binary_info: BinaryInfo::new(),
             identified_alignment: 0,
             code_map: HashMap::new(),
@@ -249,7 +249,7 @@ impl DisassemblyResult {
             function_borders: HashMap::new(),
             instructions: HashMap::new(),
             ins2fn: HashMap::new(),
-            language: HashMap::new(),
+            _language: HashMap::new(),
             data_refs_from: HashMap::new(),
             data_refs_to: HashMap::new(),
             code_refs_from: HashMap::new(),
@@ -259,7 +259,7 @@ impl DisassemblyResult {
             function_symbols: HashMap::new(),
             candidates: HashMap::new(),
             confidence_threshold: 0.0,
-            code_areas: vec![],
+            _code_areas: vec![],
         }
     }
 
