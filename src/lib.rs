@@ -14,7 +14,6 @@ mod label_providers;
 mod mnemonic_tf_idf;
 mod pe;
 pub mod report;
-mod statistics;
 mod tail_call_analyser;
 
 use capstone::prelude::*;
@@ -113,13 +112,9 @@ pub struct BinaryInfo {
     binary_size: u64,
     bitness: u32,
     code_areas: Vec<(u64, u64)>,
-    component: String,
-    family: String,
     file_path: String,
-    is_library: bool,
     is_buffer: bool,
     sha256: String,
-    _entry_point: u64,
     sections: Vec<(String, u64, usize)>,
     imports: Vec<(String, String, usize)>,
     exports: Vec<(String, usize)>,
@@ -142,13 +137,9 @@ impl BinaryInfo {
             binary_size: 0,
             bitness: 32,
             code_areas: vec![],
-            component: String::from(""),
-            family: String::from(""),
             file_path: String::from(""),
-            is_library: false,
             is_buffer: false,
             sha256: String::from(""),
-            _entry_point: 0,
             sections: vec![],
             imports: vec![],
             exports: vec![],
@@ -198,9 +189,7 @@ impl BinaryInfo {
 pub struct DisassemblyResult {
     analysis_start_ts: SystemTime,
     analysis_end_ts: SystemTime,
-    _analysis_timeout: bool,
     binary_info: BinaryInfo,
-    identified_alignment: usize,
     code_map: HashMap<u64, u64>,
     data_map: HashSet<u64>,
     //    errors:
@@ -212,7 +201,6 @@ pub struct DisassemblyResult {
     function_borders: HashMap<u64, (u64, u64)>,
     instructions: HashMap<u64, (String, u32)>,
     ins2fn: HashMap<u64, u64>,
-    _language: HashMap<i32, Vec<u8>>,
     data_refs_from: HashMap<u64, Vec<u64>>,
     data_refs_to: HashMap<u64, Vec<u64>>,
     code_refs_from: HashMap<u64, Vec<u64>>,
@@ -222,7 +210,6 @@ pub struct DisassemblyResult {
     function_symbols: HashMap<u64, String>,
     candidates: HashMap<u64, FunctionCandidate>,
     confidence_threshold: f32,
-    _code_areas: Vec<u8>,
 }
 
 impl Default for DisassemblyResult {
@@ -236,9 +223,7 @@ impl DisassemblyResult {
         DisassemblyResult {
             analysis_start_ts: SystemTime::now(),
             analysis_end_ts: SystemTime::now(),
-            _analysis_timeout: false,
             binary_info: BinaryInfo::new(),
-            identified_alignment: 0,
             code_map: HashMap::new(),
             data_map: HashSet::new(),
             functions: HashMap::new(),
@@ -249,7 +234,6 @@ impl DisassemblyResult {
             function_borders: HashMap::new(),
             instructions: HashMap::new(),
             ins2fn: HashMap::new(),
-            _language: HashMap::new(),
             data_refs_from: HashMap::new(),
             data_refs_to: HashMap::new(),
             code_refs_from: HashMap::new(),
@@ -259,7 +243,6 @@ impl DisassemblyResult {
             function_symbols: HashMap::new(),
             candidates: HashMap::new(),
             confidence_threshold: 0.0,
-            _code_areas: vec![],
         }
     }
 

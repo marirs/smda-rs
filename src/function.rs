@@ -140,7 +140,6 @@ impl Instruction {
 
 #[derive(Debug)]
 pub struct Function {
-    _arch: crate::FileArchitecture,
     pub bitness: u32,
     pub offset: u64,
     blocks: HashMap<u64, Vec<Instruction>>,
@@ -149,16 +148,11 @@ pub struct Function {
     pub inrefs: Vec<u64>,
     pub outrefs: HashMap<u64, Vec<u64>>,
     pub binweight: u32,
-    _characteristics: String,
-    _confidence: f32,
-    _function_name: String,
-    _tfidf: f32,
 }
 
 impl Function {
     pub fn new(disassembly: &DisassemblyResult, function_offset: &u64) -> Result<Function> {
         let f = Function {
-            _arch: disassembly.binary_info.file_architecture,
             bitness: disassembly.binary_info.bitness,
             offset: *function_offset,
             blocks: Function::parse_blocks(
@@ -170,25 +164,6 @@ impl Function {
             inrefs: disassembly.get_in_refs(function_offset)?,
             outrefs: disassembly.get_out_refs(function_offset)?,
             binweight: 0,
-            _characteristics: if disassembly.candidates.contains_key(function_offset) {
-                disassembly.candidates[function_offset].get_characteristics()?
-            } else {
-                "-----------".to_string()
-            },
-            _confidence: if disassembly.candidates.contains_key(function_offset) {
-                disassembly.candidates[function_offset].get_confidence()?
-            } else {
-                0.0
-            },
-            _function_name: match disassembly.function_symbols.get(function_offset) {
-                Some(s) => s.clone(),
-                _ => "".to_string(),
-            },
-            _tfidf: if disassembly.candidates.contains_key(function_offset) {
-                disassembly.candidates[function_offset].get_tfidf()?
-            } else {
-                0.0
-            },
         };
         // f.escaper = IntelInstructionEscaper if disassembly.binary_info.architecture in ["intel"] else None
         // self.pic_hash = self._calculatePicHash(disassembly.binary_info)

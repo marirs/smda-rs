@@ -92,9 +92,7 @@ pub struct FunctionCandidate {
     cp: CommonPlagues,
     bitness: u32,
     pub addr: u64,
-    _rel_start_addr: u64,
     bytes: [u8; 5],
-    lang_spec: Option<String>,
     pub call_ref_sources: HashSet<u64>,
     finished: bool,
     is_symbol: bool,
@@ -106,7 +104,6 @@ pub struct FunctionCandidate {
     score: f32,
     tfidf_score: f32,
     confidence: f32,
-    _function_start_score: f32,
     is_stub: bool,
     is_initial_candidate: bool,
     is_exception_handler: bool,
@@ -119,9 +116,7 @@ impl FunctionCandidate {
             cp: CommonPlagues::init(),
             bitness: bi.bitness,
             addr,
-            _rel_start_addr: rel_addr,
             bytes: bi.binary[rel_addr as usize..(rel_addr + 5) as usize].try_into()?,
-            lang_spec: None,
             call_ref_sources: HashSet::new(),
             finished: false,
             is_symbol: false,
@@ -133,7 +128,6 @@ impl FunctionCandidate {
             score: 0.0,
             tfidf_score: 0.0,
             confidence: 0.0,
-            _function_start_score: 0.0,
             is_stub: false,
             is_initial_candidate: false,
             is_exception_handler: false,
@@ -251,34 +245,5 @@ impl FunctionCandidate {
     pub fn set_is_symbol(&mut self, flag: bool) -> Result<()> {
         self.is_symbol = flag;
         Ok(())
-    }
-
-    pub fn get_characteristics(&self) -> Result<String> {
-        Ok(format!(
-            "{}{}{}{}{}{}{}{}{}{}{}",
-            if self.is_initial_candidate { "i" } else { "-" },
-            if self.is_symbol { "s" } else { "-" },
-            if self.is_stub { "u" } else { "-" },
-            if self.alignment != 0 { "a" } else { "-" },
-            if self.lang_spec.is_some() { "l" } else { "-" },
-            if self.has_common_function_start()? {
-                "p"
-            } else {
-                "-"
-            },
-            if !self.call_ref_sources.is_empty() {
-                "r"
-            } else {
-                "-"
-            },
-            if self.is_tailcall { "t" } else { "-" },
-            if self.is_gap_candidate { "g" } else { "-" },
-            if self.finished { "f" } else { "-" },
-            if self.analysis_aborted { "x" } else { "-" }
-        ))
-    }
-
-    pub fn get_tfidf(&self) -> Result<f32> {
-        Ok(self.tfidf_score)
     }
 }
