@@ -17,19 +17,17 @@ pub fn get_bitness(binary: &[u8]) -> Result<u32> {
 pub fn get_base_address(binary: &[u8]) -> Result<u64> {
     match goblin::Object::parse(binary) {
         Ok(goblin::Object::Elf(elf)) => {
-            let mut base_addr = 0 as u64;
-            let mut candidates = vec![0xFFFFFFFFFFFFFFFF as u64];
+            let mut base_addr = 0_u64;
+            let mut candidates = vec![0xFFFFFFFFFFFFFFFF_u64];
             for section in elf.section_headers {
-                if section.sh_addr > 0 {
-                    if section.sh_addr > section.sh_offset {
-                        candidates.push(section.sh_addr - section.sh_offset);
-                    }
+                if section.sh_addr > 0 && section.sh_addr > section.sh_offset {
+                    candidates.push(section.sh_addr - section.sh_offset);
                 }
             }
             if candidates.len() > 1 {
-                base_addr = candidates.iter().min().unwrap().clone();
+                base_addr = *candidates.iter().min().unwrap();
             }
-            return Ok(base_addr);
+            Ok(base_addr)
         }
         Err(e) => Err(Error::ParseError(e)),
         _ => Err(Error::UnsupportedFormatError),
@@ -58,7 +56,7 @@ fn align(v: &u64, alignment: &u64) -> u64 {
     if remainder == 0 {
         return *v;
     }
-    return v + (alignment - remainder);
+    v + (alignment - remainder)
 }
 
 pub fn map_binary(binary: &[u8]) -> Result<Vec<u8>> {
@@ -67,9 +65,9 @@ pub fn map_binary(binary: &[u8]) -> Result<Vec<u8>> {
         _ => return Err(Error::UnsupportedFormatError),
     };
     let base_addr = get_base_address(binary)?;
-    let mut max_virtual_address = 0 as u64;
-    let mut min_virtual_address = 0xFFFFFFFFFFFFFFFF as u64;
-    let mut min_raw_offset = 0xFFFFFFFFFFFFFFFF as u64;
+    let mut max_virtual_address = 0_u64;
+    let mut min_virtual_address = 0xFFFFFFFFFFFFFFFF_u64;
+    let mut min_raw_offset = 0xFFFFFFFFFFFFFFFF_u64;
     for section in &elffile.section_headers {
         if section.sh_addr == 0 {
             continue;

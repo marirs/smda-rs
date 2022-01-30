@@ -258,15 +258,9 @@ impl FunctionAnalysisState {
     pub fn get_blocks(
         &self,
     ) -> Result<Vec<Vec<(u64, u32, Option<String>, Option<String>, Vec<u8>)>>> {
-        //        if self.blocks.len() > 0{
-        //            return Ok(&self.blocks);
-        //      }
-        //self.instructions.sort();
-        let mut cc = 0;
         let mut ins = HashMap::new();
-        for i in &self.instructions {
+        for (cc, i) in self.instructions.iter().enumerate() {
             ins.insert(i.0, cc);
-            cc += 1;
         }
         let mut potential_starts = self.jump_targets.clone();
         potential_starts.push(self.start_addr);

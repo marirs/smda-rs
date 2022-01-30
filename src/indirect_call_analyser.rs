@@ -1,3 +1,4 @@
+#![allow(clippy::too_many_arguments)]
 use crate::{error::Error, label_providers::ApiEntry, Disassembler, FunctionAnalysisState, Result};
 use regex::Regex;
 use std::{

@@ -712,10 +712,13 @@ impl FunctionCandidateManager {
                     .unwrap()
                     .disasm_all(disassembly.get_raw_bytes(gap_offset, 15)?, gap_offset)
                     .map_err(Error::CapstoneError)?;
-                for ins in ins_bb.as_ref() {
-                    ins_buf.push(ins);
-                    break;
+                if let Some(ins) = ins_bb.as_ref().iter().next() {
+                    ins_buf.push(ins)
                 }
+                // for ins in ins_bb.as_ref() {
+                //     ins_buf.push(ins);
+                //     break;
+                // }
                 if !ins_buf.is_empty() {
                     //                i_address, i_size, i_mnemonic, i_op_str = ins.mnemonic()
                     if ins_buf[0].mnemonic() == Some("nop") {
