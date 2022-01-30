@@ -150,14 +150,14 @@ impl JumpTableAnalyser {
             if instr.2.as_ref().unwrap().starts_with("ret") {
                 break;
             }
-            if instr.2.as_ref().unwrap() == "cmp" {
-                if JMP_TBL_SIZE.is_match(instr.3.as_ref().unwrap()) {
-                    let c = JMP_TBL_SIZE
-                        .captures(instr.3.as_ref().unwrap())
-                        .ok_or(Error::LogicError(file!(), line!()))?;
-                    jumptable_size = usize::from_str_radix(&c["two"], 16)? + 1;
-                    break;
-                }
+            if instr.2.as_ref().unwrap() == "cmp"
+                && JMP_TBL_SIZE.is_match(instr.3.as_ref().unwrap())
+            {
+                let c = JMP_TBL_SIZE
+                    .captures(instr.3.as_ref().unwrap())
+                    .ok_or(Error::LogicError(file!(), line!()))?;
+                jumptable_size = usize::from_str_radix(&c["two"], 16)? + 1;
+                break;
             }
         }
         Ok(jumptable_size)
@@ -283,32 +283,31 @@ impl JumpTableAnalyser {
     ) -> Result<u64> {
         let mut off_jumptable = None;
         for instr in backtracked.iter().rev() {
-            if instr.2.as_ref().unwrap() == "lea" {
-                if X86_HANDLER.is_match(instr.3.as_ref().unwrap()) {
-                    if let Some(target_register_) = &target_register {
-                        if !instr.3.as_ref().unwrap().contains(target_register_) {
-                            continue;
-                        }
+            if instr.2.as_ref().unwrap() == "lea" && X86_HANDLER.is_match(instr.3.as_ref().unwrap())
+            {
+                if let Some(target_register_) = &target_register {
+                    if !instr.3.as_ref().unwrap().contains(target_register_) {
+                        continue;
                     }
-                    let data_ref_instruction_addr = instr.0;
-                    let mut offset =
-                        disassembler.get_referenced_addr(instr.3.as_ref().unwrap())? as i64;
-                    let rip_sign = if instr.3.as_ref().unwrap().contains('+') {
-                        "+"
-                    } else {
-                        "-"
-                    };
-                    if rip_sign == "-" {
-                        offset *= -1;
-                    }
-                    off_jumptable = Some(instr.0 as i64 + instr.1 as i64 + offset);
-                    state.add_data_ref(
-                        data_ref_instruction_addr,
-                        *off_jumptable.as_ref().unwrap() as u64,
-                        4,
-                    )?;
-                    break;
                 }
+                let data_ref_instruction_addr = instr.0;
+                let mut offset =
+                    disassembler.get_referenced_addr(instr.3.as_ref().unwrap())? as i64;
+                let rip_sign = if instr.3.as_ref().unwrap().contains('+') {
+                    "+"
+                } else {
+                    "-"
+                };
+                if rip_sign == "-" {
+                    offset *= -1;
+                }
+                off_jumptable = Some(instr.0 as i64 + instr.1 as i64 + offset);
+                state.add_data_ref(
+                    data_ref_instruction_addr,
+                    *off_jumptable.as_ref().unwrap() as u64,
+                    4,
+                )?;
+                break;
             }
         }
         match off_jumptable {
@@ -379,13 +378,12 @@ impl JumpTableAnalyser {
     ) -> Result<u64> {
         let mut bonus_offset = 0;
         for (i, instr) in backtracked[..backtracked.len() - 1].iter().enumerate() {
-            if i < 3 {
-                if instr.2.as_ref().unwrap() == "mov"
-                    && X86_BONUS_OFFSET.is_match(instr.3.as_ref().unwrap())
-                {
-                    bonus_offset = disassembler.get_referenced_addr(instr.3.as_ref().unwrap())?;
-                    break;
-                }
+            if i < 3
+                && instr.2.as_ref().unwrap() == "mov"
+                && X86_BONUS_OFFSET.is_match(instr.3.as_ref().unwrap())
+            {
+                bonus_offset = disassembler.get_referenced_addr(instr.3.as_ref().unwrap())?;
+                break;
             }
         }
         Ok(bonus_offset)
