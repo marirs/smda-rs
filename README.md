@@ -2,6 +2,8 @@
 
 [![x86_64](https://github.com/marirs/smda-rs/actions/workflows/linux_x86-64.yml/badge.svg)](https://github.com/marirs/smda-rs/actions/workflows/linux_x86-64.yml)
 [![Arm7](https://github.com/marirs/smda-rs/actions/workflows/linux_arm7.yml/badge.svg)](https://github.com/marirs/smda-rs/actions/workflows/linux_arm7.yml)
+[![Windows](https://github.com/marirs/smda-rs/actions/workflows/windows.yml/badge.svg)](https://github.com/marirs/smda-rs/actions/workflows/windows.yml)
+[![macOS](https://github.com/marirs/smda-rs/actions/workflows/macos.yml/badge.svg)](https://github.com/marirs/smda-rs/actions/workflows/macos.yml)
 
 SMDA is a minimalist recursive disassembler library that is 
 optimized for accurate Control Flow Graph (CFG) recovery 
@@ -15,6 +17,7 @@ functions (in/out). Optionally, references to the Windows API
 can be inferred by using the ApiScout method.
 
 ### Requirements
-- Rust 1.50+ (edition 2018)
+- Rust 1.56+ (edition 2021)
 
 ---
+LICENSE: MIT
