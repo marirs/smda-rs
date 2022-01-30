@@ -1,6 +1,9 @@
+#![allow(dead_code)]
 #![allow(clippy::type_complexity)]
 #[macro_use]
 extern crate maplit;
+#[macro_use]
+extern crate lazy_static;
 
 mod elf;
 pub mod function;
@@ -14,6 +17,7 @@ mod label_providers;
 mod mnemonic_tf_idf;
 mod pe;
 pub mod report;
+mod statistics;
 mod tail_call_analyser;
 
 use capstone::prelude::*;
@@ -26,7 +30,7 @@ use indirect_call_analyser::IndirectCallAnalyser;
 use jump_table_analyser::JumpTableAnalyser;
 use label_provider::LabelProvider;
 use mnemonic_tf_idf::MnemonicTfIdf;
-use regex::bytes::Regex;
+use regex::bytes::Regex as BytesRegex;
 use report::DisassemblyReport;
 use ring::digest::{Context, SHA256};
 use serde::{Deserialize, Serialize};
@@ -41,6 +45,11 @@ use tail_call_analyser::TailCallAnalyser;
 mod error;
 pub use error::Error;
 pub type Result<T> = std::result::Result<T, Error>;
+
+lazy_static! {
+    static ref BITNESS: BytesRegex = BytesRegex::new(r"(?-u)\xE8").unwrap();
+    static ref REF_ADDR: BytesRegex = BytesRegex::new(r"(?-u)0x[a-fA-F0-9]+").unwrap();
+}
 
 static CALL_INS: &[Option<&str>] = &[Some("call"), Some("ncall")];
 static CJMP_INS: &[Option<&str>] = &[
@@ -112,9 +121,13 @@ pub struct BinaryInfo {
     binary_size: u64,
     bitness: u32,
     code_areas: Vec<(u64, u64)>,
+    component: String,
+    family: String,
     file_path: String,
+    is_library: bool,
     is_buffer: bool,
     sha256: String,
+    entry_point: u64,
     sections: Vec<(String, u64, usize)>,
     imports: Vec<(String, String, usize)>,
     exports: Vec<(String, usize)>,
@@ -137,9 +150,13 @@ impl BinaryInfo {
             binary_size: 0,
             bitness: 32,
             code_areas: vec![],
+            component: String::from(""),
+            family: String::from(""),
             file_path: String::from(""),
+            is_library: false,
             is_buffer: false,
             sha256: String::from(""),
+            entry_point: 0,
             sections: vec![],
             imports: vec![],
             exports: vec![],
@@ -189,7 +206,9 @@ impl BinaryInfo {
 pub struct DisassemblyResult {
     analysis_start_ts: SystemTime,
     analysis_end_ts: SystemTime,
+    analysis_timeout: bool,
     binary_info: BinaryInfo,
+    identified_alignment: usize,
     code_map: HashMap<u64, u64>,
     data_map: HashSet<u64>,
     //    errors:
@@ -201,6 +220,7 @@ pub struct DisassemblyResult {
     function_borders: HashMap<u64, (u64, u64)>,
     instructions: HashMap<u64, (String, u32)>,
     ins2fn: HashMap<u64, u64>,
+    language: HashMap<i32, Vec<u8>>,
     data_refs_from: HashMap<u64, Vec<u64>>,
     data_refs_to: HashMap<u64, Vec<u64>>,
     code_refs_from: HashMap<u64, Vec<u64>>,
@@ -210,6 +230,7 @@ pub struct DisassemblyResult {
     function_symbols: HashMap<u64, String>,
     candidates: HashMap<u64, FunctionCandidate>,
     confidence_threshold: f32,
+    code_areas: Vec<u8>,
 }
 
 impl Default for DisassemblyResult {
@@ -223,7 +244,9 @@ impl DisassemblyResult {
         DisassemblyResult {
             analysis_start_ts: SystemTime::now(),
             analysis_end_ts: SystemTime::now(),
+            analysis_timeout: false,
             binary_info: BinaryInfo::new(),
+            identified_alignment: 0,
             code_map: HashMap::new(),
             data_map: HashSet::new(),
             functions: HashMap::new(),
@@ -234,6 +257,7 @@ impl DisassemblyResult {
             function_borders: HashMap::new(),
             instructions: HashMap::new(),
             ins2fn: HashMap::new(),
+            language: HashMap::new(),
             data_refs_from: HashMap::new(),
             data_refs_to: HashMap::new(),
             code_refs_from: HashMap::new(),
@@ -243,6 +267,7 @@ impl DisassemblyResult {
             function_symbols: HashMap::new(),
             candidates: HashMap::new(),
             confidence_threshold: 0.0,
+            code_areas: vec![],
         }
     }
 
@@ -558,8 +583,7 @@ impl Disassembler {
                 .cloned()
                 .collect();
         for bitness in [32, 64] {
-            let re = Regex::new(r"(?-u)\xE8").unwrap();
-            for call_match in re.find_iter(binary) {
+            for call_match in BITNESS.find_iter(binary) {
                 if binary.len() - call_match.start() > 5 {
                     let packed_call: &[u8; 4] =
                         &binary[call_match.start() + 1..call_match.start() + 5].try_into()?;
@@ -835,8 +859,7 @@ impl Disassembler {
     }
 
     fn get_referenced_addr(&self, op_str: &str) -> Result<u64> {
-        let re = Regex::new(r"(?-u)0x[a-fA-F0-9]+").unwrap();
-        let referenced_addr = re.find_iter(op_str.as_bytes()).next();
+        let referenced_addr = REF_ADDR.find_iter(op_str.as_bytes()).next();
         if let Some(ref_addr) = referenced_addr {
             let z = u64::from_str_radix(std::str::from_utf8(&ref_addr.as_bytes()[2..])?, 16)?;
             return Ok(z);

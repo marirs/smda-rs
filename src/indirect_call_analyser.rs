@@ -1,8 +1,21 @@
 use crate::{error::Error, label_providers::ApiEntry, Disassembler, FunctionAnalysisState, Result};
+use regex::Regex;
 use std::{
     collections::{HashMap, HashSet},
     convert::TryInto,
 };
+
+lazy_static! {
+    static ref MOV_REG_REG: Regex = Regex::new(r"(?P<reg1>[a-z]{3}), (?P<reg2>[a-z]{3})$").unwrap();
+    static ref MOV_REG_CONST: Regex =
+        Regex::new(r"(?P<reg>[a-z]{3}), (?P<val>0x[0-9a-f]{1,8})$").unwrap();
+    static ref MOV_REG_DWORD: Regex =
+        Regex::new(r"(?P<reg>[a-z]{3}), dword ptr \[(?P<addr>0x[0-9a-f]{1,8})\]$").unwrap();
+    static ref MOV_REG_QWORD: Regex =
+        Regex::new(r"(?P<reg>[a-z]{3}), qword ptr \[rip \+ (?P<addr>0x[0-9a-f]{1,8})\]$").unwrap();
+    static ref LEA_REG_DWORD: Regex =
+        Regex::new(r"(?P<reg>[a-z]{3}), dword ptr \[(?P<addr>0x[0-9a-f]{1,8})\]$").unwrap();
+}
 
 #[derive(Debug)]
 pub struct IndirectCallAnalyser {
@@ -107,16 +120,13 @@ impl IndirectCallAnalyser {
             //LOGGER.debug("0x%08x: %s %s", ins[0], ins[2], ins[3])
             if ins.2.as_ref().unwrap() == "mov" {
                 //#mov <reg>, <reg>
-                let re = regex::Regex::new(r"(?P<reg1>[a-z]{3}), (?P<reg2>[a-z]{3})$").unwrap();
-                for match1 in re.captures_iter(ins.3.as_ref().unwrap()) {
+                for match1 in MOV_REG_REG.captures_iter(ins.3.as_ref().unwrap()) {
                     if &match1["reg1"].to_string() == register_name {
                         *register_name = match1["reg2"].to_string();
                     }
                 }
                 //#mov <reg>, <const>
-                let re =
-                    regex::Regex::new(r"(?P<reg>[a-z]{3}), (?P<val>0x[0-9a-f]{1,8})$").unwrap();
-                for match2 in re.captures_iter(ins.3.as_ref().unwrap()) {
+                for match2 in MOV_REG_CONST.captures_iter(ins.3.as_ref().unwrap()) {
                     registers.insert(
                         match2["reg"].to_string(),
                         u64::from_str_radix(&match2["val"][2..], 16)?,
@@ -127,11 +137,7 @@ impl IndirectCallAnalyser {
                     }
                 }
                 //#mov <reg>, dword ptr [<addr>]
-                let re = regex::Regex::new(
-                    r"(?P<reg>[a-z]{3}), dword ptr \[(?P<addr>0x[0-9a-f]{1,8})\]$",
-                )
-                .unwrap();
-                for match3 in re.captures_iter(ins.3.as_ref().unwrap()) {
+                for match3 in MOV_REG_DWORD.captures_iter(ins.3.as_ref().unwrap()) {
                     //# HACK: test to see if the address points to a import and
                     //# use that instead of the actual memory value
                     let addr = u64::from_str_radix(&match3["addr"][2..], 16)?;
@@ -151,11 +157,7 @@ impl IndirectCallAnalyser {
                     }
                 }
                 //# mov <reg>, qword ptr [reg + <addr>]
-                let re = regex::Regex::new(
-                    r"(?P<reg>[a-z]{3}), qword ptr \[rip \+ (?P<addr>0x[0-9a-f]{1,8})\]$",
-                )
-                .unwrap();
-                for match4 in re.captures_iter(ins.3.as_ref().unwrap()) {
+                for match4 in MOV_REG_QWORD.captures_iter(ins.3.as_ref().unwrap()) {
                     let rip = ins.0 + ins.1 as u64;
                     if let Ok(dword) = self.get_dword(
                         rip + u64::from_str_radix(&match4["addr"][2..], 16)?,
@@ -170,11 +172,7 @@ impl IndirectCallAnalyser {
                 }
             } else if ins.2.as_ref().unwrap() == "lea" {
                 //# lea <reg>, dword ptr [<addr>]
-                let re = regex::Regex::new(
-                    r"(?P<reg>[a-z]{3}), dword ptr \[(?P<addr>0x[0-9a-f]{1,8})\]$",
-                )
-                .unwrap();
-                for match1 in re.captures_iter(ins.3.as_ref().unwrap()) {
+                for match1 in LEA_REG_DWORD.captures_iter(ins.3.as_ref().unwrap()) {
                     if let Ok(dword) =
                         self.get_dword(u64::from_str_radix(&match1["addr"][2..], 16)?, disassembler)
                     {

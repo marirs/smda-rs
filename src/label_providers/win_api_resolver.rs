@@ -124,7 +124,7 @@ impl WinApiResolver {
     }
 
     pub fn load_db(&mut self, os_name: &str, data: &str) -> Result<()> {
-        let api_db: serde_json::Value = serde_json::from_str(&data)?;
+        let api_db: serde_json::Value = serde_json::from_str(data)?;
         //        let mut num_apis_loaded = 0;
         let mut api_map = std::collections::HashMap::new();
         for (name, dll_entry) in api_db["dlls"]

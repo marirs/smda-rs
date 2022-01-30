@@ -4,15 +4,29 @@ use crate::{
 };
 use capstone::prelude::*;
 use itertools::Itertools;
-use regex::bytes::Regex;
+use regex::bytes::Regex as BytesRegex;
 use std::{collections::HashMap, convert::TryInto};
 
-const DEFAULT_PROLOGUES: &[&str; 4] = &[
-    r"(?-u)\x8B\xFF\x55\x8B\xEC",
-    r"(?-u)\x89\xFF\x55\x8B\xEC",
-    r"(?-u)\x55\x8B\xEC",
-    r"(?-u)\x55\x89\xE5",
-];
+lazy_static! {
+    static ref DEFAULT_PROLOGUES: Vec<BytesRegex> = vec![
+        BytesRegex::new(r"(?-u)\x8B\xFF\x55\x8B\xEC").unwrap(),
+        BytesRegex::new(r"(?-u)\x89\xFF\x55\x8B\xEC").unwrap(),
+        BytesRegex::new(r"(?-u)\x55\x8B\xEC").unwrap(),
+        BytesRegex::new(r"(?-u)\x55\x89\xE5").unwrap(),
+    ];
+    static ref REF_CANDIDATE: BytesRegex = BytesRegex::new(r"(?-u)\xE8").unwrap();
+    static ref BITNESS: BytesRegex = BytesRegex::new(r"(?-u)\xFF\x25").unwrap();
+    static ref STUB_CHAIN: BytesRegex =
+        BytesRegex::new(r"(?-u)(?P<block>(\xFF\x25[\S\s]{4}){2,})").unwrap();
+    static ref STUB_CHAIN_FUNC: BytesRegex =
+        BytesRegex::new(r"(?-u)\xFF\x25(?P<function>[\S\s]{4})").unwrap();
+    static ref STUB_CHAIN_BLOCK: BytesRegex =
+        BytesRegex::new(r"(?-u)(?P<block>(\xFF\x25[\S\s]{4}\x68[\S\s]{4}\xE9[\S\s]{4}){2,})")
+            .unwrap();
+    static ref STUB_CHAIN_BLOCK_FUNC: BytesRegex =
+        BytesRegex::new(r"(?-u)\xFF\x25(?P<function>[\S\s]{4})").unwrap();
+    static ref CELL_MATCH: BytesRegex = BytesRegex::new(r"(?-u)\xFF\x15").unwrap();
+}
 
 #[derive(Debug)]
 struct GapSequences {
@@ -301,11 +315,9 @@ impl FunctionCandidateManager {
     }
 
     fn locate_stub_chain_candidates(&mut self, disassembly: &DisassemblyResult) -> Result<()> {
-        let re = Regex::new(r"(?-u)(?P<block>(\xFF\x25[\S\s]{4}){2,})")?;
-        for block in re.find_iter(&disassembly.binary_info.binary) {
-            let re2 = Regex::new(r"(?-u)\xFF\x25(?P<function>[\S\s]{4})")?;
-            for call_match in
-                re2.find_iter(&disassembly.binary_info.binary[block.start()..block.end()])
+        for block in STUB_CHAIN.find_iter(&disassembly.binary_info.binary) {
+            for call_match in STUB_CHAIN_FUNC
+                .find_iter(&disassembly.binary_info.binary[block.start()..block.end()])
             {
                 let stub_addr = disassembly.binary_info.base_addr
                     + block.start() as u64
@@ -322,11 +334,9 @@ impl FunctionCandidateManager {
                 }
             }
         }
-        let re = Regex::new(r"(?-u)(?P<block>(\xFF\x25[\S\s]{4}\x68[\S\s]{4}\xE9[\S\s]{4}){2,})")?;
-        for block in re.find_iter(&disassembly.binary_info.binary) {
-            let re2 = Regex::new(r"(?-u)\xFF\x25(?P<function>[\S\s]{4})")?;
-            for call_match in
-                re2.find_iter(&disassembly.binary_info.binary[block.start()..block.end()])
+        for block in STUB_CHAIN_BLOCK.find_iter(&disassembly.binary_info.binary) {
+            for call_match in STUB_CHAIN_BLOCK_FUNC
+                .find_iter(&disassembly.binary_info.binary[block.start()..block.end()])
             {
                 let stub_addr = disassembly.binary_info.base_addr
                     + block.start() as u64
@@ -350,9 +360,8 @@ impl FunctionCandidateManager {
     }
 
     fn locate_prologue_candidates(&mut self, disassembly: &DisassemblyResult) -> Result<()> {
-        for re_prologue in DEFAULT_PROLOGUES {
-            let re = Regex::new(re_prologue)?;
-            for prologue_match in re.find_iter(&disassembly.binary_info.binary) {
+        for re_prologue in DEFAULT_PROLOGUES.to_vec() {
+            for prologue_match in re_prologue.find_iter(&disassembly.binary_info.binary) {
                 if !self.passes_code_filter(Some(
                     disassembly.binary_info.base_addr + prologue_match.start() as u64,
                 ))? {
@@ -373,8 +382,7 @@ impl FunctionCandidateManager {
     }
 
     fn locate_reference_candidates(&mut self, disassembly: &DisassemblyResult) -> Result<()> {
-        let re = Regex::new(r"(?-u)\xE8").unwrap();
-        let matches = re.find_iter(&disassembly.binary_info.binary);
+        let matches = REF_CANDIDATE.find_iter(&disassembly.binary_info.binary);
         for call_match in matches {
             if !self.passes_code_filter(Some(
                 disassembly.binary_info.base_addr + call_match.start() as u64,
@@ -407,8 +415,7 @@ impl FunctionCandidateManager {
         }
 
         if self.bitness == 32 {
-            let re = Regex::new(r"(?-u)\xFF\x25").unwrap();
-            for call_match in re.find_iter(&disassembly.binary_info.binary) {
+            for call_match in BITNESS.find_iter(&disassembly.binary_info.binary) {
                 let function_addr =
                     match self.resolve_pointer_reference(call_match.start() as u64, disassembly) {
                         Ok(f) => Some(f),
@@ -428,8 +435,8 @@ impl FunctionCandidateManager {
                     self.set_initial_candidate(function_addr)?;
                 }
             }
-            let re = Regex::new(r"(?-u)\xFF\x15").unwrap();
-            for call_match in re.find_iter(&disassembly.binary_info.binary) {
+
+            for call_match in CELL_MATCH.find_iter(&disassembly.binary_info.binary) {
                 let function_addr =
                     match self.resolve_pointer_reference(call_match.start() as u64, disassembly) {
                         Ok(f) => Some(f),

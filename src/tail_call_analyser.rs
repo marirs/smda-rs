@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 
 #[derive(Debug)]
 pub struct TailCall {
+    source_addr: u64,
     destination_addr: u64,
     destination_function: u64,
 }
@@ -160,14 +161,15 @@ impl TailCallAnalyser {
                     }
                 }
                 if
-                // the jumps destination is different from the functions start address
+                //the jumps destination is different from the functions start address
                 destination != &function.start_addr &&
-                    // the jumps destination is in one of the functions intervals
+                    //the jumps destination is in one of the functions intervals
                     flag1 &&
-                // the jump originates from outside the function (outside all intervals)
+                //# the jump originates from outside the function (outside all intervals)
                     flag2
                 {
                     result.push(TailCall {
+                        source_addr: *source,
                         destination_addr: *destination,
                         destination_function: function.start_addr,
                     });

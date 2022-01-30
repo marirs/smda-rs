@@ -1,5 +1,19 @@
+#![allow(clippy::invalid_regex)]
 use crate::{error::Error, Disassembler, DisassemblyResult, FunctionAnalysisState, Result};
+use regex::{bytes::Regex as BytesRegex, Regex};
 use std::convert::TryInto;
+
+lazy_static! {
+    static ref BYTES: BytesRegex =
+        BytesRegex::new(r"(?-u)(\x48|\x4c)\x8d.{5}(.\x63|\x77|.\x89..\x63)").unwrap();
+    static ref JMP_TBL_SIZE: Regex =
+        Regex::new(r"(?-u)(?P<one>[a-z0-9]{2,4}), (?P<two>([0-9])|(0x[0-9a-f]+))").unwrap();
+    static ref DIRECT_HANDLER: Regex =
+        Regex::new(r"(?-u)[a-z0-9]{2,3}, dword ptr \[[^ ]+ \+ 0x[0-9a-f]+\]").unwrap();
+    static ref X86_HANDLER: Regex =
+        Regex::new(r"(?-u)[a-z0-9]{2,3}, \[rip (\+|\-) 0x[0-9a-f]+\]").unwrap();
+    static ref X86_BONUS_OFFSET: Regex = Regex::new(r"(?-u)[a-z0-9]{2,3},.*0x[0-9a-f]+\]").unwrap();
+}
 
 #[derive(Debug)]
 pub struct JumpTableAnalyser {
@@ -20,9 +34,7 @@ impl JumpTableAnalyser {
 
     pub fn find_jump_tables(&mut self, disassembly: &DisassemblyResult) -> Result<Vec<u64>> {
         let mut jumptables = vec![];
-        let re =
-            regex::bytes::Regex::new(r"(?-u)(\x48|\x4c)\x8d.{5}(.\x63|\x77|.\x89..\x63)").unwrap();
-        for match_offset in re.find_iter(&disassembly.binary_info.binary) {
+        for match_offset in BYTES.find_iter(&disassembly.binary_info.binary) {
             let packed_dword: &[u8; 4] = disassembly
                 .get_raw_bytes(match_offset.start() as u64 + 3, 4)?
                 .try_into()?;
@@ -139,12 +151,8 @@ impl JumpTableAnalyser {
                 break;
             }
             if instr.2.as_ref().unwrap() == "cmp" {
-                let re = regex::Regex::new(
-                    r"(?-u)(?P<one>[a-z0-9]{2,4}), (?P<two>([0-9])|(0x[0-9a-f]+))",
-                )
-                .unwrap();
-                if re.is_match(instr.3.as_ref().unwrap()) {
-                    let c = re
+                if JMP_TBL_SIZE.is_match(instr.3.as_ref().unwrap()) {
+                    let c = JMP_TBL_SIZE
                         .captures(instr.3.as_ref().unwrap())
                         .ok_or(Error::LogicError(file!(), line!()))?;
                     jumptable_size = usize::from_str_radix(&c["two"], 16)? + 1;
@@ -209,10 +217,7 @@ impl JumpTableAnalyser {
         let mut off_jumptable = None;
         for instr in backtracked.iter().rev() {
             if instr.2.as_ref().unwrap() == "mov" {
-                let re =
-                    regex::Regex::new(r"(?-u)[a-z0-9]{2,3}, dword ptr \[[^ ]+ \+ 0x[0-9a-f]+\]")
-                        .unwrap();
-                if re.is_match(instr.3.as_ref().unwrap()) {
+                if DIRECT_HANDLER.is_match(instr.3.as_ref().unwrap()) {
                     let data_ref_instruction_addr = instr.0;
                     off_jumptable =
                         Some(disassembler.get_referenced_addr(instr.3.as_ref().unwrap())?);
@@ -279,9 +284,7 @@ impl JumpTableAnalyser {
         let mut off_jumptable = None;
         for instr in backtracked.iter().rev() {
             if instr.2.as_ref().unwrap() == "lea" {
-                let re =
-                    regex::Regex::new(r"(?-u)[a-z0-9]{2,3}, \[rip (\+|\-) 0x[0-9a-f]+\]").unwrap();
-                if re.is_match(instr.3.as_ref().unwrap()) {
+                if X86_HANDLER.is_match(instr.3.as_ref().unwrap()) {
                     if let Some(target_register_) = &target_register {
                         if !instr.3.as_ref().unwrap().contains(target_register_) {
                             continue;
@@ -375,16 +378,15 @@ impl JumpTableAnalyser {
         backtracked: &[(u64, u32, Option<String>, Option<String>, Vec<u8>)],
     ) -> Result<u64> {
         let mut bonus_offset = 0;
-        let mut i = 0;
-        for instr in &backtracked[..backtracked.len() - 1] {
+        for (i, instr) in backtracked[..backtracked.len() - 1].iter().enumerate() {
             if i < 3 {
-                let re = regex::Regex::new(r"(?-u)[a-z0-9]{2,3},.*0x[0-9a-f]+\]").unwrap();
-                if instr.2.as_ref().unwrap() == "mov" && re.is_match(instr.3.as_ref().unwrap()) {
+                if instr.2.as_ref().unwrap() == "mov"
+                    && X86_BONUS_OFFSET.is_match(instr.3.as_ref().unwrap())
+                {
                     bonus_offset = disassembler.get_referenced_addr(instr.3.as_ref().unwrap())?;
                     break;
                 }
             }
-            i += 1;
         }
         Ok(bonus_offset)
     }
