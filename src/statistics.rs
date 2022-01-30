@@ -1,6 +1,6 @@
 use crate::{DisassemblyResult, Result};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DisassemblyStatistics {
     num_functions: usize,
     num_recursive_functions: usize,

@@ -2,7 +2,7 @@ use crate::{error::Error, DisassemblyReport, DisassemblyResult, FileArchitecture
 use capstone::prelude::*;
 use std::collections::HashMap;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Instruction {
     arch: FileArchitecture,
     bitness: u32,
@@ -138,7 +138,7 @@ impl Instruction {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Function {
     arch: crate::FileArchitecture,
     pub bitness: u32,

@@ -4,7 +4,7 @@ use crate::{
 };
 use std::collections::HashMap;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DisassemblyReport {
     pub format: FileFormat,
     pub architecture: FileArchitecture,
