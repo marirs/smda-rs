@@ -96,6 +96,16 @@ pub enum FileFormat {
     PE,
 }
 
+
+impl std::fmt::Display for FileFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            FileFormat::ELF => write!(f, "Elf file"),
+            FileFormat::PE => write!(f, "PE file"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum FileArchitecture {
     I386,
