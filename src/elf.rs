@@ -20,7 +20,7 @@ pub fn get_base_address(binary: &[u8]) -> Result<u64> {
             let mut base_addr = 0_u64;
             let mut candidates = vec![0xFFFFFFFFFFFFFFFF_u64];
             for section in elf.section_headers {
-                if section.sh_addr > 0 && section.sh_addr > section.sh_offset {
+                if section.sh_addr > 0{
                     candidates.push(section.sh_addr - section.sh_offset);
                 }
             }
@@ -36,10 +36,10 @@ pub fn get_base_address(binary: &[u8]) -> Result<u64> {
 
 pub fn get_code_areas(binary: &[u8], pe: &goblin::elf::Elf) -> Result<Vec<(u64, u64)>> {
     let mut res = vec![];
-    let base_address = get_base_address(binary)?;
+//    let base_address = get_base_address(binary)?;
     for section in &pe.section_headers {
         if section.sh_flags & goblin::elf::section_header::SHF_EXECINSTR as u64 != 0 {
-            let section_start = base_address + section.sh_addr;
+            let section_start = section.sh_addr;
             let mut section_size = section.sh_size;
             if section_size % section.sh_addralign != 0 {
                 section_size += section.sh_addralign - (section_size % section.sh_addralign);

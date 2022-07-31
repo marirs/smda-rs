@@ -22,9 +22,21 @@ impl ElfApiResolver {
         self.is_buffer = binary_info.is_buffer;
         if !self.is_buffer {
             //setup import table info from LIEF
-            if let Object::Elf(_lief_binary) = Object::parse(&binary_info.raw_data)? {
-                //TODO
-                // for relocation in lief_binary.shdr_relocs{
+            let mut i = 0;
+            if let Object::Elf(elf) = Object::parse(&binary_info.raw_data)? {
+//                eprintln!("{:#02x?}", elf.section_headers);
+//                eprintln!("{:#02x?}", elf.dynamic);
+//                for reloc in elf.pltrelocs.iter(){
+//                    if reloc.r_sym != 0{
+//                        if let Some(sym) = elf.dynsyms.get(reloc.r_sym){
+//                            if sym.is_import() && sym.is_function(){
+//                                eprintln!("{:#02x?}: {:#02x?}, {:?} {} {}", reloc.r_offset, elf.dynstrtab.get_at(sym.st_name), reloc.r_addend, sym.st_value, reloc.r_type);
+//                                i += 1;
+//                            }
+//                        }
+//                    }
+//                }
+//                eprintln!("{}", i);
                 //     if !relocation.has_symbol{
                 //         //# doesn't have a name, we won't care about it
                 //         continue;
@@ -50,7 +62,6 @@ impl ElfApiResolver {
 
                 //         self._api_map["lief"].insert(address, (lib, name));
                 //     }
-                // }
             }
         }
         Ok(())
