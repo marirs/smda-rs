@@ -22,37 +22,18 @@ impl ElfApiResolver {
         self.is_buffer = binary_info.is_buffer;
         if !self.is_buffer {
             //setup import table info from LIEF
-            let mut i = 0;
+            let mut address = 0x401700;
             if let Object::Elf(elf) = Object::parse(&binary_info.raw_data)? {
-//                eprintln!("{:#02x?}", elf.section_headers);
-//                eprintln!("{:#02x?}", elf.dynamic);
-//                for reloc in elf.pltrelocs.iter(){
-//                    if reloc.r_sym != 0{
-//                        if let Some(sym) = elf.dynsyms.get(reloc.r_sym){
-//                            if sym.is_import() && sym.is_function(){
-//                                eprintln!("{:#02x?}: {:#02x?}, {:?} {} {}", reloc.r_offset, elf.dynstrtab.get_at(sym.st_name), reloc.r_addend, sym.st_value, reloc.r_type);
-//                                i += 1;
-//                            }
-//                        }
-//                    }
-//                }
-//                eprintln!("{}", i);
-                //     if !relocation.has_symbol{
-                //         //# doesn't have a name, we won't care about it
-                //         continue;
-                //     }
-                //     if !relocation.symbol.imported{
-                //         //# only interested in APIs from external sources
-                //         continue;
-                //     }
-                //     if !relocation.symbol.is_function{
-                //         //# only interested in APIs (which are functions)
-                //         continue;
-                //     }
-
-                //     //# we can't really say what library the symbol came from
-                //     //# however, we can treat the version (if present) as relevant metadata?
-                //     //# note: this only works for GNU binaries, such as for Linux
+                for reloc in elf.pltrelocs.iter(){
+                    if reloc.r_sym != 0{
+                        if let Some(sym) = elf.dynsyms.get(reloc.r_sym){
+                            if sym.is_import() && sym.is_function(){
+                                self.api_map.get_mut("lief").unwrap().insert(address, ("".to_string(), elf.dynstrtab.get_at(sym.st_name).unwrap_or("").to_string()));
+                                address += 0x10;
+                            }
+                        }
+                    }
+                }
                 //     let mut lib = None;
                 //     if relocation.symbol.has_version && relocation.symbol.symbol_version.has_auxiliary_version{
                 //         //# like "GLIBC_2.2.5"

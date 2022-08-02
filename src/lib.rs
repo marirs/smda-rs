@@ -891,7 +891,12 @@ impl Disassembler {
             if !provider.is_api_provider()? {
                 continue;
             }
-            return provider.get_api(to_address, api_address);
+            let res = provider.get_api(to_address, api_address);
+            if let Ok((None, None)) = res{
+                continue;
+            } else {
+                return res;
+            }
         }
         Ok((None, None))
     }
@@ -957,7 +962,6 @@ impl Disassembler {
         let i_size = i.bytes().len();
         let _i_mnemonic = i.mnemonic();
         let i_op_str = i.op_str().unwrap_or("");
-
         //case = "FALLTHROUGH"
         if i_op_str.contains(':') {
             //case = "LONG-JMP"
