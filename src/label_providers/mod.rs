@@ -1,9 +1,9 @@
 use crate::{label_provider::LabelProvider, Result};
 
 pub mod elf_api_resolver;
-pub mod win_api_resolver;
 pub mod elf_symbol_provider;
 pub mod pdb_symbol_provider;
+pub mod win_api_resolver;
 
 pub fn init() -> Result<Vec<LabelProvider>> {
     Ok(vec![

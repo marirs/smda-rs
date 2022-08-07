@@ -24,11 +24,17 @@ impl ElfApiResolver {
             //setup import table info from LIEF
             let mut address = 0x401700;
             if let Object::Elf(elf) = Object::parse(&binary_info.raw_data)? {
-                for reloc in elf.pltrelocs.iter(){
-                    if reloc.r_sym != 0{
-                        if let Some(sym) = elf.dynsyms.get(reloc.r_sym){
-                            if sym.is_import() && sym.is_function(){
-                                self.api_map.get_mut("lief").unwrap().insert(address, ("".to_string(), elf.dynstrtab.get_at(sym.st_name).unwrap_or("").to_string()));
+                for reloc in elf.pltrelocs.iter() {
+                    if reloc.r_sym != 0 {
+                        if let Some(sym) = elf.dynsyms.get(reloc.r_sym) {
+                            if sym.is_import() && sym.is_function() {
+                                self.api_map.get_mut("lief").unwrap().insert(
+                                    address,
+                                    (
+                                        "".to_string(),
+                                        elf.dynstrtab.get_at(sym.st_name).unwrap_or("").to_string(),
+                                    ),
+                                );
                                 address += 0x10;
                             }
                         }

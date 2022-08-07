@@ -96,7 +96,6 @@ pub enum FileFormat {
     PE,
 }
 
-
 impl std::fmt::Display for FileFormat {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
@@ -892,7 +891,7 @@ impl Disassembler {
                 continue;
             }
             let res = provider.get_api(to_address, api_address);
-            if let Ok((None, None)) = res{
+            if let Ok((None, None)) = res {
                 continue;
             } else {
                 return res;
