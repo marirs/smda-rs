@@ -34,7 +34,7 @@ pub fn get_base_address(binary: &[u8]) -> Result<u64> {
     }
 }
 
-pub fn get_code_areas(binary: &[u8], pe: &goblin::elf::Elf) -> Result<Vec<(u64, u64)>> {
+pub fn get_code_areas(_binary: &[u8], pe: &goblin::elf::Elf) -> Result<Vec<(u64, u64)>> {
     let mut res = vec![];
     //    let base_address = get_base_address(binary)?;
     for section in &pe.section_headers {

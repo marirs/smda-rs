@@ -68,12 +68,10 @@ impl ElfSymbolProvider {
         strtab: &goblin::strtab::Strtab,
     ) -> Result<()> {
         for symbol in symbols {
-            if symbol.is_function() {
-                if symbol.st_value != 0 {
-                    let func_name = strtab.get_at(symbol.st_name).unwrap_or("");
-                    self.func_symbols
-                        .insert(symbol.st_value, func_name.to_string());
-                }
+            if symbol.is_function() && symbol.st_value != 0 {
+                let func_name = strtab.get_at(symbol.st_name).unwrap_or("");
+                self.func_symbols
+                    .insert(symbol.st_value, func_name.to_string());
             }
         }
         Ok(())
