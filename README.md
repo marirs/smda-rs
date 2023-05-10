@@ -19,5 +19,9 @@ can be inferred by using the ApiScout method.
 ### Requirements
 - Rust 1.56+ (edition 2021)
 
+
+### Reference
+This is a [python port](https://github.com/danielplohmann/smda/) whose original authors are: Daniel Plohman and Steffen Enders
+
 ---
 LICENSE: MIT
