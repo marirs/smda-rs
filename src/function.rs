@@ -140,7 +140,8 @@ impl Instruction {
 
 #[derive(Debug, Clone)]
 pub struct Function {
-    arch: crate::FileArchitecture,
+    pub arch: crate::FileArchitecture,
+    pub format: crate::FileFormat,
     pub bitness: u32,
     pub offset: u64,
     blocks: HashMap<u64, Vec<Instruction>>,
@@ -159,6 +160,7 @@ impl Function {
     pub fn new(disassembly: &DisassemblyResult, function_offset: &u64) -> Result<Function> {
         let f = Function {
             arch: disassembly.binary_info.file_architecture,
+            format: disassembly.binary_info.file_format,
             bitness: disassembly.binary_info.bitness,
             offset: *function_offset,
             blocks: Function::parse_blocks(

@@ -90,7 +90,7 @@ static REGS_64BIT: &[&str] = &[
     "r13", "r14", "r15",
 ];
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum FileFormat {
     ELF,
     PE,
@@ -139,7 +139,7 @@ pub struct BinaryInfo {
     entry_point: u64,
     sections: Vec<(String, u64, usize)>,
     imports: Vec<(String, String, usize)>,
-    exports: Vec<(String, usize)>,
+    exports: Vec<(String, usize, Option<String>)>,
 }
 
 impl Default for BinaryInfo {
@@ -711,7 +711,18 @@ impl Disassembler {
                 binary_info.exports = pe
                     .exports
                     .iter()
-                    .map(|s| (s.name.unwrap_or("").to_string(), s.offset))
+                    .map(|s| {
+                        let forward = match s.reexport {
+                            Some(goblin::pe::export::Reexport::DLLName { export: _, lib }) => {
+                                Some(format!("{}", lib))
+                            }
+                            Some(goblin::pe::export::Reexport::DLLOrdinal { ordinal: _, lib }) => {
+                                Some(format!("{}", lib))
+                            }
+                            None => None,
+                        };
+                        (s.name.unwrap_or("").to_string(), s.rva, forward)
+                    })
                     .collect();
                 binary_info.binary = pe::map_binary(&binary_info.raw_data)?;
                 binary_info.binary_size = binary_info.binary.len() as u64;

@@ -29,7 +29,7 @@ pub struct DisassemblyReport {
     functions: HashMap<u64, Function>,
     pub sections: Vec<(String, u64, usize)>,
     pub imports: Vec<(String, String, usize)>,
-    pub exports: Vec<(String, usize)>,
+    pub exports: Vec<(String, usize, Option<String>)>,
 }
 
 impl DisassemblyReport {
