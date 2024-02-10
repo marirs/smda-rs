@@ -112,17 +112,18 @@ impl Instruction {
                         let value = match op.op_type {
                             capstone::arch::x86::X86OperandType::Imm(op_value) => op_value,
                             capstone::arch::x86::X86OperandType::Mem(op_value) => {
-                                if let Some(s) = capstone.reg_name(op_value.base()) {
-                                    if s == "rip" {
-                                        //add RIP value
-                                        op_value.disp()
-                                            + insn.address() as i64
-                                            + insn.bytes().len() as i64
-                                    } else {
-                                        op_value.disp()
+                                match capstone.reg_name(op_value.base()) {
+                                    Some(s) => {
+                                        if s == "rip" {
+                                            //add RIP value
+                                            op_value.disp()
+                                                + insn.address() as i64
+                                                + insn.bytes().len() as i64
+                                        } else {
+                                            op_value.disp()
+                                        }
                                     }
-                                } else {
-                                    op_value.disp()
+                                    _ => op_value.disp(),
                                 }
                             }
                             _ => 0,
