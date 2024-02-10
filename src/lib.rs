@@ -1350,7 +1350,8 @@ impl Disassembler {
                 self.fc_manager
                     .add_candidate(a.0, false, Some(a.1), &self.disassembly)?;
             }
-            self.tailcall_analyzer.finalize_function(&state)?;
+            // self.tailcall_analyzer.finalize_function(&state)?;
+            TailCallAnalyser::finalize_function(self, &mut state)?;
         }
         self.fc_manager.update_analysis_finished(&start_addr)?;
         if high_accuracy {
