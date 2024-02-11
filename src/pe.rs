@@ -75,6 +75,9 @@ pub fn map_binary(binary: &[u8]) -> Result<Vec<u8>> {
             optional_header_size = 0x108;
         }
     }
+    if binary.len() < pe_offset + optional_header_size + num_sections * 0x28 {
+        return Err(Error::PEOutOfBoundsSectionError);
+    }
     if binary.len() >= pe_offset + optional_header_size + num_sections * 0x28 {
         for section_index in 0..num_sections {
             let section_offset = section_index * 0x28;

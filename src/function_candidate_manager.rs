@@ -514,7 +514,7 @@ impl FunctionCandidateManager {
         Ok(true)
     }
 
-    fn add_reference_candidate(
+    pub fn add_reference_candidate(
         &mut self,
         addr: u64,
         source_ref: u64,
