@@ -57,7 +57,7 @@ impl Instruction {
                         1 => ((op_value & 0xFF) as u8).to_le_bytes().to_vec(),
                         2 => ((op_value & 0xFFFF) as u16).to_le_bytes().to_vec(),
                         4 => ((op_value & 0xFFFFFFFF) as u32).to_le_bytes().to_vec(),
-                        8 => ((op_value as u64 & 0xFFFFFFFFFFFFFFFF) as u64)
+                        8 => (op_value as u64 & 0xFFFFFFFFFFFFFFFF)
                             .to_le_bytes()
                             .to_vec(),
                         _ => {
@@ -257,7 +257,7 @@ impl Function {
             return Ok(false);
         }
         let first_ins = &self.blocks[&self.offset][0];
-        if !vec!["jmp", "call"].contains(&&first_ins.mnemonic[..]) {
+        if !["jmp", "call"].contains(&&first_ins.mnemonic[..]) {
             return Ok(false);
         }
         if self.apirefs.is_empty() {

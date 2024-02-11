@@ -38,14 +38,20 @@ impl TailCallAnalyser {
         Ok(())
     }
 
-    pub fn finalize_function(disassembler: &mut Disassembler, _function_state: &FunctionAnalysisState) -> Result<()> {
+    pub fn finalize_function(
+        disassembler: &mut Disassembler,
+        _function_state: &FunctionAnalysisState,
+    ) -> Result<()> {
         for (source, destinations) in &disassembler.tailcall_analyzer.tmp_jumps {
-            disassembler.tailcall_analyzer.jumps.insert(*source, destinations.to_vec());
+            disassembler
+                .tailcall_analyzer
+                .jumps
+                .insert(*source, destinations.to_vec());
 
             for d in destinations {
                 _ = disassembler.fc_manager.add_reference_candidate(
-                    *d as u64,
-                    *source as u64,
+                    *d,
+                    *source,
                     &disassembler.disassembly,
                 );
                 //let state = FunctionAnalysisState::new(*d)?;

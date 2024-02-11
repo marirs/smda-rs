@@ -374,7 +374,6 @@ impl DisassemblyResult {
         }
     }
 
-
     pub fn dereference_dword(&self, addr: u64) -> Result<u64> {
         if self.is_addr_within_memory_image(addr)? {
             let rel_start_addr = addr - self.binary_info.base_addr;
@@ -692,7 +691,7 @@ impl Disassembler {
                             } else {
                                 "..".to_string()
                             },
-                            s.sh_addr as u64,
+                            s.sh_addr,
                             s.sh_size as usize,
                         )
                     })
@@ -737,10 +736,10 @@ impl Disassembler {
                     .map(|s| {
                         let forward = match s.reexport {
                             Some(goblin::pe::export::Reexport::DLLName { export: _, lib }) => {
-                                Some(format!("{}", lib))
+                                Some(lib.to_string())
                             }
                             Some(goblin::pe::export::Reexport::DLLOrdinal { ordinal: _, lib }) => {
-                                Some(format!("{}", lib))
+                                Some(lib.to_string())
                             }
                             None => None,
                         };
@@ -802,7 +801,7 @@ impl Disassembler {
 
         let queue2 = self.fc_manager.get_queue()?;
         for addr in queue2 {
-            if queue.contains(&addr){
+            if queue.contains(&addr) {
                 continue;
             }
             state = match self.analyse_function(addr, false, high_accuracy) {
@@ -869,7 +868,9 @@ impl Disassembler {
 
     fn get_disasm_window_buffer(&self, addr: u64) -> Vec<u8> {
         if (addr < self.disassembly.binary_info.base_addr)
-            || (addr >= self.disassembly.binary_info.base_addr + self.disassembly.binary_info.binary.len() as u64)
+            || (addr
+                >= self.disassembly.binary_info.base_addr
+                    + self.disassembly.binary_info.binary.len() as u64)
         {
             return vec![];
         }
@@ -904,7 +905,7 @@ impl Disassembler {
     ) -> Result<(Option<String>, Option<String>)> {
         if to_addr != 0 {
             let (dll, api) = self.resolve_api(to_addr, dereferenced)?;
-            if dll != None || api != None {
+            if dll.is_some() || api.is_some() {
                 self.update_api_information(from_addr, dereferenced, &dll, &api)?;
                 return Ok((dll, api));
             } else if !self.disassembly.is_addr_within_memory_image(to_addr)? {
@@ -937,7 +938,7 @@ impl Disassembler {
             if &n["sign"] == "-" {
                 number *= -1;
             }
-            return Ok(number as i64);
+            return Ok(number);
         }
         Ok(0)
     }
@@ -992,7 +993,8 @@ impl Disassembler {
                 } else if op_str.starts_with("qword ptr [rip") {
                     let rip = i_address + i_size as u64;
                     //let call_destination = rip + self.get_referenced_addr(op_str)?;
-                    let call_destination = ((rip as i64) + self.get_referenced_addr_sign(op_str)?) as u64;
+                    let call_destination =
+                        ((rip as i64) + self.get_referenced_addr_sign(op_str)?) as u64;
                     state.add_code_ref(i_address, call_destination, false)?;
                     if let Ok(dereferenced) = self.disassembly.dereference_qword(call_destination) {
                         self.handle_api_target(i_address, call_destination, dereferenced)?;
@@ -1060,23 +1062,24 @@ impl Disassembler {
             {
                 // case = "TAILCALL?"
             } else {
-                let addr_to = u64::from_str_radix(std::str::from_utf8(&i_op_str.as_bytes()[2..])?, 16)?;
+                let addr_to =
+                    u64::from_str_radix(std::str::from_utf8(&i_op_str.as_bytes()[2..])?, 16)?;
                 if state.is_first_instruction()? {
                     // case = "STUB-TAILCALL!"
                 } else {
                     // case = "OFFSET-QUEUE"
-
-                    if self.disassembly.is_addr_within_memory_image(addr_to)? {
-                        if self.disassembly.passes_code_filter(Some(addr_to))? {
-                            state.add_block_to_queue(addr_to)?;
-                        }
+                    if self.disassembly.is_addr_within_memory_image(addr_to)?
+                        && self.disassembly.passes_code_filter(Some(addr_to))?
+                    {
+                        state.add_block_to_queue(addr_to)?;
                     }
+                    // if self.disassembly.is_addr_within_memory_image(addr_to)? {
+                    //     if self.disassembly.passes_code_filter(Some(addr_to))? {
+                    //         state.add_block_to_queue(addr_to)?;
+                    //     }
+                    // }
                 }
-                state.add_code_ref(
-                    i_address,
-                    addr_to,
-                    true,
-                )?;
+                state.add_code_ref(i_address, addr_to, true)?;
             }
         } else {
             let jumptable_targets = self.jumptable_analyzer.get_jump_targets(i, self, state)?;
@@ -1236,7 +1239,7 @@ impl Disassembler {
                         //LOGGER.error("unsupported jump @0x%08x (0x%08x): %s %s", i_address, start_addr, i_mnemonic, i_op_str)
                     } else if RET_INS.contains(&i_mnemonic) {
                         self.analyze_end_instruction(&mut state)?;
-                        if previous_address != None
+                        if previous_address.is_some()
                             && previous_address != Some(0)
                             && previous_mnemonic == Some("push".to_string())
                         {
@@ -1252,7 +1255,7 @@ impl Disassembler {
                         }
                     } else if [Some("int3"), Some("hlt")].contains(&i_mnemonic) {
                         self.analyze_end_instruction(&mut state)?;
-                    } else if previous_address != None
+                    } else if previous_address.is_some()
                         && previous_address != Some(0)
                         && i_address != start_addr
                         && previous_mnemonic == Some("call".to_string())
@@ -1351,7 +1354,7 @@ impl Disassembler {
                     .add_candidate(a.0, false, Some(a.1), &self.disassembly)?;
             }
             // self.tailcall_analyzer.finalize_function(&state)?;
-            TailCallAnalyser::finalize_function(self, &mut state)?;
+            TailCallAnalyser::finalize_function(self, &state)?;
         }
         self.fc_manager.update_analysis_finished(&start_addr)?;
         if high_accuracy {

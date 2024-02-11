@@ -114,7 +114,7 @@ pub struct FunctionCandidate {
 
 impl FunctionCandidate {
     pub fn new(bi: &BinaryInfo, addr: u64) -> Result<FunctionCandidate> {
-        let rel_addr = addr - bi.base_addr as u64;
+        let rel_addr = addr - bi.base_addr;
         let mut fc = FunctionCandidate {
             cp: CommonPlagues::init(),
             bitness: bi.bitness,
