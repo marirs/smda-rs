@@ -236,7 +236,7 @@ impl FunctionAnalysisState {
             }
             //# sane case, stub found that just jumps to a referenced function
             else if self.num_blocks_analyzed == 1
-                && vec![String::from("jmp"), String::from("call")].contains(
+                && [String::from("jmp"), String::from("call")].contains(
                     self.instructions[self.instructions.len() - 1]
                         .2
                         .as_ref()

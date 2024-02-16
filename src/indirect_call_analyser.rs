@@ -143,7 +143,7 @@ impl IndirectCallAnalyser {
                     //# use that instead of the actual memory value
                     let addr = u64::from_str_radix(&match3["addr"][2..], 16)?;
                     let (dll, api) = disassembler.resolve_api(addr, addr)?;
-                    if dll != None || api != None {
+                    if dll.is_some() || api.is_some() {
                         registers.insert(match3["reg"].to_string(), addr);
                         //LOGGER.debug("**moved API ref (%s:%s) @0x%08x to register %s", dll, api, addr, match3.group("reg"))
                         if &match3["reg"].to_string() == register_name {
@@ -198,7 +198,7 @@ impl IndirectCallAnalyser {
                     let candidate = registers[register_name];
                     //LOGGER.debug("candidate: 0x%x - %s, register: %s", candidate, ins[3], register_name)
                     let (dll, api) = disassembler.resolve_api(candidate, candidate)?;
-                    if dll != None || api != None {
+                    if dll.is_some() || api.is_some() {
                         //LOGGER.debug("successfully resolved: %s %s", dll, api)
                         let mut api_entry = ApiEntry {
                             referencing_addr: HashSet::new(),

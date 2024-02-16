@@ -360,6 +360,20 @@ impl DisassemblyResult {
         Ok(res)
     }
 
+    pub fn passes_code_filter(&self, address: Option<u64>) -> Result<bool> {
+        match address {
+            Some(addr) => {
+                for (start, end) in &self.binary_info.code_areas {
+                    if *start <= addr && *end > addr {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            _ => Ok(false),
+        }
+    }
+
     pub fn dereference_dword(&self, addr: u64) -> Result<u64> {
         if self.is_addr_within_memory_image(addr)? {
             let rel_start_addr = addr - self.binary_info.base_addr;
@@ -376,6 +390,9 @@ impl DisassemblyResult {
         if self.is_addr_within_memory_image(addr)? {
             let rel_start_addr = addr - self.binary_info.base_addr;
             let rel_end_addr = rel_start_addr + 8;
+            if rel_end_addr > self.binary_info.binary_size {
+                return Err(Error::DereferenceError(addr));
+            }
             let extracted_dword: &[u8; 8] = &self.binary_info.binary
                 [rel_start_addr as usize..rel_end_addr as usize]
                 .try_into()?;
@@ -647,9 +664,14 @@ impl Disassembler {
         file_name: &str,
         high_accuracy: bool,
         resolve_tailcalls: bool,
+        data: Option<&Vec<u8>>,
     ) -> Result<DisassemblyReport> {
         let mut disassembler = Disassembler::new()?;
-        let file_content = Disassembler::load_file(file_name)?;
+        let file_content = match data {
+            Some(d) => d.to_vec(),
+            _ => Disassembler::load_file(file_name)?,
+        };
+        //let file_content = Disassembler::load_file(file_name)?;
         let mut binary_info = BinaryInfo::new();
         binary_info.init(&file_content)?;
         binary_info.file_path = file_name.to_string();
@@ -669,7 +691,7 @@ impl Disassembler {
                             } else {
                                 "..".to_string()
                             },
-                            s.sh_addr as u64,
+                            s.sh_addr,
                             s.sh_size as usize,
                         )
                     })
@@ -714,10 +736,10 @@ impl Disassembler {
                     .map(|s| {
                         let forward = match s.reexport {
                             Some(goblin::pe::export::Reexport::DLLName { export: _, lib }) => {
-                                Some(format!("{}", lib))
+                                Some(lib.to_string())
                             }
                             Some(goblin::pe::export::Reexport::DLLOrdinal { ordinal: _, lib }) => {
-                                Some(format!("{}", lib))
+                                Some(lib.to_string())
                             }
                             None => None,
                         };
@@ -769,7 +791,7 @@ impl Disassembler {
         self.tfidf.init(self.disassembly.binary_info.bitness)?;
         let queue = self.fc_manager.get_queue()?;
         let mut state = None;
-        for addr in queue {
+        for addr in queue.clone() {
             state = match self.analyse_function(addr, false, high_accuracy) {
                 Ok(s) => Some(s),
                 Err(_) => None,
@@ -777,6 +799,16 @@ impl Disassembler {
         }
         //LOGGER.debug("Finished heuristical analysis, functions: %d", len(self.disassembly.functions))
 
+        let queue2 = self.fc_manager.get_queue()?;
+        for addr in queue2 {
+            if queue.contains(&addr) {
+                continue;
+            }
+            state = match self.analyse_function(addr, false, high_accuracy) {
+                Ok(s) => Some(s),
+                Err(_) => None,
+            }
+        }
         //# second pass, analyze remaining gaps for additional
         //# candidates in an iterative way
         let mut next_gap = 0;
@@ -835,11 +867,15 @@ impl Disassembler {
     }
 
     fn get_disasm_window_buffer(&self, addr: u64) -> Vec<u8> {
-        let relative_start = addr - self.disassembly.binary_info.base_addr;
-        let relative_end = relative_start + 15;
-        if relative_start >= self.disassembly.binary_info.binary.len() as u64 {
+        if (addr < self.disassembly.binary_info.base_addr)
+            || (addr
+                >= self.disassembly.binary_info.base_addr
+                    + self.disassembly.binary_info.binary.len() as u64)
+        {
             return vec![];
         }
+        let relative_start = addr - self.disassembly.binary_info.base_addr;
+        let relative_end = relative_start + 15;
         if relative_end >= self.disassembly.binary_info.binary.len() as u64 {
             return self.disassembly.binary_info.binary[relative_start as usize..].to_vec();
         }
@@ -869,7 +905,7 @@ impl Disassembler {
     ) -> Result<(Option<String>, Option<String>)> {
         if to_addr != 0 {
             let (dll, api) = self.resolve_api(to_addr, dereferenced)?;
-            if dll != None || api != None {
+            if dll.is_some() || api.is_some() {
                 self.update_api_information(from_addr, dereferenced, &dll, &api)?;
                 return Ok((dll, api));
             } else if !self.disassembly.is_addr_within_memory_image(to_addr)? {
@@ -889,6 +925,21 @@ impl Disassembler {
         //         u64::from_str_radix(std::str::from_utf8(&referenced_addr.as_bytes()[2..])?, 16)?;
         //     return Ok(z);
         // }
+        Ok(0)
+    }
+
+    #[allow(unused_assignments)]
+    fn get_referenced_addr_sign(&self, op_str: &str) -> Result<i64> {
+        let mut number = 0;
+        let re_number_hex = regex::Regex::new(r"(?P<sign>[+\-]) (?P<num>0x[a-fA-F0-9]+)").unwrap();
+        let number_hex = re_number_hex.captures(op_str);
+        if let Some(n) = number_hex {
+            number = i64::from_str_radix(&n["num"][2..], 16)?;
+            if &n["sign"] == "-" {
+                number *= -1;
+            }
+            return Ok(number);
+        }
         Ok(0)
     }
 
@@ -941,7 +992,9 @@ impl Disassembler {
                     }
                 } else if op_str.starts_with("qword ptr [rip") {
                     let rip = i_address + i_size as u64;
-                    let call_destination = rip + self.get_referenced_addr(op_str)?;
+                    //let call_destination = rip + self.get_referenced_addr(op_str)?;
+                    let call_destination =
+                        ((rip as i64) + self.get_referenced_addr_sign(op_str)?) as u64;
                     state.add_code_ref(i_address, call_destination, false)?;
                     if let Ok(dereferenced) = self.disassembly.dereference_qword(call_destination) {
                         self.handle_api_target(i_address, call_destination, dereferenced)?;
@@ -989,7 +1042,8 @@ impl Disassembler {
             //case = "QWORD-PTR, RIP-relative"
             //Handles mostly jmp-to-api, stubs or tailcalls, all should be handled sanely this way.
             let rip = i_address + i_size as u64;
-            let jump_destination = rip + self.get_referenced_addr(i_op_str)?;
+            //let jump_destination = rip + self.get_referenced_addr(i_op_str)?;
+            let jump_destination = ((rip as i64) + self.get_referenced_addr_sign(i_op_str)?) as u64;
             state.add_code_ref(i_address, jump_destination, true)?;
             tailcall_jumps.push((i_address, jump_destination));
             if let Ok(dereferenced) = self.disassembly.dereference_qword(jump_destination) {
@@ -1008,20 +1062,24 @@ impl Disassembler {
             {
                 // case = "TAILCALL?"
             } else {
+                let addr_to =
+                    u64::from_str_radix(std::str::from_utf8(&i_op_str.as_bytes()[2..])?, 16)?;
                 if state.is_first_instruction()? {
                     // case = "STUB-TAILCALL!"
                 } else {
                     // case = "OFFSET-QUEUE"
-                    state.add_block_to_queue(u64::from_str_radix(
-                        std::str::from_utf8(&i_op_str.as_bytes()[2..])?,
-                        16,
-                    )?)?;
+                    if self.disassembly.is_addr_within_memory_image(addr_to)?
+                        && self.disassembly.passes_code_filter(Some(addr_to))?
+                    {
+                        state.add_block_to_queue(addr_to)?;
+                    }
+                    // if self.disassembly.is_addr_within_memory_image(addr_to)? {
+                    //     if self.disassembly.passes_code_filter(Some(addr_to))? {
+                    //         state.add_block_to_queue(addr_to)?;
+                    //     }
+                    // }
                 }
-                state.add_code_ref(
-                    i_address,
-                    u64::from_str_radix(std::str::from_utf8(&i_op_str.as_bytes()[2..])?, 16)?,
-                    true,
-                )?;
+                state.add_code_ref(i_address, addr_to, true)?;
             }
         } else {
             let jumptable_targets = self.jumptable_analyzer.get_jump_targets(i, self, state)?;
@@ -1181,7 +1239,7 @@ impl Disassembler {
                         //LOGGER.error("unsupported jump @0x%08x (0x%08x): %s %s", i_address, start_addr, i_mnemonic, i_op_str)
                     } else if RET_INS.contains(&i_mnemonic) {
                         self.analyze_end_instruction(&mut state)?;
-                        if previous_address != None
+                        if previous_address.is_some()
                             && previous_address != Some(0)
                             && previous_mnemonic == Some("push".to_string())
                         {
@@ -1197,7 +1255,7 @@ impl Disassembler {
                         }
                     } else if [Some("int3"), Some("hlt")].contains(&i_mnemonic) {
                         self.analyze_end_instruction(&mut state)?;
-                    } else if previous_address != None
+                    } else if previous_address.is_some()
                         && previous_address != Some(0)
                         && i_address != start_addr
                         && previous_mnemonic == Some("call".to_string())
@@ -1295,7 +1353,8 @@ impl Disassembler {
                 self.fc_manager
                     .add_candidate(a.0, false, Some(a.1), &self.disassembly)?;
             }
-            self.tailcall_analyzer.finalize_function(&state)?;
+            // self.tailcall_analyzer.finalize_function(&state)?;
+            TailCallAnalyser::finalize_function(self, &state)?;
         }
         self.fc_manager.update_analysis_finished(&start_addr)?;
         if high_accuracy {

@@ -38,11 +38,27 @@ impl TailCallAnalyser {
         Ok(())
     }
 
-    pub fn finalize_function(&mut self, _function_state: &FunctionAnalysisState) -> Result<()> {
-        for (source, destinations) in &self.tmp_jumps {
-            self.jumps.insert(*source, destinations.to_vec());
+    pub fn finalize_function(
+        disassembler: &mut Disassembler,
+        _function_state: &FunctionAnalysisState,
+    ) -> Result<()> {
+        for (source, destinations) in &disassembler.tailcall_analyzer.tmp_jumps {
+            disassembler
+                .tailcall_analyzer
+                .jumps
+                .insert(*source, destinations.to_vec());
+
+            for d in destinations {
+                _ = disassembler.fc_manager.add_reference_candidate(
+                    *d,
+                    *source,
+                    &disassembler.disassembly,
+                );
+                //let state = FunctionAnalysisState::new(*d)?;
+                //disassembler.tailcall_analyzer.functions.insert(*source, state);
+            }
         }
-        self.tmp_jumps.clear();
+        disassembler.tailcall_analyzer.tmp_jumps.clear();
         //TODO        self.functions.push(function_state);
         Ok(())
     }

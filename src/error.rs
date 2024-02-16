@@ -38,6 +38,8 @@ pub enum Error {
     ParseError(#[from] goblin::error::Error),
     #[error("{0}")]
     IoError(#[from] std::io::Error),
+    #[error("PE file has sections that map outside of the intended space")]
+    PEOutOfBoundsSectionError,
 
     #[error("unsupported format")]
     UnsupportedFormatError,

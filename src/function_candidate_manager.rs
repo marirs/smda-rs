@@ -404,12 +404,12 @@ impl FunctionCandidateManager {
                     & self.get_bitmask() as i64) as u64;
                 if disassembly.is_addr_within_memory_image(call_destination)?
                     && self.add_reference_candidate(
-                        call_destination as u64,
+                        call_destination,
                         disassembly.binary_info.base_addr + call_match.start() as u64,
                         disassembly,
                     )?
                 {
-                    self.set_initial_candidate(call_destination as u64)?;
+                    self.set_initial_candidate(call_destination)?;
                 }
             }
         }
@@ -468,7 +468,7 @@ impl FunctionCandidateManager {
         if self.bitness == 32 {
             let addr_block: &[u8; 4] = disassembly.get_raw_bytes(offset + 2, 4)?.try_into()?;
             let function_pointer = u32::from_le_bytes(*addr_block) as u64;
-            return Ok(disassembly.dereference_dword(function_pointer)? as u64);
+            return Ok(disassembly.dereference_dword(function_pointer)?);
         }
         if self.bitness == 64 {
             let addr_block: &[u8; 4] = disassembly.get_raw_bytes(offset + 2, 4)?.try_into()?;
@@ -514,7 +514,7 @@ impl FunctionCandidateManager {
         Ok(true)
     }
 
-    fn add_reference_candidate(
+    pub fn add_reference_candidate(
         &mut self,
         addr: u64,
         source_ref: u64,
