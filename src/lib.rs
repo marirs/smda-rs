@@ -105,7 +105,7 @@ impl std::fmt::Display for FileFormat {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum FileArchitecture {
     I386,
     AMD64,
