@@ -7,7 +7,7 @@ pub struct Instruction {
     arch: FileArchitecture,
     bitness: u32,
     pub offset: u64,
-    bytes: String,
+    pub bytes: String,
     pub mnemonic: String,
     pub operands: Option<String>,
 }
