@@ -61,12 +61,13 @@ pub fn get_code_areas(binary: &[u8], pe: &goblin::pe::PE) -> Result<Vec<(u64, u6
 }
 
 pub fn map_binary(binary: &[u8]) -> Result<Vec<u8>> {
-    //This is a pretty rough implementation but does the job for now
+    // This is a pretty rough implementation but does the job for now
     let mut mapped_binary = vec![];
     let pe_offset = get_pe_offset(binary)? as usize;
     let mut num_sections = 0;
     let mut section_infos = vec![];
     let mut optional_header_size = 0xF8;
+
     if binary.len() >= pe_offset + 0x8 {
         num_sections =
             u16::from_le_bytes(binary[pe_offset + 0x6..pe_offset + 0x8].try_into()?) as usize;
@@ -75,80 +76,82 @@ pub fn map_binary(binary: &[u8]) -> Result<Vec<u8>> {
             optional_header_size = 0x108;
         }
     }
+
     if binary.len() < pe_offset + optional_header_size + num_sections * 0x28 {
         return Err(Error::PEOutOfBoundsSectionError);
     }
-    if binary.len() >= pe_offset + optional_header_size + num_sections * 0x28 {
-        for section_index in 0..num_sections {
-            let section_offset = section_index * 0x28;
-            let slice_start = pe_offset + optional_header_size + section_offset + 0x8;
-            let slice_end = pe_offset + optional_header_size + section_offset + 0x8 + 0x10;
-            let virt_size = u32::from_le_bytes(binary[slice_start..slice_start + 4].try_into()?);
-            let virt_offset =
-                u32::from_le_bytes(binary[slice_start + 4..slice_start + 8].try_into()?);
-            let raw_size =
-                u32::from_le_bytes(binary[slice_start + 8..slice_start + 12].try_into()?);
-            let raw_offset = u32::from_le_bytes(binary[slice_start + 12..slice_end].try_into()?);
-            let section_info = hashmap! {
-                "section_index".to_string() => section_index as u32,
-                "virt_size".to_string() => virt_size,
-                "virt_offset".to_string() => virt_offset,
-                "raw_size".to_string() => raw_size,
-                "raw_offset".to_string() => raw_offset
-            };
-            section_infos.push(section_info);
-        }
-        let mut max_virt_section_offset = 0;
-        let mut min_raw_section_offset = 0xFFFFFFFF;
-        if !section_infos.is_empty() {
-            for section_info in &section_infos {
-                max_virt_section_offset = if max_virt_section_offset
-                    > section_info["virt_size"] + section_info["virt_offset"]
-                {
-                    max_virt_section_offset
-                } else {
-                    section_info["virt_size"] + section_info["virt_offset"]
-                };
-                max_virt_section_offset = if max_virt_section_offset
-                    > section_info["raw_size"] + section_info["virt_offset"]
-                {
-                    max_virt_section_offset
-                } else {
-                    section_info["raw_size"] + section_info["virt_offset"]
-                };
-                if section_info["raw_offset"] > 0x200 {
-                    min_raw_section_offset = if min_raw_section_offset < section_info["raw_offset"]
-                    {
-                        min_raw_section_offset
-                    } else {
-                        section_info["raw_offset"]
-                    };
-                }
-            }
-        }
-        //support up to 100MB for now.
-        if max_virt_section_offset > 0 && max_virt_section_offset < 100 * 1024 * 1024 {
-            mapped_binary.resize(max_virt_section_offset as usize, 0_u8);
-            if min_raw_section_offset < binary.len() as u32 {
-                mapped_binary[0..min_raw_section_offset as usize]
-                    .clone_from_slice(&binary[0..min_raw_section_offset as usize]);
-            }
-        }
+
+    for section_index in 0..num_sections {
+        let section_offset = section_index * 0x28;
+        let slice_start = pe_offset + optional_header_size + section_offset + 0x8;
+        let slice_end = pe_offset + optional_header_size + section_offset + 0x8 + 0x10;
+        let virt_size = u32::from_le_bytes(binary[slice_start..slice_start + 4].try_into()?);
+        let virt_offset =
+            u32::from_le_bytes(binary[slice_start + 4..slice_start + 8].try_into()?);
+        let raw_size =
+            u32::from_le_bytes(binary[slice_start + 8..slice_start + 12].try_into()?);
+        let raw_offset = u32::from_le_bytes(binary[slice_start + 12..slice_end].try_into()?);
+        let section_info = hashmap! {
+            "section_index".to_string() => section_index as u32,
+            "virt_size".to_string() => virt_size,
+            "virt_offset".to_string() => virt_offset,
+            "raw_size".to_string() => raw_size,
+            "raw_offset".to_string() => raw_offset
+        };
+        section_infos.push(section_info);
+    }
+
+    let mut max_virt_section_offset = 0;
+    let mut min_raw_section_offset = 0xFFFFFFFF;
+
+    if !section_infos.is_empty() {
         for section_info in &section_infos {
-            let mapped_from = section_info["virt_offset"];
-            let mapped_to = section_info["virt_offset"] + section_info["raw_size"];
-            mapped_binary[mapped_from as usize..mapped_to as usize].clone_from_slice(
-                &binary[section_info["raw_offset"] as usize
-                    ..section_info["raw_offset"] as usize + section_info["raw_size"] as usize],
+            max_virt_section_offset = max_virt_section_offset.max(
+                section_info["virt_size"] + section_info["virt_offset"]
             );
-            //LOG.debug("Mapping %d: raw 0x%x (0x%x bytes) -> virtual 0x%x (0x%x bytes)",
-            //              section_info["section_index"],
-            //              section_info["raw_offset"],
-            //              section_info["raw_size"],
-            //              section_info["virt_offset"],
-            //              section_info["virt_size"])
+            max_virt_section_offset = max_virt_section_offset.max(
+                section_info["raw_size"] + section_info["virt_offset"]
+            );
+            if section_info["raw_offset"] > 0x200 {
+                min_raw_section_offset = min_raw_section_offset.min(section_info["raw_offset"]);
+            }
         }
     }
-    //LOG.debug("Mapped binary of size %d bytes (%d sections) to memory view of size %d bytes", len(binary), num_sections, len(mapped_binary))
+
+    // Support up to 100MB for now.
+    if max_virt_section_offset > 0 && max_virt_section_offset < 100 * 1024 * 1024 {
+        mapped_binary.resize(max_virt_section_offset as usize, 0_u8);
+        if min_raw_section_offset < binary.len() as u32 {
+            mapped_binary[0..min_raw_section_offset as usize]
+                .clone_from_slice(&binary[0..min_raw_section_offset as usize]);
+        }
+    }
+
+    for section_info in &section_infos {
+        let mapped_from = section_info["virt_offset"];
+        let mapped_to = section_info["virt_offset"] + section_info["raw_size"];
+
+        // Ensure the slice ranges are within bounds
+        let binary_raw_start = section_info["raw_offset"] as usize;
+        let binary_raw_end = binary_raw_start + section_info["raw_size"] as usize;
+        let mapped_binary_end = mapped_from as usize + section_info["raw_size"] as usize;
+
+        if binary_raw_end <= binary.len() && mapped_binary_end <= mapped_binary.len() {
+            mapped_binary[mapped_from as usize..mapped_to as usize].clone_from_slice(
+                &binary[binary_raw_start..binary_raw_end],
+            );
+        } else {
+            // println!("Warning: Skipping out-of-bounds section mapping.");
+        }
+
+        // LOG.debug("Mapping %d: raw 0x%x (0x%x bytes) -> virtual 0x%x (0x%x bytes)",
+        //           section_info["section_index"],
+        //           section_info["raw_offset"],
+        //           section_info["raw_size"],
+        //           section_info["virt_offset"],
+        //           section_info["virt_size"])
+    }
+
+    // LOG.debug("Mapped binary of size %d bytes (%d sections) to memory view of size %d bytes", len(binary), num_sections, len(mapped_binary))
     Ok(mapped_binary)
 }
