@@ -86,10 +86,8 @@ pub fn map_binary(binary: &[u8]) -> Result<Vec<u8>> {
         let slice_start = pe_offset + optional_header_size + section_offset + 0x8;
         let slice_end = pe_offset + optional_header_size + section_offset + 0x8 + 0x10;
         let virt_size = u32::from_le_bytes(binary[slice_start..slice_start + 4].try_into()?);
-        let virt_offset =
-            u32::from_le_bytes(binary[slice_start + 4..slice_start + 8].try_into()?);
-        let raw_size =
-            u32::from_le_bytes(binary[slice_start + 8..slice_start + 12].try_into()?);
+        let virt_offset = u32::from_le_bytes(binary[slice_start + 4..slice_start + 8].try_into()?);
+        let raw_size = u32::from_le_bytes(binary[slice_start + 8..slice_start + 12].try_into()?);
         let raw_offset = u32::from_le_bytes(binary[slice_start + 12..slice_end].try_into()?);
         let section_info = hashmap! {
             "section_index".to_string() => section_index as u32,
@@ -106,12 +104,10 @@ pub fn map_binary(binary: &[u8]) -> Result<Vec<u8>> {
 
     if !section_infos.is_empty() {
         for section_info in &section_infos {
-            max_virt_section_offset = max_virt_section_offset.max(
-                section_info["virt_size"] + section_info["virt_offset"]
-            );
-            max_virt_section_offset = max_virt_section_offset.max(
-                section_info["raw_size"] + section_info["virt_offset"]
-            );
+            max_virt_section_offset = max_virt_section_offset
+                .max(section_info["virt_size"] + section_info["virt_offset"]);
+            max_virt_section_offset =
+                max_virt_section_offset.max(section_info["raw_size"] + section_info["virt_offset"]);
             if section_info["raw_offset"] > 0x200 {
                 min_raw_section_offset = min_raw_section_offset.min(section_info["raw_offset"]);
             }
@@ -137,9 +133,8 @@ pub fn map_binary(binary: &[u8]) -> Result<Vec<u8>> {
         let mapped_binary_end = mapped_from as usize + section_info["raw_size"] as usize;
 
         if binary_raw_end <= binary.len() && mapped_binary_end <= mapped_binary.len() {
-            mapped_binary[mapped_from as usize..mapped_to as usize].clone_from_slice(
-                &binary[binary_raw_start..binary_raw_end],
-            );
+            mapped_binary[mapped_from as usize..mapped_to as usize]
+                .clone_from_slice(&binary[binary_raw_start..binary_raw_end]);
         } else {
             // println!("Warning: Skipping out-of-bounds section mapping.");
         }
