@@ -94,12 +94,17 @@ pub fn map_binary(binary: &[u8]) -> Result<Vec<u8>> {
     let mut mapped_binary = vec![];
     mapped_binary.resize(align(&virtual_size, &0x1000) as usize, 0_u8);
     for segment in elffile.program_headers {
-        if segment.p_vaddr == 0 {
+        if segment.p_vaddr == 0 || (segment.p_offset as usize) < binary.len() {
             continue;
         }
         let rva = segment.p_vaddr - base_addr;
-        mapped_binary[rva as usize..(rva + segment.p_filesz) as usize].clone_from_slice(
-            &binary[segment.p_offset as usize..(segment.p_offset + segment.p_filesz) as usize],
+        let segment_size = if (segment.p_offset + segment.p_filesz) as usize >= binary.len() {
+            binary.len() - 1
+        } else {
+            binary.len() - segment.p_offset as usize
+        };
+        mapped_binary[rva as usize..rva as usize + segment_size].clone_from_slice(
+            &binary[segment.p_offset as usize..segment.p_offset as usize + segment_size],
         );
     }
     for section in &elffile.section_headers {
