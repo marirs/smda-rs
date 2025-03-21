@@ -52,9 +52,9 @@ pub fn get_code_areas(binary: &[u8], pe: &goblin::pe::PE) -> Result<Vec<(u64, u6
             let mut section_size = section.virtual_size as u64;
             if section_size % 0x1000 != 0 {
                 section_size += 0x1000 - (section_size % 0x1000);
-                let section_end = section_start + section_size;
-                res.push((section_start, section_end));
             }
+            let section_end = section_start + section_size;
+            res.push((section_start, section_end));
         }
     }
     Ok(res)

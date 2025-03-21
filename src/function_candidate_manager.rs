@@ -5,7 +5,7 @@ use crate::{
 use capstone::prelude::*;
 use itertools::Itertools;
 use regex::bytes::Regex as BytesRegex;
-use std::{collections::HashMap, convert::TryInto};
+use std::{collections::HashMap, collections::BTreeMap, convert::TryInto};
 
 lazy_static! {
     static ref DEFAULT_PROLOGUES: Vec<BytesRegex> = vec![
@@ -164,7 +164,7 @@ pub struct FunctionCandidateManager {
     code_areas: Vec<(u64, u64)>,
     all_call_refs: HashMap<u64, u64>,
     pub symbol_addresses: Vec<u64>,
-    pub candidates: HashMap<u64, FunctionCandidate>,
+    pub candidates: BTreeMap<u64, FunctionCandidate>,
     candidate_offsets: Vec<u64>,
     gs: GapSequences,
     candidate_queue: Vec<u64>,
@@ -182,7 +182,7 @@ impl FunctionCandidateManager {
             code_areas: vec![],
             all_call_refs: HashMap::new(),
             symbol_addresses: vec![],
-            candidates: HashMap::<u64, FunctionCandidate>::new(),
+            candidates: BTreeMap::<u64, FunctionCandidate>::new(),
             candidate_offsets: vec![],
             gs: GapSequences::new(),
             candidate_queue: vec![],
@@ -507,7 +507,7 @@ impl FunctionCandidateManager {
     }
 
     fn ensure_candidate(&mut self, addr: u64, disassembly: &DisassemblyResult) -> Result<bool> {
-        if let std::collections::hash_map::Entry::Vacant(e) = self.candidates.entry(addr) {
+        if let std::collections::btree_map::Entry::Vacant(e) = self.candidates.entry(addr) {
             e.insert(FunctionCandidate::new(&disassembly.binary_info, addr)?);
             return Ok(true);
         }
