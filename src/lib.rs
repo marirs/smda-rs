@@ -50,6 +50,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 lazy_static! {
     static ref BITNESS: BytesRegex = BytesRegex::new(r"(?-u)\xE8").unwrap();
     static ref REF_ADDR: BytesRegex = BytesRegex::new(r"(?-u)0x[a-fA-F0-9]+").unwrap();
+    static ref RE_NUMBER_HEX_SIGN: regex::Regex = regex::Regex::new(r"(?P<sign>[+\-]) (?P<num>0x[a-fA-F0-9]+)").unwrap();
 }
 
 static CALL_INS: &[Option<&str>] = &[Some("call"), Some("ncall")];
@@ -1000,8 +1001,8 @@ impl Disassembler {
     fn get_disasm_window_buffer(&self, addr: u64) -> Vec<u8> {
         if (addr < self.disassembly.binary_info.base_addr)
             || (addr
-                >= self.disassembly.binary_info.base_addr
-                    + self.disassembly.binary_info.binary.len() as u64)
+            >= self.disassembly.binary_info.base_addr
+            + self.disassembly.binary_info.binary.len() as u64)
         {
             return vec![];
         }
@@ -1062,8 +1063,7 @@ impl Disassembler {
     #[allow(unused_assignments)]
     fn get_referenced_addr_sign(&self, op_str: &str) -> Result<i64> {
         let mut number = 0;
-        let re_number_hex = regex::Regex::new(r"(?P<sign>[+\-]) (?P<num>0x[a-fA-F0-9]+)").unwrap();
-        let number_hex = re_number_hex.captures(op_str);
+        let number_hex = RE_NUMBER_HEX_SIGN.captures(op_str);
         if let Some(n) = number_hex {
             number = i64::from_str_radix(&n["num"][2..], 16)?;
             if &n["sign"] == "-" {
@@ -1129,7 +1129,7 @@ impl Disassembler {
                     let rip = i_address + i_size as u64;
                     let call_destination = ((rip as i64) + self.get_referenced_addr_sign(op_str)?) as u64;
 
-		            // Search API in add_to_api
+                    // Search API in add_to_api
                     if let Some((dll, api)) = self.disassembly.addr_to_api.get(&call_destination) {
                         let mut api_entry = label_providers::ApiEntry {
                             referencing_addr: HashSet::new(),
@@ -1545,7 +1545,7 @@ impl Disassembler {
             let (api_e, cand_e) = self
                 .indirect_call_analyser
                 .resolve_register_calls(self, &mut state, 4)?;
-           for a in api_e {
+            for a in api_e {
                 match self.disassembly.apis.get_mut(&a.0) {
                     Some(s) => {
                         s.referencing_addr.extend(a.1.referencing_addr.clone());

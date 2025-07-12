@@ -26,10 +26,11 @@ pub struct DisassemblyReport {
     message: String,
     sha256: String,
     statistics: DisassemblyStatistics,
-    functions: HashMap<u64, Function>,
+    pub functions: HashMap<u64, Function>,
     pub sections: Vec<(String, u64, usize)>,
     pub imports: Vec<(String, String, usize)>,
     pub exports: Vec<(String, usize, Option<String>)>,
+    pub addr_to_api: HashMap<u64, (Option<String>, Option<String>)>,
 }
 
 impl DisassemblyReport {
@@ -59,6 +60,7 @@ impl DisassemblyReport {
             sections: disassembly.binary_info.sections.clone(),
             imports: disassembly.binary_info.imports.clone(),
             exports: disassembly.binary_info.exports.clone(),
+            addr_to_api: HashMap::new(),
         };
         for function_offset in disassembly.functions.keys() {
             if res.confidence_threshold > 0.0
@@ -71,6 +73,7 @@ impl DisassemblyReport {
             let function = Function::new(disassembly, function_offset)?;
             res.binweight += function.binweight;
             res.functions.insert(*function_offset, function);
+            res.addr_to_api = disassembly.addr_to_api.clone();
         }
         Ok(res)
     }
