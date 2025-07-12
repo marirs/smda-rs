@@ -5,7 +5,7 @@ extern crate maplit;
 #[macro_use]
 extern crate lazy_static;
 
-mod elf;
+pub mod elf;
 pub mod function;
 mod function_analysis_state;
 mod function_candidate;
@@ -44,11 +44,13 @@ use tail_call_analyser::TailCallAnalyser;
 
 mod error;
 pub use error::Error;
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 lazy_static! {
     static ref BITNESS: BytesRegex = BytesRegex::new(r"(?-u)\xE8").unwrap();
     static ref REF_ADDR: BytesRegex = BytesRegex::new(r"(?-u)0x[a-fA-F0-9]+").unwrap();
+    static ref RE_NUMBER_HEX_SIGN: regex::Regex = regex::Regex::new(r"(?P<sign>[+\-]) (?P<num>0x[a-fA-F0-9]+)").unwrap();
 }
 
 static CALL_INS: &[Option<&str>] = &[Some("call"), Some("ncall")];
@@ -300,20 +302,6 @@ impl DisassemblyResult {
         Ok(all_api_refs)
     }
 
-    pub fn get_api_refs(
-        &self,
-        func_addr: &u64,
-    ) -> Result<HashMap<u64, (Option<String>, Option<String>)>> {
-        let mut api_refs = HashMap::new();
-        for block in &self.functions[func_addr] {
-            for ins in block {
-                if self.addr_to_api.contains_key(&ins.0) {
-                    api_refs.insert(ins.0, self.addr_to_api[&ins.0].clone());
-                }
-            }
-        }
-        Ok(api_refs)
-    }
 
     fn init_api_refs(&mut self) -> Result<()> {
         for api_offset in self.apis.keys() {
@@ -323,7 +311,121 @@ impl DisassemblyResult {
                     .insert(reference, (api.dll_name.clone(), api.api_name.clone()));
             }
         }
+
+        if self.binary_info.file_format == FileFormat::ELF {
+            let elf_apis = elf::extract_elf_dynamic_apis(&self.binary_info.raw_data)?;
+            for (addr, (dll, api)) in elf_apis {
+                if let Some(_) = &api {
+                    let canonical_addr = if addr >= self.binary_info.base_addr {
+                        addr
+                    } else {
+                        self.binary_info.base_addr + addr
+                    };
+
+                    self.addr_to_api.insert(canonical_addr, (dll.clone(), api.clone()));
+                }
+            }
+        }
+
         Ok(())
+    }
+
+    pub fn get_api_refs(&self, func_addr: &u64) -> Result<HashMap<u64, (Option<String>, Option<String>)>> {
+        let mut api_refs = HashMap::new();
+
+        for block in &self.functions[func_addr] {
+            for ins in block {
+                let ins_absolute_addr = self.binary_info.base_addr + ins.0;
+
+                // METHOD 1: Direct search in addr_to_api
+                if let Some((dll, api)) = self.addr_to_api.get(&ins_absolute_addr) {
+                    println!("DEBUG: Found direct API for ins {}: {:?}:{:?}", ins_absolute_addr, dll, api);
+                    api_refs.insert(ins_absolute_addr, (dll.clone(), api.clone()));
+                    continue;
+                }
+
+                // METHOD 2: for jumps, check if it's a jump or call
+                if let Some(ref mnemonic) = ins.2 {
+                    if mnemonic == "call" {
+                        if let Some(target_addr) = self.extract_call_target(ins, self.binary_info.base_addr) {
+
+                            // SEARCH IN addr_to_api
+                            if let Some((dll, api)) = self.addr_to_api.get(&target_addr) {
+                                // println!("DEBUG: Found target API {} -> {:?}:{:?}", target_addr, dll, api);
+                                api_refs.insert(ins_absolute_addr, (dll.clone(), api.clone()));
+                                continue;
+                            }
+
+                            // SEARCH IN self.apis
+                            if let Some(api_entry) = self.apis.get(&target_addr) {
+                                // println!("DEBUG: Found API via thunk {} -> {:?}", target_addr, api_entry.api_name);
+                                api_refs.insert(ins_absolute_addr, (api_entry.dll_name.clone(), api_entry.api_name.clone()));
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(api_refs)
+    }
+
+    fn extract_call_target(&self, instruction: &(u64, u32, Option<String>, Option<String>, Vec<u8>), base_addr: u64) -> Option<u64> {
+        let (ins_addr, ins_size, mnemonic, op_str, _ins_bytes) = instruction;
+
+        if let Some(mnem) = mnemonic {
+            if mnem != "call" {
+                return None;
+            }
+        } else {
+            return None;
+        }
+
+        if let Some(operands) = op_str {
+            // DIRECT CALL - call 0x12345
+            if operands.starts_with("0x") {
+                if let Ok(addr) = u64::from_str_radix(&operands[2..], 16) {
+                    // println!("DEBUG: Direct call target: {}", addr);
+                    return Some(addr);
+                }
+            }
+
+            // DWORD-PTR - call dword ptr [0x12345]
+            if operands.starts_with("dword ptr [0x") {
+                let start = "dword ptr [0x".len();
+                if let Some(end) = operands.find(']') {
+                    if let Ok(addr) = u64::from_str_radix(&operands[start..end], 16) {
+                        return Some(addr);
+                    }
+                }
+            }
+
+            // QWORD-PTR RIP-relative - call qword ptr [rip + 0x12345]
+            if operands.starts_with("qword ptr [rip") {
+                if let Some(plus_pos) = operands.find(" + 0x") {
+                    let start = plus_pos + 5; // " + 0x".len()
+                    if let Some(end) = operands[start..].find(']') {
+                        if let Ok(offset) = u64::from_str_radix(&operands[start..start+end], 16) {
+                            let rip = base_addr + ins_addr + *ins_size as u64;
+                            let target = rip + offset;
+                            return Some(target);
+                        }
+                    }
+                } else if let Some(minus_pos) = operands.find(" - 0x") {
+                    let start = minus_pos + 5; // " - 0x".len()
+                    if let Some(end) = operands[start..].find(']') {
+                        if let Ok(offset) = u64::from_str_radix(&operands[start..start+end], 16) {
+                            let rip = base_addr + ins_addr + *ins_size as u64;
+                            let target = rip - offset;
+                            return Some(target);
+                        }
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     pub fn get_confidence_threshold(&self) -> Result<f32> {
@@ -677,9 +779,15 @@ impl Disassembler {
         binary_info.file_path = file_name.to_string();
         match Object::parse(&file_content)? {
             Object::Elf(elf) => {
+                // println!("Parsing ELF file: {}", file_name);
                 binary_info.file_format = FileFormat::ELF;
                 binary_info.base_addr = elf::get_base_address(&file_content)?;
                 binary_info.bitness = elf::get_bitness(&file_content)?;
+                binary_info.file_architecture = match binary_info.bitness {
+                    64 => FileArchitecture::AMD64,
+                    32 => FileArchitecture::I386,
+                    _ => FileArchitecture::I386,  // fallback
+                };
                 binary_info.code_areas = elf::get_code_areas(&file_content, &elf)?;
                 binary_info.sections = elf
                     .section_headers
@@ -706,6 +814,7 @@ impl Disassembler {
                 //     .iter()
                 //     .map(|s| (s.name.unwrap_or("").to_string(), s.offset))
                 //     .collect();
+
                 binary_info.binary = elf::map_binary(&binary_info.raw_data)?;
                 binary_info.binary_size = binary_info.binary.len() as u64;
             }
@@ -780,6 +889,30 @@ impl Disassembler {
         // binary_info.binary_size, binary_info.base_addr)
         self.update_label_providers(&bin)?;
         self.disassembly.init(bin)?;
+        if self.disassembly.binary_info.file_format == FileFormat::ELF {
+            match elf::extract_elf_dynamic_apis(&self.disassembly.binary_info.raw_data) {
+                Ok(elf_apis) => {
+                    for (addr, (dll, api)) in elf_apis {
+                        let api_entry = label_providers::ApiEntry {
+                            referencing_addr: HashSet::new(),
+                            dll_name: dll,
+                            api_name: api,
+                        };
+
+                        self.disassembly.apis.insert(addr, api_entry);
+                    }
+
+                    if let Err(e) = self.disassembly.init_api_refs() {
+                        eprintln!("Error initializing ELF API references: {:?}", e);
+                    }
+
+                }
+                Err(e) => {
+                    eprintln!("Error extracting ELF APIs: {:?}", e);
+                }
+            }
+        }
+
         if ![32u32, 64u32].contains(&self.disassembly.binary_info.bitness) {
             self.disassembly.binary_info.bitness = self.determine_bitness()?;
         }
@@ -798,7 +931,6 @@ impl Disassembler {
             }
         }
         //LOGGER.debug("Finished heuristical analysis, functions: %d", len(self.disassembly.functions))
-
         let queue2 = self.fc_manager.get_queue()?;
         for addr in queue2 {
             if queue.contains(&addr) {
@@ -869,8 +1001,8 @@ impl Disassembler {
     fn get_disasm_window_buffer(&self, addr: u64) -> Vec<u8> {
         if (addr < self.disassembly.binary_info.base_addr)
             || (addr
-                >= self.disassembly.binary_info.base_addr
-                    + self.disassembly.binary_info.binary.len() as u64)
+            >= self.disassembly.binary_info.base_addr
+            + self.disassembly.binary_info.binary.len() as u64)
         {
             return vec![];
         }
@@ -931,8 +1063,7 @@ impl Disassembler {
     #[allow(unused_assignments)]
     fn get_referenced_addr_sign(&self, op_str: &str) -> Result<i64> {
         let mut number = 0;
-        let re_number_hex = regex::Regex::new(r"(?P<sign>[+\-]) (?P<num>0x[a-fA-F0-9]+)").unwrap();
-        let number_hex = re_number_hex.captures(op_str);
+        let number_hex = RE_NUMBER_HEX_SIGN.captures(op_str);
         if let Some(n) = number_hex {
             number = i64::from_str_radix(&n["num"][2..], 16)?;
             if &n["sign"] == "-" {
@@ -961,7 +1092,18 @@ impl Disassembler {
         }
         Ok((None, None))
     }
-
+    fn is_plt_got_address(&self, addr: u64) -> Result<bool> {
+        // Check if address is in .plt or .got section
+        for (section_name, section_start, section_size) in &self.disassembly.binary_info.sections {
+            if section_name.contains(".plt") || section_name.contains(".got") {
+                let section_end = section_start + *section_size as u64;
+                if addr >= *section_start && addr < section_end {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
     fn analyze_call_instruction(
         &mut self,
         i: &capstone::Insn,
@@ -969,22 +1111,15 @@ impl Disassembler {
     ) -> Result<()> {
         let i_address = i.address();
         let i_size = i.bytes().len();
-        let i_op_str = i.op_str(); //strip
+        let i_op_str = i.op_str();
         state.set_leaf(false)?;
+
         match i_op_str {
             Some(op_str) => {
-                // case = "FALLTHROUGH"
-                let call_destination = self.get_referenced_addr(op_str)?;
-                if !op_str.is_empty() && i_op_str.as_ref().unwrap().contains(':') {
-                    // case = "LONG-CALL"
-                }
                 if op_str.starts_with("dword ptr [") {
-                    //# case = "DWORD-PTR-REG"
                     if op_str.starts_with("dword ptr [0x") {
-                        //# case = "DWORD-PTR"
-                        if let Ok(dereferenced) =
-                            self.disassembly.dereference_dword(call_destination)
-                        {
+                        let call_destination = self.get_referenced_addr(op_str)?;
+                        if let Ok(dereferenced) = self.disassembly.dereference_dword(call_destination) {
                             state.add_code_ref(i_address, dereferenced, false)?;
                             self.handle_call_target(i_address, dereferenced, state)?;
                             self.handle_api_target(i_address, call_destination, dereferenced)?;
@@ -992,21 +1127,45 @@ impl Disassembler {
                     }
                 } else if op_str.starts_with("qword ptr [rip") {
                     let rip = i_address + i_size as u64;
-                    //let call_destination = rip + self.get_referenced_addr(op_str)?;
-                    let call_destination =
-                        ((rip as i64) + self.get_referenced_addr_sign(op_str)?) as u64;
+                    let call_destination = ((rip as i64) + self.get_referenced_addr_sign(op_str)?) as u64;
+
+                    // Search API in add_to_api
+                    if let Some((dll, api)) = self.disassembly.addr_to_api.get(&call_destination) {
+                        let mut api_entry = label_providers::ApiEntry {
+                            referencing_addr: HashSet::new(),
+                            dll_name: dll.clone(),
+                            api_name: api.clone(),
+                        };
+                        api_entry.referencing_addr.insert(i_address);
+                        self.disassembly.apis.insert(call_destination, api_entry);
+                    }
+
                     state.add_code_ref(i_address, call_destination, false)?;
                     if let Ok(dereferenced) = self.disassembly.dereference_qword(call_destination) {
                         self.handle_api_target(i_address, call_destination, dereferenced)?;
                     }
                 } else if op_str.starts_with("0x") {
-                    //# case = "DIRECT"
+                    let call_destination = self.get_referenced_addr(op_str)?;
+                    if self.disassembly.binary_info.file_format == FileFormat::ELF {
+                        if let Ok(api_info) = self.resolve_elf_thunk(call_destination) {
+                            if let Some((dll, api)) = api_info {
+                                let mut api_entry = label_providers::ApiEntry {
+                                    referencing_addr: HashSet::new(),
+                                    dll_name: dll.clone(),
+                                    api_name: api.clone(),
+                                };
+                                api_entry.referencing_addr.insert(i_address);
+                                self.disassembly.apis.insert(call_destination, api_entry);
+                                self.disassembly.addr_to_api.insert(call_destination, (dll.clone(), api.clone()));
+                            }
+                        }
+                    }
+
                     self.handle_call_target(i_address, call_destination, state)?;
                     self.handle_api_target(i_address, call_destination, call_destination)?;
                 } else if REGS_32BIT.contains(&op_str.to_lowercase().as_str())
                     || REGS_64BIT.contains(&op_str.to_lowercase().as_str())
                 {
-                    //# case = "REG"
                     state.call_register_ins.push(i_address);
                 }
                 Ok(())
@@ -1015,6 +1174,54 @@ impl Disassembler {
         }
     }
 
+    fn resolve_elf_thunk(&self, thunk_addr: u64) -> Result<Option<(Option<String>, Option<String>)>> {
+        if !self.disassembly.is_addr_within_memory_image(thunk_addr)? {
+            return Ok(None);
+        }
+
+        // first check if we already have this address mapped
+        if let Some((dll, api)) = self.disassembly.addr_to_api.get(&thunk_addr) {
+            return Ok(Some((dll.clone(), api.clone())));
+        }
+
+        let rel_addr = thunk_addr - self.disassembly.binary_info.base_addr;
+        if rel_addr + 16 > self.disassembly.binary_info.binary_size {
+            return Ok(None);
+        }
+
+        let bytes = &self.disassembly.binary_info.binary[rel_addr as usize..rel_addr as usize + 16];
+
+
+        // search for the pattern FF 25 ?? ?? ?? ??
+        for i in 0..12 {
+            if i + 5 < bytes.len() && bytes[i] == 0xFF && bytes[i + 1] == 0x25 {
+                let offset = i32::from_le_bytes([bytes[i + 2], bytes[i + 3], bytes[i + 4], bytes[i + 5]]);
+                let rip = thunk_addr + (i as u64) + 6;
+                let got_addr = (rip as i64 + offset as i64) as u64;
+
+                if let Some((dll, api)) = self.disassembly.addr_to_api.get(&got_addr) {
+                    return Ok(Some((dll.clone(), api.clone())));
+                } else {
+                    for candidate_addr in self.disassembly.addr_to_api.keys() {
+                        let diff = if *candidate_addr > got_addr {
+                            *candidate_addr - got_addr
+                        } else {
+                            got_addr - *candidate_addr
+                        };
+
+                        if diff <= 8 {
+                            if let Some((dll, api)) = self.disassembly.addr_to_api.get(candidate_addr) {
+                                return Ok(Some((dll.clone(), api.clone())));
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+        }
+
+        Ok(None)
+    }
     fn analyze_jmp_instruction(
         &mut self,
         i: &capstone::Insn,
@@ -1161,7 +1368,6 @@ impl Disassembler {
         high_accuracy: bool,
     ) -> Result<FunctionAnalysisState> {
         self.tailcall_analyzer.init()?;
-        let mut _i = 0;
         let mut state = FunctionAnalysisState::new(start_addr)?;
         if state.is_processed_function(&self.disassembly) {
             self.fc_manager.update_analysis_aborted(
@@ -1283,9 +1489,9 @@ impl Disassembler {
                                     None,
                                     &self.disassembly,
                                 )?;
-                                exit_flag = true;
-                                break;
                             }
+                            exit_flag = true;
+                            break;
                         }
                     }
                     previous_address = Some(i_address);
@@ -1338,7 +1544,7 @@ impl Disassembler {
         if let Ok(_analysis_result) = state.finalize_analysis(as_gap, &mut self.disassembly) {
             let (api_e, cand_e) = self
                 .indirect_call_analyser
-                .resolve_register_calls(self, &mut state, 3)?;
+                .resolve_register_calls(self, &mut state, 4)?;
             for a in api_e {
                 match self.disassembly.apis.get_mut(&a.0) {
                     Some(s) => {

@@ -1,4 +1,4 @@
-use crate::{BinaryInfo, Result};
+use crate::{BinaryInfo, Error, Result};
 use std::{
     collections::{HashMap, HashSet},
     convert::TryInto,
@@ -114,13 +114,39 @@ pub struct FunctionCandidate {
 
 impl FunctionCandidate {
     pub fn new(bi: &BinaryInfo, addr: u64) -> Result<FunctionCandidate> {
+        // Check if the address is below the base address
+        if addr < bi.base_addr {
+            return Err(Error::InvalidAddress(format!(
+                "Address 0x{:x} is below base address 0x{:x}",
+                addr, bi.base_addr
+            )));
+        }
+
         let rel_addr = addr - bi.base_addr;
+
+        // This check ensures that we have at least 5 bytes available from the relative address
+        if (rel_addr as usize + 5) > bi.binary.len() {
+            return Err(Error::InvalidAddress(format!(
+                "Not enough bytes at address 0x{:x} (rel_addr: 0x{:x}, binary size: {})",
+                addr, rel_addr, bi.binary.len()
+            )));
+        }
+
+        // This check ensures that the relative address is within the bounds of the binary
+        let rel_addr_usize = rel_addr as usize;
+        if rel_addr_usize >= bi.binary.len() {
+            return Err(Error::InvalidAddress(format!(
+                "Relative address 0x{:x} is beyond binary size {}",
+                rel_addr, bi.binary.len()
+            )));
+        }
+
         let mut fc = FunctionCandidate {
             cp: CommonPlagues::init(),
             bitness: bi.bitness,
             addr,
             rel_start_addr: rel_addr,
-            bytes: bi.binary[rel_addr as usize..(rel_addr + 5) as usize].try_into()?,
+            bytes: bi.binary[rel_addr_usize..rel_addr_usize + 5].try_into()?,
             lang_spec: None,
             call_ref_sources: HashSet::new(),
             finished: false,
@@ -138,6 +164,7 @@ impl FunctionCandidate {
             is_initial_candidate: false,
             is_exception_handler: false,
         };
+
         if fc.addr % 4 == 0 {
             fc.alignment = 4;
         }

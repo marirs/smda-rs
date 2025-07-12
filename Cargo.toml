@@ -15,7 +15,7 @@ edition = "2021"
 [dependencies]
 capstone = "0.13.0"
 data-encoding = "2.6.0"
-goblin = { version = "0.9.3", features = ["alloc"] }
+goblin = { version = "0.10.0", features = ["alloc"] }
 hex = "0.4.3"
 itertools = "0.13.0"
 lazy_static = "1"

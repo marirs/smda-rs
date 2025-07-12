@@ -18,6 +18,8 @@ pub enum Error {
     CollisionError(u64),
     #[error("dereference error: {0}")]
     DereferenceError(u64),
+    #[error("invalid address: {0}")]
+    InvalidAddress(String),
 
     #[error("{0}")]
     FromSliceError(#[from] std::array::TryFromSliceError),

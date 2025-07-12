@@ -53,6 +53,7 @@ impl GapSequences {
                 b"\x8d\x00".to_vec(), //lea eax, dword ptr [eax]
                 b"\x86\xc0".to_vec(), //xchg al, al
                 b"\x66\x2e".to_vec(), //NOP2_OVERRIDE_NOP - AMD / nop - INTEL
+                b"\x89\xf6".to_vec(), //mov esi, esi
             ],
         );
         gs.gs.insert(
@@ -841,6 +842,8 @@ impl FunctionCandidateManager {
                 self.gap_pointer = self.function_gaps[0].0;
             }
         }
+        // sort gaps by start address
+        self.function_gaps.sort_by_key(|gap| gap.0);
         //LOGGER.debug("initGapSearch() gaps are:")
         for _gap in &self.function_gaps {
             //LOGGER.debug("initGapSearch() 0x%08x - 0x%08x == %d",
