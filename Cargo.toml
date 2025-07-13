@@ -2,7 +2,7 @@
 name = "smda"
 description = "SMDA is a minimalist recursive disassembler library."
 version = "0.2.13"
-authors = ["Marirs <marirs@gmail.com>", "Andrey Mnatsakanov <andrey@3ig.kiev.ua>"]
+authors = ["Marirs <marirs@gmail.com>", "Andrey Mnatsakanov <andrey@3ig.kiev.ua>", "Jorge Alejandro Durán Royo<jorge.duran.royo@gmail.com>"]
 keywords = ["smda", "disassembler", "cfg", "capstone"]
 categories = ["parsing", "development-tools::debugging"]
 license-file = "LICENSE"
