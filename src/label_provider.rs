@@ -1,10 +1,10 @@
 use crate::{
+    BinaryInfo, Result,
     error::Error,
     label_providers::{
         elf_api_resolver::ElfApiResolver, elf_symbol_provider::ElfSymbolProvider,
         pdb_symbol_provider::PdbSymbolProvider, win_api_resolver::WinApiResolver,
     },
-    BinaryInfo, Result,
 };
 
 #[derive(Debug)]

@@ -1,8 +1,8 @@
-use crate::{
-    error::Error, function_candidate::FunctionCandidate, DisassemblyResult, FunctionAnalysisState,
-    Result,
-};
 use crate::function::DecodedInsn;
+use crate::{
+    DisassemblyResult, FunctionAnalysisState, Result, error::Error,
+    function_candidate::FunctionCandidate,
+};
 use iced_x86::{Decoder, DecoderOptions, Mnemonic};
 use itertools::Itertools;
 use regex::bytes::Regex as BytesRegex;
@@ -406,8 +406,9 @@ impl FunctionCandidateManager {
 
         if self.bitness == 32 {
             for call_match in BITNESS.find_iter(&disassembly.binary_info.binary) {
-                let function_addr =
-                    self.resolve_pointer_reference(call_match.start() as u64, disassembly).ok();
+                let function_addr = self
+                    .resolve_pointer_reference(call_match.start() as u64, disassembly)
+                    .ok();
                 if !self.passes_code_filter(function_addr)? {
                     continue;
                 }
@@ -424,8 +425,9 @@ impl FunctionCandidateManager {
             }
 
             for call_match in CELL_MATCH.find_iter(&disassembly.binary_info.binary) {
-                let function_addr =
-                    self.resolve_pointer_reference(call_match.start() as u64, disassembly).ok();
+                let function_addr = self
+                    .resolve_pointer_reference(call_match.start() as u64, disassembly)
+                    .ok();
                 if !self.passes_code_filter(function_addr)? {
                     continue;
                 }
@@ -573,16 +575,18 @@ impl FunctionCandidateManager {
         Ok(self.candidate_offsets.clone())
     }
 
-    pub fn is_alignment_sequence(
-        &self,
-        instruction_sequence: &[DecodedInsn],
-    ) -> Result<bool> {
+    pub fn is_alignment_sequence(&self, instruction_sequence: &[DecodedInsn]) -> Result<bool> {
         let mut is_alignment_sequence = false;
         if !instruction_sequence.is_empty() {
             let mut current_offset = instruction_sequence[0].offset;
             for instruction in instruction_sequence {
                 let len = instruction.bytes.len();
-                if self.gs.gs.get(&len).is_some_and(|set| set.contains(&instruction.bytes)) {
+                if self
+                    .gs
+                    .gs
+                    .get(&len)
+                    .is_some_and(|set| set.contains(&instruction.bytes))
+                {
                     current_offset += len as u64;
                     if current_offset.is_multiple_of(16) {
                         is_alignment_sequence = true;
@@ -691,7 +695,8 @@ impl FunctionCandidateManager {
             // NOP encoding; if so, skip it and continue looking.
             {
                 let buf = disassembly.get_raw_bytes(gap_offset, 15)?;
-                let mut decoder = Decoder::with_ip(self.bitness, buf, gap_offset, DecoderOptions::NONE);
+                let mut decoder =
+                    Decoder::with_ip(self.bitness, buf, gap_offset, DecoderOptions::NONE);
                 if decoder.can_decode() {
                     let insn = decoder.decode();
                     if !insn.is_invalid() && matches!(insn.mnemonic(), Mnemonic::Nop) {
@@ -739,8 +744,8 @@ impl FunctionCandidateManager {
                 let _start_byte = disassembly.get_raw_byte(gap_offset)?;
             }
             let has_common_prologue = true; //start_byte in
-                                            // FunctionCandidate(self.gap_pointer, start_byte,
-                                            // self.bitness).common_gap_starts[self.bitness]
+            // FunctionCandidate(self.gap_pointer, start_byte,
+            // self.bitness).common_gap_starts[self.bitness]
             if (self.previously_analyzed_gap == self.gap_pointer) || !has_common_prologue {
                 //LOGGER.debug("--- HRM, nextGapCandidate() gap_ptr at: 0x%08x was previously analyzed", self.gap_pointer)
                 self.gap_pointer = self.get_next_gap(true, disassembly)?;

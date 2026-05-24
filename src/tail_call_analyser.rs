@@ -1,4 +1,4 @@
-use crate::{error::Error, Disassembler, FunctionAnalysisState, Result};
+use crate::{Disassembler, FunctionAnalysisState, Result, error::Error};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug)]
@@ -109,23 +109,23 @@ impl TailCallAnalyser {
                 && disassembler.tailcall_analyzer.functions[&addr]
                     .instruction_start_bytes
                     .contains(&tailcall.destination_function)
-                {
-                    //# analyze the (previously) broken function a second time
-                    disassembler.analyse_function(
-                        tailcall.destination_function,
-                        false,
-                        high_accuracy,
-                    )?;
-                    let addr_function = disassembler
-                        .tailcall_analyzer
-                        .get_function_by_start_addr(tailcall.destination_function)?;
-                    disassembler
-                        .tailcall_analyzer
-                        .functions
-                        .get_mut(&addr_function)
-                        .ok_or(Error::LogicError(file!(), line!()))?
-                        .is_tailcall_function = true;
-                }
+            {
+                //# analyze the (previously) broken function a second time
+                disassembler.analyse_function(
+                    tailcall.destination_function,
+                    false,
+                    high_accuracy,
+                )?;
+                let addr_function = disassembler
+                    .tailcall_analyzer
+                    .get_function_by_start_addr(tailcall.destination_function)?;
+                disassembler
+                    .tailcall_analyzer
+                    .functions
+                    .get_mut(&addr_function)
+                    .ok_or(Error::LogicError(file!(), line!()))?
+                    .is_tailcall_function = true;
+            }
         }
         Ok(newly_created_functions)
     }

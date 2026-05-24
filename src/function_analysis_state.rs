@@ -1,4 +1,4 @@
-use crate::{error::Error, function::DecodedInsn, DisassemblyResult, Result};
+use crate::{DisassemblyResult, Result, error::Error, function::DecodedInsn};
 use iced_x86::{FlowControl, Mnemonic};
 use std::collections::{HashMap, HashSet, VecDeque};
 

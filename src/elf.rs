@@ -1,6 +1,6 @@
+use crate::{Result, error::Error};
+use goblin::elf::program_header::{PT_DYNAMIC, PT_LOAD};
 use std::collections::{HashMap, HashSet};
-use goblin::elf::program_header::{PT_LOAD, PT_DYNAMIC};
-use crate::{error::Error, Result};
 
 pub fn get_bitness(binary: &[u8]) -> Result<u32> {
     let elffile = match goblin::Object::parse(binary) {
@@ -36,9 +36,9 @@ pub fn get_base_address(binary: &[u8]) -> Result<u64> {
                     .filter(|ph| ph.p_type == PT_LOAD && ph.p_vaddr != 0)
                     .map(|ph| ph.p_vaddr)
                     .min()
-                {
-                    base = min_vaddr;
-                }
+            {
+                base = min_vaddr;
+            }
 
             Ok(base)
         }
@@ -112,7 +112,9 @@ pub fn map_binary(binary: &[u8]) -> Result<Vec<u8>> {
         }
 
         let rva = segment.p_vaddr - base_addr;
-        let file_size = segment.p_filesz.min((binary.len() as u64).saturating_sub(segment.p_offset));
+        let file_size = segment
+            .p_filesz
+            .min((binary.len() as u64).saturating_sub(segment.p_offset));
 
         if rva + file_size <= mapped_binary.len() as u64 && file_size > 0 {
             let src_start = segment.p_offset as usize;
@@ -150,7 +152,9 @@ pub fn map_binary(binary: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Extracts ALL symbols (dynamic + static + exported)
-pub fn extract_all_symbols(binary: &[u8]) -> Result<HashMap<u64, (Option<String>, Option<String>)>> {
+pub fn extract_all_symbols(
+    binary: &[u8],
+) -> Result<HashMap<u64, (Option<String>, Option<String>)>> {
     let mut symbol_map = HashMap::new();
 
     match goblin::Object::parse(binary) {
@@ -171,7 +175,8 @@ pub fn extract_all_symbols(binary: &[u8]) -> Result<HashMap<u64, (Option<String>
             symbol_map.extend(exported_symbols);
 
             // 4. Fallback for unmapped dynamic symbols
-            let fallback_symbols = extract_elf_dynamic_apis_fallback_internal(&elf, &lib_map, binary)?;
+            let fallback_symbols =
+                extract_elf_dynamic_apis_fallback_internal(&elf, &lib_map, binary)?;
             for (addr, (lib, name)) in fallback_symbols {
                 symbol_map.entry(addr).or_insert((lib, name));
             }
@@ -184,7 +189,9 @@ pub fn extract_all_symbols(binary: &[u8]) -> Result<HashMap<u64, (Option<String>
 }
 
 /// Extracts only dynamic APIs (for compatibility with original code)
-pub fn extract_elf_dynamic_apis(binary: &[u8]) -> Result<HashMap<u64, (Option<String>, Option<String>)>> {
+pub fn extract_elf_dynamic_apis(
+    binary: &[u8],
+) -> Result<HashMap<u64, (Option<String>, Option<String>)>> {
     let mut api_map = HashMap::new();
 
     match goblin::Object::parse(binary) {
@@ -197,7 +204,8 @@ pub fn extract_elf_dynamic_apis(binary: &[u8]) -> Result<HashMap<u64, (Option<St
             api_map.extend(relocation_symbols);
 
             // Fallback for dynamic APIs
-            let fallback_symbols = extract_elf_dynamic_apis_fallback_internal(&elf, &lib_map, binary)?;
+            let fallback_symbols =
+                extract_elf_dynamic_apis_fallback_internal(&elf, &lib_map, binary)?;
             for (addr, (lib, name)) in fallback_symbols {
                 api_map.entry(addr).or_insert((lib, name));
             }
@@ -229,27 +237,31 @@ pub fn extract_local_functions(binary: &[u8]) -> Result<Vec<(u64, String)>> {
 
 fn extract_dynamic_symbols_with_relocations(
     elf: &goblin::elf::Elf,
-    lib_map: &HashMap<&str, String>
+    lib_map: &HashMap<&str, String>,
 ) -> Result<HashMap<u64, (Option<String>, Option<String>)>> {
     let mut symbols = HashMap::new();
 
     // Obtain the base address from the program headers
-    let base_addr = elf.program_headers.iter()
+    let base_addr = elf
+        .program_headers
+        .iter()
         .filter(|ph| ph.p_type == PT_LOAD)
         .map(|ph| ph.p_vaddr.saturating_sub(ph.p_offset))
-        .min().unwrap_or(0);
+        .min()
+        .unwrap_or(0);
 
     for reloc in &elf.pltrelocs {
         let sym_idx = reloc.r_sym;
 
         if let Some(symbol) = elf.dynsyms.get(sym_idx)
             && let Some(symbol_name) = elf.dynstrtab.get_at(symbol.st_name)
-                && !symbol_name.is_empty() {
-                    let library = detect_library_from_symbol(symbol_name, lib_map);
-                    // Apply base address to the relocation offset
-                    let final_addr = base_addr + reloc.r_offset;
-                    symbols.insert(final_addr, (library, Some(symbol_name.to_string())));
-                }
+            && !symbol_name.is_empty()
+        {
+            let library = detect_library_from_symbol(symbol_name, lib_map);
+            // Apply base address to the relocation offset
+            let final_addr = base_addr + reloc.r_offset;
+            symbols.insert(final_addr, (library, Some(symbol_name.to_string())));
+        }
     }
 
     for reloc in elf.dynrelas.iter().chain(elf.dynrels.iter()) {
@@ -257,46 +269,58 @@ fn extract_dynamic_symbols_with_relocations(
 
         if let Some(symbol) = elf.dynsyms.get(sym_idx)
             && let Some(symbol_name) = elf.dynstrtab.get_at(symbol.st_name)
-                && !symbol_name.is_empty() {
-                    let library = detect_library_from_symbol(symbol_name, lib_map);
+            && !symbol_name.is_empty()
+        {
+            let library = detect_library_from_symbol(symbol_name, lib_map);
 
-                    // Apply base address to the relocation offset
-                    let final_addr = base_addr + reloc.r_offset;
-                    symbols.insert(final_addr, (library, Some(symbol_name.to_string())));
-
-                }
+            // Apply base address to the relocation offset
+            let final_addr = base_addr + reloc.r_offset;
+            symbols.insert(final_addr, (library, Some(symbol_name.to_string())));
+        }
     }
 
     Ok(symbols)
 }
 
-fn extract_static_symbols(elf: &goblin::elf::Elf) -> Result<HashMap<u64, (Option<String>, Option<String>)>> {
+fn extract_static_symbols(
+    elf: &goblin::elf::Elf,
+) -> Result<HashMap<u64, (Option<String>, Option<String>)>> {
     let mut symbols = HashMap::new();
 
     for sym in &elf.syms {
         if let Some(name) = elf.strtab.get_at(sym.st_name)
-            && !name.is_empty() && sym.st_value != 0 {
-                let symbol_type = sym.st_info & 0xf;
-                if symbol_type == 2 {  // STT_FUNC
-                    symbols.insert(sym.st_value, (None, Some(name.to_string())));
-                }
+            && !name.is_empty()
+            && sym.st_value != 0
+        {
+            let symbol_type = sym.st_info & 0xf;
+            if symbol_type == 2 {
+                // STT_FUNC
+                symbols.insert(sym.st_value, (None, Some(name.to_string())));
             }
+        }
     }
 
     Ok(symbols)
 }
 
-fn extract_exported_symbols(elf: &goblin::elf::Elf) -> Result<HashMap<u64, (Option<String>, Option<String>)>> {
+fn extract_exported_symbols(
+    elf: &goblin::elf::Elf,
+) -> Result<HashMap<u64, (Option<String>, Option<String>)>> {
     let mut symbols = HashMap::new();
 
     for sym in &elf.dynsyms {
         if let Some(name) = elf.dynstrtab.get_at(sym.st_name)
-            && !name.is_empty() && sym.st_value != 0 {
-                let is_exported = sym.st_shndx != goblin::elf::section_header::SHN_UNDEF as usize;
-                if is_exported {
-                    symbols.insert(sym.st_value, (Some("SELF".to_string()), Some(name.to_string())));
-                }
+            && !name.is_empty()
+            && sym.st_value != 0
+        {
+            let is_exported = sym.st_shndx != goblin::elf::section_header::SHN_UNDEF as usize;
+            if is_exported {
+                symbols.insert(
+                    sym.st_value,
+                    (Some("SELF".to_string()), Some(name.to_string())),
+                );
             }
+        }
     }
 
     Ok(symbols)
@@ -309,7 +333,9 @@ fn extract_elf_dynamic_apis_fallback_internal(
 ) -> Result<HashMap<u64, (Option<String>, Option<String>)>> {
     let mut api_map = HashMap::new();
 
-    let got_section = elf.section_headers.iter()
+    let got_section = elf
+        .section_headers
+        .iter()
         .find(|section| {
             if let Some(name) = elf.shdr_strtab.get_at(section.sh_name) {
                 name == ".got.plt"
@@ -353,11 +379,12 @@ fn extract_elf_dynamic_apis_fallback_internal(
     }
 
     let entry_size = if elf.is_64 { 8 } else { 4 };
-    let first_api_offset = if got_section.and_then(|s| elf.shdr_strtab.get_at(s.sh_name)) == Some(".got.plt") {
-        3 * entry_size
-    } else {
-        0
-    };
+    let first_api_offset =
+        if got_section.and_then(|s| elf.shdr_strtab.get_at(s.sh_name)) == Some(".got.plt") {
+            3 * entry_size
+        } else {
+            0
+        };
 
     for (i, (api_name, library)) in imported_symbols.iter().enumerate() {
         let got_entry_addr = got_addr + first_api_offset + (i as u64 * entry_size);
@@ -368,14 +395,17 @@ fn extract_elf_dynamic_apis_fallback_internal(
 
         let got_file_offset = got_offset + first_api_offset + (i as u64 * entry_size);
 
-        if let Some(bytes) = binary.get(got_file_offset as usize..(got_file_offset + entry_size) as usize) {
+        if let Some(bytes) =
+            binary.get(got_file_offset as usize..(got_file_offset + entry_size) as usize)
+        {
             let ptr = if elf.is_64 {
                 u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]))
             } else {
                 u32::from_le_bytes(bytes.try_into().unwrap_or([0; 4])) as u64
             };
 
-            let is_got_plt = got_section.and_then(|s| elf.shdr_strtab.get_at(s.sh_name)) == Some(".got.plt");
+            let is_got_plt =
+                got_section.and_then(|s| elf.shdr_strtab.get_at(s.sh_name)) == Some(".got.plt");
             if ptr != 0 || is_got_plt {
                 api_map.insert(got_entry_addr, (library.clone(), Some(api_name.clone())));
             }
@@ -411,13 +441,15 @@ fn get_dynamic_dependencies(binary: &[u8], elf: &goblin::elf::Elf) -> Result<Vec
                     (tag, val)
                 };
 
-                if tag == 1 {  // DT_NEEDED
+                if tag == 1 {
+                    // DT_NEEDED
                     if let Some(lib_name) = elf.dynstrtab.get_at(val as usize) {
                         dependencies.push(lib_name.to_string());
                     }
                 }
 
-                if tag == 0 {  // DT_NULL
+                if tag == 0 {
+                    // DT_NULL
                     break;
                 }
             }
@@ -456,17 +488,27 @@ fn create_library_mapping(dependencies: &[String]) -> HashMap<&str, String> {
     lib_map
 }
 
-fn detect_library_from_symbol(symbol_name: &str, lib_map: &HashMap<&str, String>) -> Option<String> {
+fn detect_library_from_symbol(
+    symbol_name: &str,
+    lib_map: &HashMap<&str, String>,
+) -> Option<String> {
     let clean_name = symbol_name.split("@@").next().unwrap_or(symbol_name);
 
     // 1. PATTERN KNOWN LIBRARIES
     let library_patterns = [
         ("_Z", "libstdc++"),
-        ("socket", "libc"), ("connect", "libc"), ("bind", "libc"),
-        ("open", "libc"), ("read", "libc"), ("write", "libc"),
-        ("fork", "libc"), ("exec", "libc"), ("wait", "libc"),
+        ("socket", "libc"),
+        ("connect", "libc"),
+        ("bind", "libc"),
+        ("open", "libc"),
+        ("read", "libc"),
+        ("write", "libc"),
+        ("fork", "libc"),
+        ("exec", "libc"),
+        ("wait", "libc"),
         ("pthread_", "libpthread"),
-        ("crypto_", "libcrypto"), ("ssl_", "libssl"),
+        ("crypto_", "libcrypto"),
+        ("ssl_", "libssl"),
     ];
 
     for (pattern, lib) in library_patterns {
@@ -477,22 +519,35 @@ fn detect_library_from_symbol(symbol_name: &str, lib_map: &HashMap<&str, String>
 
     // 2. FUNCTIONS KNOWN TO BE IN LIBRARIES
     let libc_functions = [
-        "printf", "scanf", "malloc", "free", "memcpy", "strcpy", "strlen",
-        "fopen", "fclose", "fread", "fwrite", "exit", "abort", "sprintf",
-        "strcmp", "strcat", "memset", "calloc", "realloc", "puts", "gets",
-        "atoi", "atof", "strtol", "rand", "srand", "time", "system",
-        "getpid", "getppid", "getuid", "getgid", "geteuid", "getegid"
+        "printf", "scanf", "malloc", "free", "memcpy", "strcpy", "strlen", "fopen", "fclose",
+        "fread", "fwrite", "exit", "abort", "sprintf", "strcmp", "strcat", "memset", "calloc",
+        "realloc", "puts", "gets", "atoi", "atof", "strtol", "rand", "srand", "time", "system",
+        "getpid", "getppid", "getuid", "getgid", "geteuid", "getegid",
     ];
 
     let pthread_functions = [
-        "pthread_create", "pthread_join", "pthread_mutex_lock",
-        "pthread_mutex_unlock", "pthread_cond_wait", "pthread_cond_signal",
-        "pthread_detach", "pthread_exit", "pthread_self"
+        "pthread_create",
+        "pthread_join",
+        "pthread_mutex_lock",
+        "pthread_mutex_unlock",
+        "pthread_cond_wait",
+        "pthread_cond_signal",
+        "pthread_detach",
+        "pthread_exit",
+        "pthread_self",
     ];
 
     let libdl_functions = ["dlopen", "dlsym", "dlclose", "dlerror"];
-    let libm_functions = ["sin", "cos", "tan", "log", "exp", "sqrt", "pow", "floor", "ceil"];
-    let ssl_functions = ["SSL_new", "SSL_connect", "SSL_read", "SSL_write", "SSL_free"];
+    let libm_functions = [
+        "sin", "cos", "tan", "log", "exp", "sqrt", "pow", "floor", "ceil",
+    ];
+    let ssl_functions = [
+        "SSL_new",
+        "SSL_connect",
+        "SSL_read",
+        "SSL_write",
+        "SSL_free",
+    ];
     let crypto_functions = ["EVP_encrypt", "EVP_decrypt", "MD5", "SHA1", "AES_encrypt"];
     let z_functions = ["deflate", "inflate", "compress", "uncompress", "gzip"];
 
@@ -525,13 +580,16 @@ fn detect_library_from_symbol(symbol_name: &str, lib_map: &HashMap<&str, String>
 
     // 4. FALLBACK LOGIC
     // For unknown functions like unknown.Init(), assign to available library
-    let non_libc_libs: Vec<_> = lib_map.values()
+    let non_libc_libs: Vec<_> = lib_map
+        .values()
         .filter(|lib| !lib.contains("libc.so"))
         .collect();
 
     if !non_libc_libs.is_empty() {
         // hashing to avoid collisions
-        let hash = clean_name.bytes().fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
+        let hash = clean_name
+            .bytes()
+            .fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
         let lib_index = (hash as usize) % non_libc_libs.len();
         return Some(non_libc_libs[lib_index].clone());
     }
@@ -539,7 +597,9 @@ fn detect_library_from_symbol(symbol_name: &str, lib_map: &HashMap<&str, String>
     // some libraries may not be detected
     if !lib_map.is_empty() {
         let all_libs: Vec<_> = lib_map.values().collect();
-        let hash = clean_name.bytes().fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
+        let hash = clean_name
+            .bytes()
+            .fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
         let lib_index = (hash as usize) % all_libs.len();
         return Some(all_libs[lib_index].clone());
     }

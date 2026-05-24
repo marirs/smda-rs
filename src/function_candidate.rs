@@ -128,7 +128,9 @@ impl FunctionCandidate {
         if (rel_addr as usize + 5) > bi.binary.len() {
             return Err(Error::InvalidAddress(format!(
                 "Not enough bytes at address 0x{:x} (rel_addr: 0x{:x}, binary size: {})",
-                addr, rel_addr, bi.binary.len()
+                addr,
+                rel_addr,
+                bi.binary.len()
             )));
         }
 
@@ -137,7 +139,8 @@ impl FunctionCandidate {
         if rel_addr_usize >= bi.binary.len() {
             return Err(Error::InvalidAddress(format!(
                 "Relative address 0x{:x} is beyond binary size {}",
-                rel_addr, bi.binary.len()
+                rel_addr,
+                bi.binary.len()
             )));
         }
 

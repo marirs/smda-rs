@@ -1,9 +1,9 @@
 #![allow(clippy::too_many_arguments)]
 use crate::{
-    error::Error,
-    function::{capstone_compat_formatter, DecodedInsn},
-    label_providers::ApiEntry,
     Disassembler, FunctionAnalysisState, Result,
+    error::Error,
+    function::{DecodedInsn, capstone_compat_formatter},
+    label_providers::ApiEntry,
 };
 use iced_x86::{Formatter, Mnemonic};
 use regex::Regex;
@@ -266,8 +266,7 @@ impl IndirectCallAnalyser {
         if !disassembler.disassembly.is_addr_within_memory_image(addr)? {
             return Err(Error::LogicError(file!(), line!()));
         }
-        let extracted_dword: &[u8; 4] =
-            &disassembler.disassembly.get_bytes(addr, 4)?.try_into()?;
+        let extracted_dword: &[u8; 4] = &disassembler.disassembly.get_bytes(addr, 4)?.try_into()?;
         Ok(u32::from_le_bytes(*extracted_dword) as u64)
     }
 }

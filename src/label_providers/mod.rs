@@ -1,4 +1,4 @@
-use crate::{label_provider::LabelProvider, Result};
+use crate::{Result, label_provider::LabelProvider};
 
 pub mod elf_api_resolver;
 pub mod elf_symbol_provider;

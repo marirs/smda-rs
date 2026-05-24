@@ -27,16 +27,18 @@ impl ElfApiResolver {
                 for reloc in elf.pltrelocs.iter() {
                     if reloc.r_sym != 0
                         && let Some(sym) = elf.dynsyms.get(reloc.r_sym)
-                            && sym.is_import() && sym.is_function() {
-                                self.api_map.get_mut("lief").unwrap().insert(
-                                    address,
-                                    (
-                                        "".to_string(),
-                                        elf.dynstrtab.get_at(sym.st_name).unwrap_or("").to_string(),
-                                    ),
-                                );
-                                address += 0x10;
-                            }
+                        && sym.is_import()
+                        && sym.is_function()
+                    {
+                        self.api_map.get_mut("lief").unwrap().insert(
+                            address,
+                            (
+                                "".to_string(),
+                                elf.dynstrtab.get_at(sym.st_name).unwrap_or("").to_string(),
+                            ),
+                        );
+                        address += 0x10;
+                    }
                 }
                 //     let mut lib = None;
                 //     if relocation.symbol.has_version && relocation.symbol.symbol_version.has_auxiliary_version{
@@ -58,9 +60,10 @@ impl ElfApiResolver {
         _absolute_addr: u64,
     ) -> Result<(Option<String>, Option<String>)> {
         if let Some(s) = self.api_map.get("lief")
-            && let Some((dll, api)) = s.get(&to_addr) {
-                return Ok((Some(dll.to_string()), Some(api.to_string())));
-            }
+            && let Some((dll, api)) = s.get(&to_addr)
+        {
+            return Ok((Some(dll.to_string()), Some(api.to_string())));
+        }
         Ok((None, None))
     }
 }

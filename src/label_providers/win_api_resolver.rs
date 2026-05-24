@@ -1,4 +1,4 @@
-use crate::{error::Error, BinaryInfo, Result};
+use crate::{BinaryInfo, Result, error::Error};
 use goblin::Object;
 
 #[derive(Debug)]
@@ -53,9 +53,10 @@ impl OrdinalHelper {
     pub fn resolve_ordinal(&self, dll_name: &str, ordinal: &u16) -> Result<String> {
         let dll_name = dll_name.to_lowercase();
         if let Some(s) = self.ordinals.get(&dll_name)
-            && let Some(o) = s.get(ordinal) {
-                return Ok(o.to_string());
-            }
+            && let Some(o) = s.get(ordinal)
+        {
+            return Ok(o.to_string());
+        }
         Err(Error::LogicError(file!(), line!()))
     }
 }

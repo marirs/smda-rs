@@ -1,14 +1,15 @@
-use crate::{error::Error, Result};
+use crate::{Result, error::Error};
 use std::convert::TryInto;
 
 pub fn get_bitness(binary: &[u8]) -> Result<u32> {
     let mut bitness_id = 0;
     if let Ok(pe_offset) = get_pe_offset(binary)
-        && pe_offset != 0 && binary.len() as u64 >= pe_offset + 0x6 {
-            let bb: [u8; 2] =
-                binary[pe_offset as usize + 0x4..pe_offset as usize + 0x6].try_into()?;
-            bitness_id = u16::from_le_bytes(bb);
-        }
+        && pe_offset != 0
+        && binary.len() as u64 >= pe_offset + 0x6
+    {
+        let bb: [u8; 2] = binary[pe_offset as usize + 0x4..pe_offset as usize + 0x6].try_into()?;
+        bitness_id = u16::from_le_bytes(bb);
+    }
     match bitness_id {
         0x14c => Ok(32),
         0x8664 => Ok(64),

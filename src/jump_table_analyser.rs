@@ -1,28 +1,26 @@
 #![allow(clippy::invalid_regex)]
 use crate::{
-    error::Error, function::{capstone_compat_formatter, DecodedInsn}, Disassembler, DisassemblyResult,
-    FunctionAnalysisState, Result,
+    Disassembler, DisassemblyResult, FunctionAnalysisState, Result,
+    error::Error,
+    function::{DecodedInsn, capstone_compat_formatter},
 };
 use iced_x86::{Formatter, Mnemonic};
-use regex::{bytes::Regex as BytesRegex, Regex};
+use regex::{Regex, bytes::Regex as BytesRegex};
 use std::convert::TryInto;
 use std::sync::LazyLock;
 
-static BYTES: LazyLock<BytesRegex> = LazyLock::new(|| {
-    BytesRegex::new(r"(?-u)(\x48|\x4c)\x8d.{5}(.\x63|\x77|.\x89..\x63)").unwrap()
-});
+static BYTES: LazyLock<BytesRegex> =
+    LazyLock::new(|| BytesRegex::new(r"(?-u)(\x48|\x4c)\x8d.{5}(.\x63|\x77|.\x89..\x63)").unwrap());
 static JMP_TBL_SIZE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?-u)(?P<one>[a-z0-9]{2,4}), (?P<two>([0-9])|(0x[0-9a-f]+))").unwrap()
 });
 static DIRECT_HANDLER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?-u)[a-z0-9]{2,3}, dword ptr \[[^ ]+ \+ 0x[0-9a-f]+\]").unwrap()
 });
-static X86_HANDLER: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?-u)[a-z0-9]{2,3}, \[rip (\+|\-) 0x[0-9a-f]+\]").unwrap()
-});
-static X86_BONUS_OFFSET: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?-u)[a-z0-9]{2,3},.*0x[0-9a-f]+\]").unwrap()
-});
+static X86_HANDLER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?-u)[a-z0-9]{2,3}, \[rip (\+|\-) 0x[0-9a-f]+\]").unwrap());
+static X86_BONUS_OFFSET: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?-u)[a-z0-9]{2,3},.*0x[0-9a-f]+\]").unwrap());
 
 /// Format the operands string for a DecodedInsn using the capstone-compatible
 /// formatter — used here so the legacy regex-based heuristics keep matching.
@@ -95,8 +93,11 @@ impl JumpTableAnalyser {
         } else if backtracked_sequence.starts_with("mov") {
             let off_jumptable =
                 self.direct_handler(jump_instruction_op_str, disassembler, state, &backtracked)?;
-            table_offsets =
-                self.extract_direct_table_offsets(Some(jumptable_size), off_jumptable, disassembler)?;
+            table_offsets = self.extract_direct_table_offsets(
+                Some(jumptable_size),
+                off_jumptable,
+                disassembler,
+            )?;
         } else if backtracked_sequence.starts_with("add-movsxd") {
             jumptable_size = self.find_jump_table_size(&backtracked)?;
             let off_jumptable = self.x64_handler(disassembler, state, &backtracked, None)?;
@@ -104,12 +105,8 @@ impl JumpTableAnalyser {
             // first element of the slice excluding the last. Equivalent to
             // `backtracked[0]` whenever `backtracked.len() >= 2`.
             if backtracked.len() >= 2 && op_str_of(&backtracked[0]).contains("rsi") {
-                let alternative_base = self.x64_handler(
-                    disassembler,
-                    state,
-                    &backtracked,
-                    Some("rsi".to_string()),
-                )?;
+                let alternative_base =
+                    self.x64_handler(disassembler, state, &backtracked, Some("rsi".to_string()))?;
                 table_offsets = self.extract_relative_table_offsets(
                     Some(jumptable_size),
                     off_jumptable,
@@ -263,19 +260,19 @@ impl JumpTableAnalyser {
         let mut jump_targets = vec![];
         if let Some(jumptable_size) = jumptable_size
             && off_jumptable != 0
-                && disassembler
+            && disassembler
+                .disassembly
+                .is_addr_within_memory_image(off_jumptable)?
+        {
+            for index in 0..jumptable_size {
+                let packed_dword: &[u8; 4] = disassembler
                     .disassembly
-                    .is_addr_within_memory_image(off_jumptable)?
-            {
-                for index in 0..jumptable_size {
-                    let packed_dword: &[u8; 4] = disassembler
-                        .disassembly
-                        .get_bytes(off_jumptable + index as u64 * 4, 4)?
-                        .try_into()?;
-                    let entry = u32::from_le_bytes(*packed_dword) as u64;
-                    jump_targets.push(entry);
-                }
+                    .get_bytes(off_jumptable + index as u64 * 4, 4)?
+                    .try_into()?;
+                let entry = u32::from_le_bytes(*packed_dword) as u64;
+                jump_targets.push(entry);
             }
+        }
         jump_targets.sort_unstable();
         Ok(jump_targets)
     }
@@ -293,9 +290,10 @@ impl JumpTableAnalyser {
             let op_str = op_str_of(instr);
             if matches!(mnem, Mnemonic::Lea) && X86_HANDLER.is_match(&op_str) {
                 if let Some(target_register_) = &target_register
-                    && !op_str.contains(target_register_) {
-                        continue;
-                    }
+                    && !op_str.contains(target_register_)
+                {
+                    continue;
+                }
                 let data_ref_instruction_addr = instr.offset;
                 let mut offset = disassembler.get_referenced_addr(&op_str)? as i64;
                 let rip_sign = if op_str.contains('+') { "+" } else { "-" };
