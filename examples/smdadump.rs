@@ -35,7 +35,10 @@ fn main() -> ExitCode {
     println!("functions    : {}", report.functions.len());
 
     if !report.imports.is_empty() {
-        println!("imports      : {} entries (showing first 5)", report.imports.len());
+        println!(
+            "imports      : {} entries (showing first 5)",
+            report.imports.len()
+        );
         for (dll, api, _) in report.imports.iter().take(5) {
             println!("  {dll}!{api}");
         }
