@@ -1,4 +1,5 @@
-use crate::{error::Error, Result};
+use crate::{error::Error, function::{capstone_compat_formatter, DecodedInsn}, Result};
+use iced_x86::Formatter;
 use std::collections::HashMap;
 
 #[derive(Debug)]
@@ -40,17 +41,18 @@ impl MnemonicTfIdf {
 
     pub fn get_tfidf_from_blocks(
         &self,
-        blocks: &HashMap<u64, Vec<(u64, String, String, Option<String>)>>,
+        blocks: &HashMap<u64, Vec<DecodedInsn>>,
     ) -> Result<f32> {
-        let mut term_counts = HashMap::new();
+        let mut term_counts: HashMap<String, u32> = HashMap::new();
+        let mut fmt = capstone_compat_formatter();
         for block in blocks.values() {
             for ins in block {
-                match term_counts.get_mut(&ins.2) {
-                    Some(s) => *s += 1,
-                    None => {
-                        term_counts.insert(ins.2.clone(), 1);
-                    }
-                }
+                // Format mnemonic via the capstone-compatible formatter so
+                // the IDF table (whose keys are capstone-format strings)
+                // still matches.
+                let mut mnem = String::new();
+                fmt.format_mnemonic(&ins.iced, &mut mnem);
+                *term_counts.entry(mnem).or_insert(0) += 1;
             }
         }
         self.tfidf(&term_counts)

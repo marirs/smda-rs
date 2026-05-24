@@ -3,13 +3,12 @@ use std::convert::TryInto;
 
 pub fn get_bitness(binary: &[u8]) -> Result<u32> {
     let mut bitness_id = 0;
-    if let Ok(pe_offset) = get_pe_offset(binary) {
-        if pe_offset != 0 && binary.len() as u64 >= pe_offset + 0x6 {
+    if let Ok(pe_offset) = get_pe_offset(binary)
+        && pe_offset != 0 && binary.len() as u64 >= pe_offset + 0x6 {
             let bb: [u8; 2] =
                 binary[pe_offset as usize + 0x4..pe_offset as usize + 0x6].try_into()?;
             bitness_id = u16::from_le_bytes(bb);
         }
-    }
     match bitness_id {
         0x14c => Ok(32),
         0x8664 => Ok(64),
@@ -50,7 +49,7 @@ pub fn get_code_areas(binary: &[u8], pe: &goblin::pe::PE) -> Result<Vec<(u64, u6
         if section.characteristics & goblin::pe::section_table::IMAGE_SCN_MEM_EXECUTE != 0 {
             let section_start = base_address + section.virtual_address as u64;
             let mut section_size = section.virtual_size as u64;
-            if section_size % 0x1000 != 0 {
+            if !section_size.is_multiple_of(0x1000) {
                 section_size += 0x1000 - (section_size % 0x1000);
             }
             let section_end = section_start + section_size;

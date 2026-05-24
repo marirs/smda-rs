@@ -2,8 +2,6 @@
 #![allow(clippy::type_complexity)]
 #[macro_use]
 extern crate maplit;
-#[macro_use]
-extern crate lazy_static;
 
 pub mod elf;
 pub mod function;
@@ -20,24 +18,25 @@ pub mod report;
 mod statistics;
 mod tail_call_analyser;
 
-use capstone::prelude::*;
-use data_encoding::HEXUPPER;
+use function::{capstone_compat_formatter, DecodedInsn};
 use function_analysis_state::FunctionAnalysisState;
 use function_candidate::FunctionCandidate;
 use function_candidate_manager::FunctionCandidateManager;
 use goblin::Object;
+use iced_x86::{Decoder, DecoderOptions, FlowControl, Formatter, Mnemonic};
 use indirect_call_analyser::IndirectCallAnalyser;
 use jump_table_analyser::JumpTableAnalyser;
 use label_provider::LabelProvider;
 use mnemonic_tf_idf::MnemonicTfIdf;
 use regex::bytes::Regex as BytesRegex;
 use report::DisassemblyReport;
-use ring::digest::{Context, SHA256};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     convert::TryInto,
     io::Read,
+    sync::LazyLock,
     time::SystemTime,
 };
 use tail_call_analyser::TailCallAnalyser;
@@ -47,45 +46,12 @@ pub use error::Error;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-lazy_static! {
-    static ref BITNESS: BytesRegex = BytesRegex::new(r"(?-u)\xE8").unwrap();
-    static ref REF_ADDR: BytesRegex = BytesRegex::new(r"(?-u)0x[a-fA-F0-9]+").unwrap();
-    static ref RE_NUMBER_HEX_SIGN: regex::Regex = regex::Regex::new(r"(?P<sign>[+\-]) (?P<num>0x[a-fA-F0-9]+)").unwrap();
-}
+static BITNESS: LazyLock<BytesRegex> = LazyLock::new(|| BytesRegex::new(r"(?-u)\xE8").unwrap());
+static REF_ADDR: LazyLock<BytesRegex> =
+    LazyLock::new(|| BytesRegex::new(r"(?-u)0x[a-fA-F0-9]+").unwrap());
+static RE_NUMBER_HEX_SIGN: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?P<sign>[+\-]) (?P<num>0x[a-fA-F0-9]+)").unwrap());
 
-static CALL_INS: &[Option<&str>] = &[Some("call"), Some("ncall")];
-static CJMP_INS: &[Option<&str>] = &[
-    Some("je"),
-    Some("jne"),
-    Some("js"),
-    Some("jns"),
-    Some("jp"),
-    Some("jnp"),
-    Some("jo"),
-    Some("jno"),
-    Some("jl"),
-    Some("jle"),
-    Some("jg"),
-    Some("jge"),
-    Some("jb"),
-    Some("jbe"),
-    Some("ja"),
-    Some("jae"),
-    Some("jcxz"),
-    Some("jecxz"),
-    Some("jrcxz"),
-];
-static LOOP_INS: &[Option<&str>] = &[Some("loop"), Some("loopne"), Some("loope")];
-static JMP_INS: &[Option<&str>] = &[Some("jmp"), Some("ljmp")];
-static RET_INS: &[Option<&str>] = &[Some("ret"), Some("retn"), Some("retf"), Some("iret")];
-static END_INS: &[Option<&str>] = &[
-    Some("ret"),
-    Some("retn"),
-    Some("retf"),
-    Some("iret"),
-    Some("int3"),
-    Some("hlt"),
-];
 static REGS_32BIT: &[&str] = &["eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp"];
 static REGS_64BIT: &[&str] = &[
     "rax", "rbx", "rcx", "rdx", "rsp", "rbp", "rsi", "rdi", "rip", "r8", "r9", "r10", "r11", "r12",
@@ -124,24 +90,24 @@ impl std::fmt::Display for FileArchitecture {
 
 #[derive(Debug)]
 pub struct BinaryInfo {
-    file_format: FileFormat,
-    file_architecture: FileArchitecture,
-    base_addr: u64,
-    binary: Vec<u8>,
-    raw_data: Vec<u8>,
-    binary_size: u64,
-    bitness: u32,
-    code_areas: Vec<(u64, u64)>,
-    component: String,
-    family: String,
-    file_path: String,
-    is_library: bool,
-    is_buffer: bool,
-    sha256: String,
-    entry_point: u64,
-    sections: Vec<(String, u64, usize)>,
-    imports: Vec<(String, String, usize)>,
-    exports: Vec<(String, usize, Option<String>)>,
+    pub file_format: FileFormat,
+    pub file_architecture: FileArchitecture,
+    pub base_addr: u64,
+    pub binary: Vec<u8>,
+    pub raw_data: Vec<u8>,
+    pub binary_size: u64,
+    pub bitness: u32,
+    pub code_areas: Vec<(u64, u64)>,
+    pub component: String,
+    pub family: String,
+    pub file_path: String,
+    pub is_library: bool,
+    pub is_buffer: bool,
+    pub sha256: String,
+    pub entry_point: u64,
+    pub sections: Vec<(String, u64, usize)>,
+    pub imports: Vec<(String, String, usize)>,
+    pub exports: Vec<(String, usize, Option<String>)>,
 }
 
 impl Default for BinaryInfo {
@@ -161,12 +127,12 @@ impl BinaryInfo {
             binary_size: 0,
             bitness: 32,
             code_areas: vec![],
-            component: String::from(""),
-            family: String::from(""),
-            file_path: String::from(""),
+            component: String::new(),
+            family: String::new(),
+            file_path: String::new(),
             is_library: false,
             is_buffer: false,
-            sha256: String::from(""),
+            sha256: String::new(),
             entry_point: 0,
             sections: vec![],
             imports: vec![],
@@ -175,17 +141,17 @@ impl BinaryInfo {
     }
 
     pub fn init(&mut self, content: &[u8]) -> Result<()> {
-        //        self.binary = content.to_vec();
         self.raw_data = content.to_vec();
         self.binary_size = content.len() as u64;
-        self.sha256 = BinaryInfo::sha256_digest(content)?;
+        self.sha256 = BinaryInfo::sha256_digest(content);
         Ok(())
     }
 
-    fn sha256_digest(content: &[u8]) -> Result<String> {
-        let mut context = Context::new(&SHA256);
-        context.update(content);
-        Ok(HEXUPPER.encode(context.finish().as_ref()))
+    fn sha256_digest(content: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(content);
+        let digest = hasher.finalize();
+        digest.iter().map(|b| format!("{b:02X}")).collect()
     }
 
     pub fn get_sections(&self) -> Result<Vec<(String, u64, u64)>> {
@@ -218,28 +184,30 @@ pub struct DisassemblyResult {
     analysis_start_ts: SystemTime,
     analysis_end_ts: SystemTime,
     analysis_timeout: bool,
-    binary_info: BinaryInfo,
+    pub binary_info: BinaryInfo,
     identified_alignment: usize,
-    code_map: HashMap<u64, u64>,
-    data_map: HashSet<u64>,
-    //    errors:
-    functions: HashMap<u64, Vec<Vec<(u64, u32, Option<String>, Option<String>, Vec<u8>)>>>,
+    pub code_map: HashMap<u64, u64>,
+    pub data_map: HashSet<u64>,
+    /// Per-function block list. Keyed by function start address; value is a
+    /// `Vec<block>`, each block is `Vec<DecodedInsn>` (per-instruction iced
+    /// decode + raw bytes — no per-instruction `String` mnemonic/operands).
+    pub functions: HashMap<u64, Vec<Vec<DecodedInsn>>>,
     recursive_functions: HashSet<u64>,
     leaf_functions: HashSet<u64>,
     thunk_functions: HashSet<u64>,
     failed_analysis_addr: Vec<u64>,
     function_borders: HashMap<u64, (u64, u64)>,
     instructions: HashMap<u64, (String, u32)>,
-    ins2fn: HashMap<u64, u64>,
+    pub ins2fn: HashMap<u64, u64>,
     language: HashMap<i32, Vec<u8>>,
     data_refs_from: HashMap<u64, Vec<u64>>,
     data_refs_to: HashMap<u64, Vec<u64>>,
-    code_refs_from: HashMap<u64, Vec<u64>>,
-    code_refs_to: HashMap<u64, Vec<u64>>,
-    apis: HashMap<u64, label_providers::ApiEntry>,
-    addr_to_api: HashMap<u64, (Option<String>, Option<String>)>,
-    function_symbols: HashMap<u64, String>,
-    candidates: HashMap<u64, FunctionCandidate>,
+    pub code_refs_from: HashMap<u64, Vec<u64>>,
+    pub code_refs_to: HashMap<u64, Vec<u64>>,
+    pub apis: HashMap<u64, label_providers::ApiEntry>,
+    pub addr_to_api: HashMap<u64, (Option<String>, Option<String>)>,
+    pub function_symbols: HashMap<u64, String>,
+    pub candidates: HashMap<u64, FunctionCandidate>,
     confidence_threshold: f32,
     code_areas: Vec<u8>,
 }
@@ -294,16 +262,16 @@ impl DisassemblyResult {
             self.init_api_refs()?;
         }
         let mut all_api_refs = HashMap::new();
-        for function_addr in self.functions.keys() {
-            for (k, v) in self.get_api_refs(function_addr)? {
+        let func_addrs: Vec<u64> = self.functions.keys().copied().collect();
+        for function_addr in func_addrs {
+            for (k, v) in self.get_api_refs(&function_addr)? {
                 all_api_refs.insert(k, v);
             }
         }
         Ok(all_api_refs)
     }
 
-
-    fn init_api_refs(&mut self) -> Result<()> {
+    pub fn init_api_refs(&mut self) -> Result<()> {
         for api_offset in self.apis.keys() {
             let api = self.apis[api_offset].clone();
             for reference in api.referencing_addr {
@@ -315,116 +283,80 @@ impl DisassemblyResult {
         if self.binary_info.file_format == FileFormat::ELF {
             let elf_apis = elf::extract_elf_dynamic_apis(&self.binary_info.raw_data)?;
             for (addr, (dll, api)) in elf_apis {
-                if let Some(_) = &api {
+                if api.is_some() {
                     let canonical_addr = if addr >= self.binary_info.base_addr {
                         addr
                     } else {
                         self.binary_info.base_addr + addr
                     };
-
-                    self.addr_to_api.insert(canonical_addr, (dll.clone(), api.clone()));
+                    self.addr_to_api
+                        .insert(canonical_addr, (dll.clone(), api.clone()));
                 }
             }
         }
-
         Ok(())
     }
 
-    pub fn get_api_refs(&self, func_addr: &u64) -> Result<HashMap<u64, (Option<String>, Option<String>)>> {
+    pub fn get_api_refs(
+        &self,
+        func_addr: &u64,
+    ) -> Result<HashMap<u64, (Option<String>, Option<String>)>> {
         let mut api_refs = HashMap::new();
+        let Some(blocks) = self.functions.get(func_addr) else {
+            return Ok(api_refs);
+        };
 
-        for block in &self.functions[func_addr] {
+        for block in blocks {
             for ins in block {
-                let ins_absolute_addr = self.binary_info.base_addr + ins.0;
+                let ins_absolute_addr = self.binary_info.base_addr + ins.offset;
 
-                // METHOD 1: Direct search in addr_to_api
+                // Direct lookup
                 if let Some((dll, api)) = self.addr_to_api.get(&ins_absolute_addr) {
-                    println!("DEBUG: Found direct API for ins {}: {:?}:{:?}", ins_absolute_addr, dll, api);
                     api_refs.insert(ins_absolute_addr, (dll.clone(), api.clone()));
                     continue;
                 }
 
-                // METHOD 2: for jumps, check if it's a jump or call
-                if let Some(ref mnemonic) = ins.2 {
-                    if mnemonic == "call" {
-                        if let Some(target_addr) = self.extract_call_target(ins, self.binary_info.base_addr) {
-
-                            // SEARCH IN addr_to_api
-                            if let Some((dll, api)) = self.addr_to_api.get(&target_addr) {
-                                // println!("DEBUG: Found target API {} -> {:?}:{:?}", target_addr, dll, api);
-                                api_refs.insert(ins_absolute_addr, (dll.clone(), api.clone()));
-                                continue;
-                            }
-
-                            // SEARCH IN self.apis
-                            if let Some(api_entry) = self.apis.get(&target_addr) {
-                                // println!("DEBUG: Found API via thunk {} -> {:?}", target_addr, api_entry.api_name);
-                                api_refs.insert(ins_absolute_addr, (api_entry.dll_name.clone(), api_entry.api_name.clone()));
-                                continue;
-                            }
+                // If it's a call, follow the target
+                if matches!(ins.iced.flow_control(), FlowControl::Call)
+                    && let Some(target_addr) =
+                        Self::extract_call_target(ins, self.binary_info.base_addr)
+                    {
+                        if let Some((dll, api)) = self.addr_to_api.get(&target_addr) {
+                            api_refs.insert(ins_absolute_addr, (dll.clone(), api.clone()));
+                            continue;
+                        }
+                        if let Some(api_entry) = self.apis.get(&target_addr) {
+                            api_refs.insert(
+                                ins_absolute_addr,
+                                (api_entry.dll_name.clone(), api_entry.api_name.clone()),
+                            );
+                            continue;
                         }
                     }
-                }
             }
         }
 
         Ok(api_refs)
     }
 
-    fn extract_call_target(&self, instruction: &(u64, u32, Option<String>, Option<String>, Vec<u8>), base_addr: u64) -> Option<u64> {
-        let (ins_addr, ins_size, mnemonic, op_str, _ins_bytes) = instruction;
-
-        if let Some(mnem) = mnemonic {
-            if mnem != "call" {
-                return None;
-            }
-        } else {
-            return None;
-        }
-
-        if let Some(operands) = op_str {
-            // DIRECT CALL - call 0x12345
-            if operands.starts_with("0x") {
-                if let Ok(addr) = u64::from_str_radix(&operands[2..], 16) {
-                    // println!("DEBUG: Direct call target: {}", addr);
-                    return Some(addr);
+    fn extract_call_target(instruction: &DecodedInsn, _base_addr: u64) -> Option<u64> {
+        use iced_x86::OpKind;
+        if matches!(instruction.iced.flow_control(), FlowControl::Call)
+            && instruction.iced.op_count() >= 1
+        {
+            match instruction.iced.op_kind(0) {
+                OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
+                    return Some(instruction.iced.near_branch_target());
                 }
-            }
-
-            // DWORD-PTR - call dword ptr [0x12345]
-            if operands.starts_with("dword ptr [0x") {
-                let start = "dword ptr [0x".len();
-                if let Some(end) = operands.find(']') {
-                    if let Ok(addr) = u64::from_str_radix(&operands[start..end], 16) {
-                        return Some(addr);
+                OpKind::Memory => {
+                    let target = instruction.iced.memory_displacement64();
+                    if target != 0 {
+                        return Some(target);
                     }
                 }
-            }
-
-            // QWORD-PTR RIP-relative - call qword ptr [rip + 0x12345]
-            if operands.starts_with("qword ptr [rip") {
-                if let Some(plus_pos) = operands.find(" + 0x") {
-                    let start = plus_pos + 5; // " + 0x".len()
-                    if let Some(end) = operands[start..].find(']') {
-                        if let Ok(offset) = u64::from_str_radix(&operands[start..start+end], 16) {
-                            let rip = base_addr + ins_addr + *ins_size as u64;
-                            let target = rip + offset;
-                            return Some(target);
-                        }
-                    }
-                } else if let Some(minus_pos) = operands.find(" - 0x") {
-                    let start = minus_pos + 5; // " - 0x".len()
-                    if let Some(end) = operands[start..].find(']') {
-                        if let Ok(offset) = u64::from_str_radix(&operands[start..start+end], 16) {
-                            let rip = base_addr + ins_addr + *ins_size as u64;
-                            let target = rip - offset;
-                            return Some(target);
-                        }
-                    }
-                }
+                _ => {}
             }
         }
-
         None
     }
 
@@ -434,7 +366,9 @@ impl DisassemblyResult {
 
     pub fn get_byte(&self, addr: u64) -> Result<u8> {
         if self.is_addr_within_memory_image(addr)? {
-            return Ok(self.binary_info.binary[addr as usize - self.binary_info.base_addr as usize]);
+            return Ok(
+                self.binary_info.binary[addr as usize - self.binary_info.base_addr as usize],
+            );
         }
         Err(Error::LogicError(file!(), line!()))
     }
@@ -504,75 +438,52 @@ impl DisassemblyResult {
     }
 
     pub fn add_code_refs(&mut self, addr_from: u64, addr_to: u64) -> Result<()> {
-        let mut refs_from = match self.code_refs_from.remove(&addr_from) {
-            Some(v) => v,
-            _ => vec![],
-        };
-        refs_from.push(addr_to);
-        self.code_refs_from.insert(addr_from, refs_from);
-        let mut refs_to = match self.code_refs_to.remove(&addr_to) {
-            Some(v) => v,
-            _ => vec![],
-        };
-        refs_to.push(addr_from);
-        self.code_refs_to.insert(addr_to, refs_to.clone());
+        self.code_refs_from.entry(addr_from).or_default().push(addr_to);
+        self.code_refs_to.entry(addr_to).or_default().push(addr_from);
         Ok(())
     }
 
     pub fn add_data_refs(&mut self, addr_from: u64, addr_to: u64) -> Result<()> {
-        let mut refs_from = match self.data_refs_from.remove(&addr_from) {
-            Some(v) => v,
-            _ => vec![],
-        };
-        refs_from.push(addr_to);
-        self.data_refs_from.insert(addr_from, refs_from);
-        let mut refs_to = match self.data_refs_to.remove(&addr_to) {
-            Some(v) => v,
-            _ => vec![],
-        };
-        refs_to.push(addr_from);
-        self.data_refs_to.insert(addr_to, refs_to.clone());
+        self.data_refs_from.entry(addr_from).or_default().push(addr_to);
+        self.data_refs_to.entry(addr_to).or_default().push(addr_from);
         Ok(())
     }
 
-    pub fn get_blocks_as_dict(
+    /// Per-block view of a function, used by `Function::new` to construct
+    /// the public-facing `Instruction`s.
+    pub fn get_blocks_as_decoded(
         &self,
         function_addr: &u64,
-    ) -> Result<HashMap<u64, Vec<(u64, String, String, Option<String>)>>> {
+    ) -> Result<HashMap<u64, Vec<DecodedInsn>>> {
         let mut blocks = HashMap::new();
-        for block in &self.functions[function_addr] {
-            let mut instructions = vec![];
-            for ins in block {
-                instructions.push(self.transform_instruction(ins)?);
-                blocks.insert(instructions[0].0, instructions.clone());
+        let Some(func_blocks) = self.functions.get(function_addr) else {
+            return Ok(blocks);
+        };
+        for block in func_blocks {
+            if block.is_empty() {
+                continue;
             }
+            blocks.insert(block[0].offset, block.clone());
         }
         Ok(blocks)
-    }
-
-    pub fn transform_instruction(
-        &self,
-        ins_tuple: &(u64, u32, Option<String>, Option<String>, Vec<u8>),
-    ) -> Result<(u64, String, String, Option<String>)> {
-        let (ins_addr, _, ins_mnem, ins_ops, ins_raw_bytes) = ins_tuple;
-        Ok((
-            *ins_addr,
-            hex::encode(ins_raw_bytes),
-            ins_mnem.as_ref().unwrap().to_string(),
-            ins_ops.clone(),
-        ))
     }
 
     pub fn get_block_refs(&self, func_addr: &u64) -> Result<HashMap<u64, Vec<u64>>> {
         let mut block_refs = HashMap::new();
         let mut ins_addrs = HashSet::new();
-        for block in &self.functions[func_addr] {
+        let Some(blocks) = self.functions.get(func_addr) else {
+            return Ok(block_refs);
+        };
+        for block in blocks {
             for ins in block {
-                ins_addrs.insert(ins.0);
+                ins_addrs.insert(ins.offset);
             }
         }
-        for block in &self.functions[func_addr] {
-            let last_ins_addr = block[block.len() - 1].0;
+        for block in blocks {
+            if block.is_empty() {
+                continue;
+            }
+            let last_ins_addr = block[block.len() - 1].offset;
             if self.code_refs_from.contains_key(&last_ins_addr) {
                 let mut code_refs_from_a = HashSet::new();
                 for dd in &self.code_refs_from[&last_ins_addr] {
@@ -583,7 +494,7 @@ impl DisassemblyResult {
                     verified_refs.push(*dd);
                 }
                 if !verified_refs.is_empty() {
-                    block_refs.insert(block[0].0, verified_refs);
+                    block_refs.insert(block[0].offset, verified_refs);
                 }
             }
         }
@@ -600,10 +511,13 @@ impl DisassemblyResult {
     pub fn get_out_refs(&self, func_addr: &u64) -> Result<HashMap<u64, Vec<u64>>> {
         let mut ins_addrs = HashSet::new();
         let mut code_refs = vec![];
-        let mut out_refs = HashMap::new();
-        for block in &self.functions[func_addr] {
+        let mut out_refs: HashMap<u64, u64> = HashMap::new();
+        let Some(blocks) = self.functions.get(func_addr) else {
+            return Ok(HashMap::new());
+        };
+        for block in blocks {
             for ins in block {
-                let ins_addr = ins.0;
+                let ins_addr = ins.offset;
                 ins_addrs.insert(ins_addr);
                 if self.code_refs_from.contains_key(&ins_addr) {
                     for to_addr in &self.code_refs_from[&ins_addr] {
@@ -612,11 +526,9 @@ impl DisassemblyResult {
                 }
             }
         }
-        //# function may be recursive
         if ins_addrs.contains(func_addr) {
             ins_addrs.remove(func_addr);
         }
-        //# reduce outrefs to addresses within the memory image
         let max_addr = self.binary_info.base_addr + self.binary_info.binary_size;
         let mut image_refs = vec![];
         for reff in code_refs {
@@ -628,18 +540,11 @@ impl DisassemblyResult {
             if ins_addrs.contains(reff.1) {
                 continue;
             }
-            out_refs.entry(reff.0).or_insert(reff.1);
+            out_refs.entry(reff.0).or_insert(*reff.1);
         }
         let mut res: HashMap<u64, Vec<u64>> = HashMap::new();
         for (src, dst) in &out_refs {
-            match res.get_mut(src) {
-                Some(s) => {
-                    s.push(**dst);
-                }
-                _ => {
-                    res.insert(*src, vec![**dst]);
-                }
-            }
+            res.entry(*src).or_default().push(*dst);
         }
         Ok(res)
     }
@@ -653,7 +558,7 @@ pub struct Disassembler {
     jumptable_analyzer: JumpTableAnalyser,
     fc_manager: FunctionCandidateManager,
     tfidf: MnemonicTfIdf,
-    disassembly: DisassemblyResult,
+    pub disassembly: DisassemblyResult,
     label_providers: Vec<LabelProvider>,
 }
 
@@ -724,11 +629,7 @@ impl Disassembler {
                     if call_destination > 0 && (call_destination as usize) < binary.len() {
                         let first_byte = binary[call_destination as usize];
                         if let Some(s) = candidate_first_bytes.get_mut(&bitness) {
-                            if let Some(ss) = s.get_mut(&first_byte) {
-                                *ss += 1;
-                            } else {
-                                s.insert(first_byte, 1);
-                            }
+                            *s.entry(first_byte).or_insert(0) += 1;
                         }
                     }
                 }
@@ -773,20 +674,17 @@ impl Disassembler {
             Some(d) => d.to_vec(),
             _ => Disassembler::load_file(file_name)?,
         };
-        //let file_content = Disassembler::load_file(file_name)?;
         let mut binary_info = BinaryInfo::new();
         binary_info.init(&file_content)?;
         binary_info.file_path = file_name.to_string();
         match Object::parse(&file_content)? {
             Object::Elf(elf) => {
-                // println!("Parsing ELF file: {}", file_name);
                 binary_info.file_format = FileFormat::ELF;
                 binary_info.base_addr = elf::get_base_address(&file_content)?;
                 binary_info.bitness = elf::get_bitness(&file_content)?;
                 binary_info.file_architecture = match binary_info.bitness {
                     64 => FileArchitecture::AMD64,
-                    32 => FileArchitecture::I386,
-                    _ => FileArchitecture::I386,  // fallback
+                    _ => FileArchitecture::I386,
                 };
                 binary_info.code_areas = elf::get_code_areas(&file_content, &elf)?;
                 binary_info.sections = elf
@@ -794,27 +692,12 @@ impl Disassembler {
                     .iter()
                     .map(|s| {
                         (
-                            if let Some(ss) = elf.shdr_strtab.get_at(s.sh_name) {
-                                ss.to_string()
-                            } else {
-                                "..".to_string()
-                            },
+                            elf.shdr_strtab.get_at(s.sh_name).unwrap_or("..").to_string(),
                             s.sh_addr,
                             s.sh_size as usize,
                         )
                     })
                     .collect();
-                // binary_info.imports = elf
-                //     .imports
-                //     .iter()
-                //     .map(|s| (s.dll.to_string(), s.name.to_string(), s.offset))
-                //     .collect();
-                // binary_info.exports = elf
-                //     .exports
-                //     .iter()
-                //     .map(|s| (s.name.unwrap_or("").to_string(), s.offset))
-                //     .collect();
-
                 binary_info.binary = elf::map_binary(&binary_info.raw_data)?;
                 binary_info.binary_size = binary_info.binary.len() as u64;
             }
@@ -822,13 +705,17 @@ impl Disassembler {
                 binary_info.file_format = FileFormat::PE;
                 binary_info.base_addr = pe::get_base_address(&file_content)?;
                 binary_info.bitness = pe::get_bitness(&file_content)?;
+                binary_info.file_architecture = match binary_info.bitness {
+                    64 => FileArchitecture::AMD64,
+                    _ => FileArchitecture::I386,
+                };
                 binary_info.code_areas = pe::get_code_areas(&file_content, &pe)?;
                 binary_info.sections = pe
                     .sections
                     .iter()
                     .map(|s| {
                         (
-                            std::str::from_utf8(&s.name).unwrap().to_string(),
+                            std::str::from_utf8(&s.name).unwrap_or("").to_string(),
                             s.virtual_address as u64,
                             s.virtual_size as usize,
                         )
@@ -871,7 +758,6 @@ impl Disassembler {
             if !provider.is_symbol_provider()? {
                 continue;
             }
-            // for (s, _a) in provider.get_functions_symbols()? {
             for s in (provider.get_functions_symbols()?).keys() {
                 symbol_offsets.insert(*s);
             }
@@ -885,8 +771,6 @@ impl Disassembler {
         high_accuracy: bool,
         resolve_tailcalls: bool,
     ) -> Result<&DisassemblyResult> {
-        //LOGGER.debug("Analyzing buffer with %d bytes @0x%08x",
-        // binary_info.binary_size, binary_info.base_addr)
         self.update_label_providers(&bin)?;
         self.disassembly.init(bin)?;
         if self.disassembly.binary_info.file_format == FileFormat::ELF {
@@ -898,18 +782,13 @@ impl Disassembler {
                             dll_name: dll,
                             api_name: api,
                         };
-
                         self.disassembly.apis.insert(addr, api_entry);
                     }
-
                     if let Err(e) = self.disassembly.init_api_refs() {
-                        eprintln!("Error initializing ELF API references: {:?}", e);
+                        eprintln!("Error initializing ELF API references: {e:?}");
                     }
-
                 }
-                Err(e) => {
-                    eprintln!("Error extracting ELF APIs: {:?}", e);
-                }
+                Err(e) => eprintln!("Error extracting ELF APIs: {e:?}"),
             }
         }
 
@@ -925,43 +804,22 @@ impl Disassembler {
         let queue = self.fc_manager.get_queue()?;
         let mut state = None;
         for addr in queue.clone() {
-            state = match self.analyse_function(addr, false, high_accuracy) {
-                Ok(s) => Some(s),
-                Err(_) => None,
-            }
+            state = self.analyse_function(addr, false, high_accuracy).ok()
         }
-        //LOGGER.debug("Finished heuristical analysis, functions: %d", len(self.disassembly.functions))
         let queue2 = self.fc_manager.get_queue()?;
         for addr in queue2 {
             if queue.contains(&addr) {
                 continue;
             }
-            state = match self.analyse_function(addr, false, high_accuracy) {
-                Ok(s) => Some(s),
-                Err(_) => None,
-            }
+            state = self.analyse_function(addr, false, high_accuracy).ok()
         }
-        //# second pass, analyze remaining gaps for additional
-        //# candidates in an iterative way
         let mut next_gap = 0;
         while let Ok(gap_candidate) = self
             .fc_manager
             .next_gap_candidate(Some(next_gap), &self.disassembly)
         {
-            //LOGGER.debug("based on gap, performing function analysis of 0x%08x", gap_candidate)
-            state = match self.analyse_function(gap_candidate, true, high_accuracy) {
-                Ok(s) => {
-                    if let Ok(_function_blocks) = s.get_blocks() {
-                        //LOGGER.debug("+ got some blocks here -> 0x%08x", gap_candidate)
-                    }
-                    Some(s)
-                }
-                Err(_) => None,
-            };
-            if self.disassembly.functions.contains_key(&gap_candidate) {
-                //LOGGER.debug("+++ YAY, is now a function! -> 0x%08x - 0x%08x", fn_min, fn_max)
-                //start looking directly after our new function
-            } else {
+            state = self.analyse_function(gap_candidate, true, high_accuracy).ok();
+            if !self.disassembly.functions.contains_key(&gap_candidate) {
                 self.fc_manager.update_analysis_aborted(
                     &gap_candidate,
                     "Gap candidate did not fulfil function criteria.",
@@ -969,11 +827,9 @@ impl Disassembler {
             }
             next_gap = self.fc_manager.get_next_gap(true, &self.disassembly)?;
         }
-        //LOGGER.debug("Finished gap analysis, functions: %d", len(self.disassembly.functions))
 
-        //# third pass, fix potential tailcall functions that were identified during analysis
-        if resolve_tailcalls {
-            if let Some(s) = &mut state {
+        if resolve_tailcalls
+            && let Some(s) = &mut state {
                 let tailcalled_functions =
                     TailCallAnalyser::resolve_tailcalls(self, s, high_accuracy)?;
                 for addr in tailcalled_functions {
@@ -981,14 +837,11 @@ impl Disassembler {
                         .add_tailcall_candidate(&addr, &self.disassembly)?;
                 }
             }
-            //LOGGER.debug("Finished tailcall analysis, functions.")
-        }
         self.disassembly.failed_analysis_addr = self.fc_manager.get_aborted_candidates()?;
 
-        //# package up and finish
         for (addr, candidate) in &mut self.fc_manager.candidates {
             if self.disassembly.functions.contains_key(addr) {
-                let function_blocks = self.disassembly.get_blocks_as_dict(addr)?;
+                let function_blocks = self.disassembly.get_blocks_as_decoded(addr)?;
                 let function_tfidf = self.tfidf.get_tfidf_from_blocks(&function_blocks)?;
                 candidate.set_tfidf(function_tfidf)?;
                 candidate.init_confidence()?;
@@ -999,19 +852,17 @@ impl Disassembler {
     }
 
     fn get_disasm_window_buffer(&self, addr: u64) -> Vec<u8> {
-        if (addr < self.disassembly.binary_info.base_addr)
-            || (addr
-            >= self.disassembly.binary_info.base_addr
-            + self.disassembly.binary_info.binary.len() as u64)
+        if addr < self.disassembly.binary_info.base_addr
+            || addr
+                >= self.disassembly.binary_info.base_addr
+                    + self.disassembly.binary_info.binary.len() as u64
         {
             return vec![];
         }
-        let relative_start = addr - self.disassembly.binary_info.base_addr;
-        let relative_end = relative_start + 15;
-        if relative_end >= self.disassembly.binary_info.binary.len() as u64 {
-            return self.disassembly.binary_info.binary[relative_start as usize..].to_vec();
-        }
-        self.disassembly.binary_info.binary[relative_start as usize..relative_end as usize].to_vec()
+        let relative_start = (addr - self.disassembly.binary_info.base_addr) as usize;
+        let len = self.disassembly.binary_info.binary.len();
+        let relative_end = (relative_start + 15).min(len);
+        self.disassembly.binary_info.binary[relative_start..relative_end].to_vec()
     }
 
     fn handle_call_target(
@@ -1040,7 +891,6 @@ impl Disassembler {
             if dll.is_some() || api.is_some() {
                 self.update_api_information(from_addr, dereferenced, &dll, &api)?;
                 return Ok((dll, api));
-            } else if !self.disassembly.is_addr_within_memory_image(to_addr)? {
             }
         }
         Ok((None, None))
@@ -1052,11 +902,6 @@ impl Disassembler {
             let z = u64::from_str_radix(std::str::from_utf8(&ref_addr.as_bytes()[2..])?, 16)?;
             return Ok(z);
         }
-        // for referenced_addr in re.find_iter(op_str.as_bytes()) {
-        //     let z =
-        //         u64::from_str_radix(std::str::from_utf8(&referenced_addr.as_bytes()[2..])?, 16)?;
-        //     return Ok(z);
-        // }
         Ok(0)
     }
 
@@ -1092,8 +937,8 @@ impl Disassembler {
         }
         Ok((None, None))
     }
+
     fn is_plt_got_address(&self, addr: u64) -> Result<bool> {
-        // Check if address is in .plt or .got section
         for (section_name, section_start, section_size) in &self.disassembly.binary_info.sections {
             if section_name.contains(".plt") || section_name.contains(".got") {
                 let section_end = section_start + *section_size as u64;
@@ -1104,192 +949,156 @@ impl Disassembler {
         }
         Ok(false)
     }
+
     fn analyze_call_instruction(
         &mut self,
-        i: &capstone::Insn,
+        ins: &DecodedInsn,
+        op_str: &str,
         state: &mut FunctionAnalysisState,
     ) -> Result<()> {
-        let i_address = i.address();
-        let i_size = i.bytes().len();
-        let i_op_str = i.op_str();
+        let i_address = ins.offset;
+        let i_size = ins.length;
         state.set_leaf(false)?;
 
-        match i_op_str {
-            Some(op_str) => {
-                if op_str.starts_with("dword ptr [") {
-                    if op_str.starts_with("dword ptr [0x") {
-                        let call_destination = self.get_referenced_addr(op_str)?;
-                        if let Ok(dereferenced) = self.disassembly.dereference_dword(call_destination) {
-                            state.add_code_ref(i_address, dereferenced, false)?;
-                            self.handle_call_target(i_address, dereferenced, state)?;
-                            self.handle_api_target(i_address, call_destination, dereferenced)?;
-                        }
-                    }
-                } else if op_str.starts_with("qword ptr [rip") {
-                    let rip = i_address + i_size as u64;
-                    let call_destination = ((rip as i64) + self.get_referenced_addr_sign(op_str)?) as u64;
-
-                    // Search API in add_to_api
-                    if let Some((dll, api)) = self.disassembly.addr_to_api.get(&call_destination) {
-                        let mut api_entry = label_providers::ApiEntry {
-                            referencing_addr: HashSet::new(),
-                            dll_name: dll.clone(),
-                            api_name: api.clone(),
-                        };
-                        api_entry.referencing_addr.insert(i_address);
-                        self.disassembly.apis.insert(call_destination, api_entry);
-                    }
-
-                    state.add_code_ref(i_address, call_destination, false)?;
-                    if let Ok(dereferenced) = self.disassembly.dereference_qword(call_destination) {
-                        self.handle_api_target(i_address, call_destination, dereferenced)?;
-                    }
-                } else if op_str.starts_with("0x") {
-                    let call_destination = self.get_referenced_addr(op_str)?;
-                    if self.disassembly.binary_info.file_format == FileFormat::ELF {
-                        if let Ok(api_info) = self.resolve_elf_thunk(call_destination) {
-                            if let Some((dll, api)) = api_info {
-                                let mut api_entry = label_providers::ApiEntry {
-                                    referencing_addr: HashSet::new(),
-                                    dll_name: dll.clone(),
-                                    api_name: api.clone(),
-                                };
-                                api_entry.referencing_addr.insert(i_address);
-                                self.disassembly.apis.insert(call_destination, api_entry);
-                                self.disassembly.addr_to_api.insert(call_destination, (dll.clone(), api.clone()));
-                            }
-                        }
-                    }
-
-                    self.handle_call_target(i_address, call_destination, state)?;
-                    self.handle_api_target(i_address, call_destination, call_destination)?;
-                } else if REGS_32BIT.contains(&op_str.to_lowercase().as_str())
-                    || REGS_64BIT.contains(&op_str.to_lowercase().as_str())
-                {
-                    state.call_register_ins.push(i_address);
+        if op_str.starts_with("dword ptr [") {
+            if op_str.starts_with("dword ptr [0x") {
+                let call_destination = self.get_referenced_addr(op_str)?;
+                if let Ok(dereferenced) = self.disassembly.dereference_dword(call_destination) {
+                    state.add_code_ref(i_address, dereferenced, false)?;
+                    self.handle_call_target(i_address, dereferenced, state)?;
+                    self.handle_api_target(i_address, call_destination, dereferenced)?;
                 }
-                Ok(())
             }
-            _ => Ok(()),
+        } else if op_str.starts_with("qword ptr [rip") {
+            let rip = i_address + i_size as u64;
+            let call_destination = ((rip as i64) + self.get_referenced_addr_sign(op_str)?) as u64;
+            if let Some((dll, api)) = self.disassembly.addr_to_api.get(&call_destination) {
+                let mut api_entry = label_providers::ApiEntry {
+                    referencing_addr: HashSet::new(),
+                    dll_name: dll.clone(),
+                    api_name: api.clone(),
+                };
+                api_entry.referencing_addr.insert(i_address);
+                self.disassembly.apis.insert(call_destination, api_entry);
+            }
+            state.add_code_ref(i_address, call_destination, false)?;
+            if let Ok(dereferenced) = self.disassembly.dereference_qword(call_destination) {
+                self.handle_api_target(i_address, call_destination, dereferenced)?;
+            }
+        } else if op_str.starts_with("0x") {
+            let call_destination = self.get_referenced_addr(op_str)?;
+            if self.disassembly.binary_info.file_format == FileFormat::ELF
+                && let Ok(Some((dll, api))) = self.resolve_elf_thunk(call_destination) {
+                    let mut api_entry = label_providers::ApiEntry {
+                        referencing_addr: HashSet::new(),
+                        dll_name: dll.clone(),
+                        api_name: api.clone(),
+                    };
+                    api_entry.referencing_addr.insert(i_address);
+                    self.disassembly.apis.insert(call_destination, api_entry);
+                    self.disassembly
+                        .addr_to_api
+                        .insert(call_destination, (dll.clone(), api.clone()));
+                }
+            self.handle_call_target(i_address, call_destination, state)?;
+            self.handle_api_target(i_address, call_destination, call_destination)?;
+        } else if REGS_32BIT.contains(&op_str.to_lowercase().as_str())
+            || REGS_64BIT.contains(&op_str.to_lowercase().as_str())
+        {
+            state.call_register_ins.push(i_address);
         }
+        Ok(())
     }
 
-    fn resolve_elf_thunk(&self, thunk_addr: u64) -> Result<Option<(Option<String>, Option<String>)>> {
+    fn resolve_elf_thunk(
+        &self,
+        thunk_addr: u64,
+    ) -> Result<Option<(Option<String>, Option<String>)>> {
         if !self.disassembly.is_addr_within_memory_image(thunk_addr)? {
             return Ok(None);
         }
-
-        // first check if we already have this address mapped
         if let Some((dll, api)) = self.disassembly.addr_to_api.get(&thunk_addr) {
             return Ok(Some((dll.clone(), api.clone())));
         }
-
         let rel_addr = thunk_addr - self.disassembly.binary_info.base_addr;
         if rel_addr + 16 > self.disassembly.binary_info.binary_size {
             return Ok(None);
         }
-
         let bytes = &self.disassembly.binary_info.binary[rel_addr as usize..rel_addr as usize + 16];
-
-
-        // search for the pattern FF 25 ?? ?? ?? ??
         for i in 0..12 {
             if i + 5 < bytes.len() && bytes[i] == 0xFF && bytes[i + 1] == 0x25 {
-                let offset = i32::from_le_bytes([bytes[i + 2], bytes[i + 3], bytes[i + 4], bytes[i + 5]]);
+                let offset =
+                    i32::from_le_bytes([bytes[i + 2], bytes[i + 3], bytes[i + 4], bytes[i + 5]]);
                 let rip = thunk_addr + (i as u64) + 6;
                 let got_addr = (rip as i64 + offset as i64) as u64;
-
                 if let Some((dll, api)) = self.disassembly.addr_to_api.get(&got_addr) {
                     return Ok(Some((dll.clone(), api.clone())));
                 } else {
                     for candidate_addr in self.disassembly.addr_to_api.keys() {
-                        let diff = if *candidate_addr > got_addr {
-                            *candidate_addr - got_addr
-                        } else {
-                            got_addr - *candidate_addr
-                        };
-
-                        if diff <= 8 {
-                            if let Some((dll, api)) = self.disassembly.addr_to_api.get(candidate_addr) {
+                        let diff = (*candidate_addr).abs_diff(got_addr);
+                        if diff <= 8
+                            && let Some((dll, api)) = self.disassembly.addr_to_api.get(candidate_addr) {
                                 return Ok(Some((dll.clone(), api.clone())));
                             }
-                        }
                     }
                 }
                 break;
             }
         }
-
         Ok(None)
     }
+
     fn analyze_jmp_instruction(
         &mut self,
-        i: &capstone::Insn,
+        ins: &DecodedInsn,
+        op_str: &str,
         state: &mut FunctionAnalysisState,
     ) -> Result<Vec<(u64, u64)>> {
         let mut tailcall_jumps = vec![];
-        let i_address = i.address();
-        let i_size = i.bytes().len();
-        let _i_mnemonic = i.mnemonic();
-        let i_op_str = i.op_str().unwrap_or("");
-        //case = "FALLTHROUGH"
-        if i_op_str.contains(':') {
-            //case = "LONG-JMP"
-        } else if i_op_str.starts_with("dword ptr [0x") {
-            //case = "DWORD-PTR"
-            //Handles mostly jmp-to-api, stubs or tailcalls, all
-            // should be handled sanely this way.
-            let jump_destination = self.get_referenced_addr(i_op_str)?;
+        let i_address = ins.offset;
+        let i_size = ins.length;
+
+        if op_str.contains(':') {
+            // long-jmp
+        } else if op_str.starts_with("dword ptr [0x") {
+            let jump_destination = self.get_referenced_addr(op_str)?;
             state.add_code_ref(i_address, jump_destination, true)?;
             tailcall_jumps.push((i_address, jump_destination));
             if let Ok(dereferenced) = self.disassembly.dereference_dword(jump_destination) {
                 self.handle_api_target(i_address, jump_destination, dereferenced)?;
             }
-        } else if i_op_str.starts_with("qword ptr [rip") {
-            //case = "QWORD-PTR, RIP-relative"
-            //Handles mostly jmp-to-api, stubs or tailcalls, all should be handled sanely this way.
+        } else if op_str.starts_with("qword ptr [rip") {
             let rip = i_address + i_size as u64;
-            //let jump_destination = rip + self.get_referenced_addr(i_op_str)?;
-            let jump_destination = ((rip as i64) + self.get_referenced_addr_sign(i_op_str)?) as u64;
+            let jump_destination = ((rip as i64) + self.get_referenced_addr_sign(op_str)?) as u64;
             state.add_code_ref(i_address, jump_destination, true)?;
             tailcall_jumps.push((i_address, jump_destination));
             if let Ok(dereferenced) = self.disassembly.dereference_qword(jump_destination) {
                 self.handle_api_target(i_address, jump_destination, dereferenced)?;
             }
-        } else if i_op_str.starts_with("0x") {
-            let jump_destination = self.get_referenced_addr(i_op_str)?;
+        } else if let Some(stripped) = op_str.strip_prefix("0x") {
+            let jump_destination = self.get_referenced_addr(op_str)?;
             tailcall_jumps.push((i_address, jump_destination));
             if self.disassembly.functions.contains_key(&jump_destination) {
-                // case = "TAILCALL!"
                 state.set_sanely_ending(true)?;
             } else if self
                 .fc_manager
                 .get_function_start_candidates()?
                 .contains(&jump_destination)
             {
-                // case = "TAILCALL?"
+                // tailcall?
             } else {
-                let addr_to =
-                    u64::from_str_radix(std::str::from_utf8(&i_op_str.as_bytes()[2..])?, 16)?;
-                if state.is_first_instruction()? {
-                    // case = "STUB-TAILCALL!"
-                } else {
-                    // case = "OFFSET-QUEUE"
-                    if self.disassembly.is_addr_within_memory_image(addr_to)?
-                        && self.disassembly.passes_code_filter(Some(addr_to))?
-                    {
-                        state.add_block_to_queue(addr_to)?;
-                    }
-                    // if self.disassembly.is_addr_within_memory_image(addr_to)? {
-                    //     if self.disassembly.passes_code_filter(Some(addr_to))? {
-                    //         state.add_block_to_queue(addr_to)?;
-                    //     }
-                    // }
+                let addr_to = u64::from_str_radix(stripped, 16)?;
+                if !state.is_first_instruction()?
+                    && self.disassembly.is_addr_within_memory_image(addr_to)?
+                    && self.disassembly.passes_code_filter(Some(addr_to))?
+                {
+                    state.add_block_to_queue(addr_to)?;
                 }
                 state.add_code_ref(i_address, addr_to, true)?;
             }
         } else {
-            let jumptable_targets = self.jumptable_analyzer.get_jump_targets(i, self, state)?;
+            let jumptable_targets =
+                self.jumptable_analyzer.get_jump_targets(ins, op_str, self, state)?;
             for target in jumptable_targets {
                 if self.disassembly.is_addr_within_memory_image(target)? {
                     state.add_block_to_queue(target)?;
@@ -1304,17 +1113,15 @@ impl Disassembler {
 
     pub fn analyze_loop_instruction(
         &self,
-        i: &capstone::Insn,
+        ins: &DecodedInsn,
+        op_str: &str,
         state: &mut FunctionAnalysisState,
     ) -> Result<()> {
-        let i_address = i.address();
-        let i_size = i.bytes().len();
-        let _i_mnemonic = i.mnemonic();
-        let i_op_str = i.op_str().unwrap_or("");
-        if let Ok(_jump_destination) = self.get_referenced_addr(i_op_str) {
-            state.add_code_ref(i_address, u64::from_str_radix(&i_op_str[2..], 16)?, true)?;
+        let i_address = ins.offset;
+        let i_size = ins.length;
+        if let Ok(_jump_destination) = self.get_referenced_addr(op_str) {
+            state.add_code_ref(i_address, u64::from_str_radix(&op_str[2..], 16)?, true)?;
         }
-        //# loops have two exits and should thus be handled as block ending instruction
         state.add_block_to_queue(i_address + i_size as u64)?;
         state.set_block_ending_instruction(true)?;
         Ok(())
@@ -1322,33 +1129,28 @@ impl Disassembler {
 
     pub fn analyze_cond_jmp_instruction(
         &self,
-        i: &capstone::Insn,
+        ins: &DecodedInsn,
+        op_str: &str,
         state: &mut FunctionAnalysisState,
     ) -> Result<Vec<(u64, u64)>> {
         let mut tailcall_jumps = vec![];
-        let i_address = i.address();
-        let i_size = i.bytes().len();
-        let _i_mnemonic = i.mnemonic();
-        let i_op_str = i.op_str().unwrap_or("");
+        let i_address = ins.offset;
+        let i_size = ins.length;
         state.add_block_to_queue(i_address + i_size as u64)?;
-        if let Ok(jump_destination) = self.get_referenced_addr(i_op_str) {
-            //# case = "FALLTHROUGH"
+        if let Ok(jump_destination) = self.get_referenced_addr(op_str) {
             tailcall_jumps.push((i_address, jump_destination));
             if self.disassembly.functions.contains_key(&jump_destination) {
-                //# case = "TAILCALL!"
                 state.set_sanely_ending(true)?;
             } else if self
                 .fc_manager
                 .get_function_start_candidates()?
                 .contains(&jump_destination)
             {
-                //# it's tough to decide whether this should be disassembled here or not. topic of "code-sharing functions".
-                //# case = "TAILCALL?"
+                // tailcall?
             } else {
-                //# case = "OFFSET-QUEUE"
-                state.add_block_to_queue(u64::from_str_radix(&i_op_str[2..], 16)?)?;
+                state.add_block_to_queue(u64::from_str_radix(&op_str[2..], 16)?)?;
             }
-            state.add_code_ref(i_address, u64::from_str_radix(&i_op_str[2..], 16)?, true)?;
+            state.add_code_ref(i_address, u64::from_str_radix(&op_str[2..], 16)?, true)?;
         }
         state.set_block_ending_instruction(true)?;
         Ok(tailcall_jumps)
@@ -1359,6 +1161,37 @@ impl Disassembler {
         state.set_next_instruction_reachable(false)?;
         state.set_block_ending_instruction(true)?;
         Ok(())
+    }
+
+    /// Decode a 15-byte window with iced. Returns owned DecodedInsn values.
+    fn decode_window(&self, ip: u64) -> Vec<DecodedInsn> {
+        let buf = self.get_disasm_window_buffer(ip);
+        if buf.is_empty() {
+            return vec![];
+        }
+        let mut decoder = Decoder::with_ip(
+            self.disassembly.binary_info.bitness,
+            &buf,
+            ip,
+            DecoderOptions::NONE,
+        );
+        let mut out = Vec::with_capacity(4);
+        while decoder.can_decode() {
+            let pos_before = decoder.position();
+            let insn = decoder.decode();
+            if insn.is_invalid() {
+                break;
+            }
+            let len = decoder.position() - pos_before;
+            let bytes = buf[pos_before..pos_before + len].to_vec();
+            out.push(DecodedInsn {
+                offset: insn.ip(),
+                length: len as u32,
+                iced: insn,
+                bytes,
+            });
+        }
+        out
     }
 
     fn analyse_function(
@@ -1379,110 +1212,100 @@ impl Disassembler {
             )?;
             return Err(Error::CollisionError(self.disassembly.ins2fn[&start_addr]));
         }
-        let capstone = Capstone::new()
-            .x86()
-            .mode(if self.fc_manager.bitness == 32 {
-                arch::x86::ArchMode::Mode32
-            } else {
-                arch::x86::ArchMode::Mode64
-            })
-            .syntax(arch::x86::ArchSyntax::Intel)
-            //            .detail(true)
-            .build()
-            .map_err(Error::CapstoneError)?;
+        let mut fmt = capstone_compat_formatter();
+
         while state.has_unprocessed_blocks() {
             state.choose_next_block()?;
-            let mut cache_pos = 0;
+            let mut cache_pos: usize = 0;
             let start_block = state.block_start;
-            let mut cache = capstone
-                .disasm_all(
-                    &self.get_disasm_window_buffer(state.block_start),
-                    start_block,
-                )
-                .map_err(Error::CapstoneError)?;
+            let mut cache = self.decode_window(start_block);
             let mut previous_address: Option<u64> = None;
-            let mut previous_mnemonic: Option<String> = None;
+            let mut previous_mnemonic_str: Option<String> = None;
             let mut previous_op_str: Option<String> = None;
+
             loop {
                 let mut exit_flag = false;
-                for i in cache.as_ref() {
-                    let i_address = i.address();
-                    let i_size = i.bytes().len();
-                    let i_mnemonic = i.mnemonic();
-                    let i_op_str = i.op_str(); //strip
-                    let i_relative_address = i_address - self.disassembly.binary_info.base_addr;
-                    let i_bytes = &self.disassembly.binary_info.binary
-                        [i_relative_address as usize..i_relative_address as usize + i_size]
-                        .to_vec();
-                    //LOGGER.debug("  analyzeFunction() now processing instruction @0x%08x: %s", i_address, i_mnemonic + " " + i_op_str)
-                    cache_pos += i_size;
+                for ins in &cache {
+                    let i_address = ins.offset;
+                    let i_size = ins.length;
+                    let mnemonic_enum = ins.iced.mnemonic();
+                    let mut mnemonic_str = String::new();
+                    fmt.format_mnemonic(&ins.iced, &mut mnemonic_str);
+                    let op_str = if ins.iced.op_count() == 0 {
+                        String::new()
+                    } else {
+                        let mut s = String::new();
+                        fmt.format_all_operands(&ins.iced, &mut s);
+                        s
+                    };
+
+                    cache_pos += i_size as usize;
                     state.set_next_instruction_reachable(true)?;
-                    if i_bytes == b"\x00\x00" {
+
+                    if ins.bytes == b"\x00\x00" {
                         state.suspicious_ins_count += 1;
                         if state.suspicious_ins_count > 1 {
                             self.fc_manager.update_analysis_aborted(
                                 &start_addr,
-                                &format!("too many suspicious instructions 0x{:08x}", i_address),
+                                &format!("too many suspicious instructions 0x{i_address:08x}"),
                             )?;
                             return Ok(state);
                         }
                     }
-                    if CALL_INS.contains(&i_mnemonic) {
-                        self.analyze_call_instruction(i, &mut state)?;
-                    } else if JMP_INS.contains(&i_mnemonic) {
-                        let jumps = self.analyze_jmp_instruction(i, &mut state)?;
+
+                    let fc = ins.iced.flow_control();
+                    if matches!(fc, FlowControl::Call | FlowControl::IndirectCall) {
+                        self.analyze_call_instruction(ins, &op_str, &mut state)?;
+                    } else if matches!(
+                        fc,
+                        FlowControl::UnconditionalBranch | FlowControl::IndirectBranch
+                    ) {
+                        let jumps = self.analyze_jmp_instruction(ins, &op_str, &mut state)?;
                         for j in jumps {
                             self.tailcall_analyzer.add_jump(j.0, j.1)?;
                         }
-                    } else if LOOP_INS.contains(&i_mnemonic) {
-                        self.analyze_loop_instruction(i, &mut state)?;
-                    } else if CJMP_INS.contains(&i_mnemonic) {
-                        let jumps = self.analyze_cond_jmp_instruction(i, &mut state)?;
+                    } else if matches!(
+                        mnemonic_enum,
+                        Mnemonic::Loop | Mnemonic::Loope | Mnemonic::Loopne
+                    ) {
+                        self.analyze_loop_instruction(ins, &op_str, &mut state)?;
+                    } else if matches!(fc, FlowControl::ConditionalBranch) {
+                        let jumps = self.analyze_cond_jmp_instruction(ins, &op_str, &mut state)?;
                         for j in jumps {
                             self.tailcall_analyzer.add_jump(j.0, j.1)?;
                         }
-                    } else if i_mnemonic.as_ref().unwrap().starts_with('j') {
-                        //LOGGER.error("unsupported jump @0x%08x (0x%08x): %s %s", i_address, start_addr, i_mnemonic, i_op_str)
-                    } else if RET_INS.contains(&i_mnemonic) {
+                    } else if matches!(fc, FlowControl::Return) {
                         self.analyze_end_instruction(&mut state)?;
                         if previous_address.is_some()
                             && previous_address != Some(0)
-                            && previous_mnemonic == Some("push".to_string())
-                        {
-                            let push_ret_destination =
-                                self.get_referenced_addr(previous_op_str.as_ref().unwrap())?;
-                            if self
-                                .disassembly
-                                .is_addr_within_memory_image(push_ret_destination)?
-                            {
-                                state.add_block_to_queue(push_ret_destination)?;
-                                state.add_code_ref(i_address, push_ret_destination, true)?;
+                            && previous_mnemonic_str.as_deref() == Some("push")
+                            && let Some(prev_op) = previous_op_str.as_ref() {
+                                let push_ret_destination = self.get_referenced_addr(prev_op)?;
+                                if self
+                                    .disassembly
+                                    .is_addr_within_memory_image(push_ret_destination)?
+                                {
+                                    state.add_block_to_queue(push_ret_destination)?;
+                                    state.add_code_ref(i_address, push_ret_destination, true)?;
+                                }
                             }
-                        }
-                    } else if [Some("int3"), Some("hlt")].contains(&i_mnemonic) {
+                    } else if matches!(mnemonic_enum, Mnemonic::Int3 | Mnemonic::Hlt) {
                         self.analyze_end_instruction(&mut state)?;
-                    } else if previous_address.is_some()
-                        && previous_address != Some(0)
+                    } else if let Some(prev) = previous_address
+                        && prev != 0
                         && i_address != start_addr
-                        && previous_mnemonic == Some("call".to_string())
+                        && previous_mnemonic_str.as_deref() == Some("call")
                     {
-                        let instruction_sequence = capstone
-                            .disasm_all(&self.get_disasm_window_buffer(i_address), i_address)
-                            .map_err(Error::CapstoneError)?;
-                        if self
-                            .fc_manager
-                            .is_alignment_sequence(&instruction_sequence)?
-                            || self.fc_manager.is_function_candidate(i_address)?
-                        {
+                        let instruction_sequence = self.decode_window(i_address);
+                        let is_align =
+                            self.fc_manager.is_alignment_sequence(&instruction_sequence)?;
+                        let is_cand = self.fc_manager.is_function_candidate(i_address)?;
+                        if is_align || is_cand {
                             state.set_block_ending_instruction(true)?;
                             state.end_block()?;
                             state.set_sanely_ending(true)?;
-                            if self
-                                .fc_manager
-                                .is_alignment_sequence(&instruction_sequence)?
-                            {
-                                let next_aligned_address = previous_address.as_ref().unwrap()
-                                    + (16 - previous_address.as_ref().unwrap() % 16);
+                            if is_align {
+                                let next_aligned_address = prev + (16 - prev % 16);
                                 self.fc_manager.add_candidate(
                                     next_aligned_address,
                                     true,
@@ -1494,20 +1317,15 @@ impl Disassembler {
                             break;
                         }
                     }
+
                     previous_address = Some(i_address);
-                    previous_mnemonic = Some(i_mnemonic.as_ref().unwrap().to_string());
-                    previous_op_str = Some(i_op_str.as_ref().unwrap().to_string());
+                    previous_mnemonic_str = Some(mnemonic_str.clone());
+                    previous_op_str = Some(op_str.clone());
                     if !self.disassembly.code_map.contains_key(&i_address)
                         && !self.disassembly.data_map.contains(&i_address)
                         && !state.is_processed(&i_address)?
                     {
-                        state.add_instruction(
-                            i_address,
-                            i_size,
-                            i_mnemonic.map(|m| m.to_string()),
-                            i_op_str.map(|m| m.to_string()),
-                            i_bytes.to_vec(),
-                        )?;
+                        state.add_instruction(ins.clone())?;
                     } else if self.disassembly.code_map.contains_key(&i_address) {
                         state.set_block_ending_instruction(true)?;
                         state.set_collision(true)?;
@@ -1521,13 +1339,8 @@ impl Disassembler {
                     }
                 }
                 if !exit_flag {
-                    cache = capstone
-                        .disasm_all(
-                            &self.get_disasm_window_buffer(state.block_start + cache_pos as u64),
-                            state.block_start + cache_pos as u64,
-                        )
-                        .map_err(Error::CapstoneError)?;
-                    if cache.len() == 0 {
+                    cache = self.decode_window(state.block_start + cache_pos as u64);
+                    if cache.is_empty() {
                         break;
                     }
                     continue;
@@ -1535,16 +1348,12 @@ impl Disassembler {
                     break;
                 }
             }
-            if !state.is_block_ending_instruction()? {
-                //LOGGER.debug("No block submitted, last instruction:
-                // 0x%08x -> 0x%08x %s || %s", start_addr, i_address, i_mnemonic + " " + i_op_str, self.fc_manager.getFunctionCandidate(start_addr))
-            }
         }
         state.label = self.resolve_symbol(state.start_addr)?;
         if let Ok(_analysis_result) = state.finalize_analysis(as_gap, &mut self.disassembly) {
-            let (api_e, cand_e) = self
-                .indirect_call_analyser
-                .resolve_register_calls(self, &mut state, 4)?;
+            let (api_e, cand_e) =
+                self.indirect_call_analyser
+                    .resolve_register_calls(self, &mut state, 4)?;
             for a in api_e {
                 match self.disassembly.apis.get_mut(&a.0) {
                     Some(s) => {
@@ -1559,7 +1368,6 @@ impl Disassembler {
                 self.fc_manager
                     .add_candidate(a.0, false, Some(a.1), &self.disassembly)?;
             }
-            // self.tailcall_analyzer.finalize_function(&state)?;
             TailCallAnalyser::finalize_function(self, &state)?;
         }
         self.fc_manager.update_analysis_finished(&start_addr)?;
@@ -1600,8 +1408,7 @@ impl Disassembler {
                 return Ok(result);
             }
         }
-        Ok(String::from(""))
-        //        Err(Error::LogicError(file!(), line!()))
+        Ok(String::new())
     }
 
     fn update_label_providers(&mut self, bi: &BinaryInfo) -> Result<()> {

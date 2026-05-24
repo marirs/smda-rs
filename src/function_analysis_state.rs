@@ -1,14 +1,15 @@
-use crate::{error::Error, DisassemblyResult, Result, CALL_INS, END_INS};
+use crate::{error::Error, function::DecodedInsn, DisassemblyResult, Result};
+use iced_x86::{FlowControl, Mnemonic};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Debug)]
 pub struct FunctionAnalysisState {
     pub start_addr: u64,
     pub block_queue: VecDeque<u64>,
-    pub(crate) current_block: Vec<(u64, u32, Option<String>, Option<String>, Vec<u8>)>,
-    blocks: Vec<Vec<(u64, u32, Option<String>, Option<String>, Vec<u8>)>>,
+    pub(crate) current_block: Vec<DecodedInsn>,
+    blocks: Vec<Vec<DecodedInsn>>,
     num_blocks_analyzed: u32,
-    pub instructions: Vec<(u64, u32, Option<String>, Option<String>, Vec<u8>)>,
+    pub instructions: Vec<DecodedInsn>,
     pub instruction_start_bytes: HashSet<u64>,
     processed_blocks: HashSet<u64>,
     processed_bytes: HashSet<u64>,
@@ -63,7 +64,7 @@ impl FunctionAnalysisState {
             is_leaf_function: true,
             is_recursive: false,
             is_thunk_call: false,
-            label: String::from(""),
+            label: String::new(),
         })
     }
 
@@ -98,18 +99,14 @@ impl FunctionAnalysisState {
 
     pub fn add_code_ref(&mut self, addr_from: u64, addr_to: u64, by_jump: bool) -> Result<()> {
         self.code_refs.push((addr_from, addr_to));
-        let mut refs_from = match self.code_refs_from.remove(&addr_from) {
-            Some(v) => v,
-            _ => vec![],
-        };
-        refs_from.push(addr_to);
-        self.code_refs_from.insert(addr_from, refs_from);
-        let mut refs_to = match self.code_refs_to.remove(&addr_to) {
-            Some(v) => v,
-            _ => vec![],
-        };
-        refs_to.push(addr_from);
-        self.code_refs_to.insert(addr_to, refs_to.clone());
+        self.code_refs_from
+            .entry(addr_from)
+            .or_default()
+            .push(addr_to);
+        self.code_refs_to
+            .entry(addr_to)
+            .or_default()
+            .push(addr_from);
         if by_jump {
             self.is_jmp = true;
             self.jump_targets.push(addr_to);
@@ -155,26 +152,21 @@ impl FunctionAnalysisState {
         &self,
         addr_from: u64,
         num_instructions: u32,
-    ) -> Result<Vec<(u64, u32, Option<String>, Option<String>, Vec<u8>)>> {
+    ) -> Result<Vec<DecodedInsn>> {
         let mut backtracked = vec![];
         for instruction in &self.instructions {
-            if instruction.0 < addr_from {
+            if instruction.offset < addr_from {
                 backtracked.push(instruction.clone());
             }
         }
         if backtracked.len() < num_instructions as usize {
-            Ok(backtracked[..].to_vec())
+            Ok(backtracked)
         } else {
             Ok(backtracked[backtracked.len() - num_instructions as usize..].to_vec())
         }
     }
 
-    pub fn add_data_ref(
-        &mut self,
-        addr_from: u64,
-        addr_to: u64,
-        size: u64, /*1*/
-    ) -> Result<()> {
+    pub fn add_data_ref(&mut self, addr_from: u64, addr_to: u64, size: u64) -> Result<()> {
         self.data_refs.push((addr_from, addr_to));
         for i in 0..size {
             self.data_bytes.push(addr_to + i);
@@ -185,29 +177,22 @@ impl FunctionAnalysisState {
     pub fn end_block(&mut self) -> Result<()> {
         if !self.current_block.is_empty() {
             self.num_blocks_analyzed += 1;
-            //# self.blocks.append(self.current_block)
         }
         self.current_block = vec![];
         Ok(())
     }
 
-    pub fn add_instruction(
-        &mut self,
-        i_address: u64,
-        i_size: usize,
-        i_mnemonic: Option<String>,
-        i_op_str: Option<String>,
-        i_bytes: Vec<u8>,
-    ) -> Result<()> {
-        let ins = (i_address, i_size as u32, i_mnemonic, i_op_str, i_bytes);
+    pub fn add_instruction(&mut self, ins: DecodedInsn) -> Result<()> {
+        let i_address = ins.offset;
+        let i_size = ins.length as u64;
         self.instructions.push(ins.clone());
         self.instruction_start_bytes.insert(i_address);
         self.current_block.push(ins);
         for byte in 0..i_size {
-            self.processed_bytes.insert(i_address + byte as u64);
+            self.processed_bytes.insert(i_address + byte);
         }
         if self.is_next_instruction_reachable {
-            self.add_code_ref(i_address, i_address + i_size as u64, self.is_jmp)?;
+            self.add_code_ref(i_address, i_address + i_size, self.is_jmp)?;
         }
         self.is_jmp = false;
         Ok(())
@@ -223,79 +208,78 @@ impl FunctionAnalysisState {
         as_gap: bool,
         disassembly: &mut DisassemblyResult,
     ) -> Result<bool> {
-        if as_gap {
-            //LOGGER.debug("0x%08x had sanity state: %s (%d ins, blocks: %d)", self.start_addr, self.is_sanely_ending, len(self.instructions), self.num_blocks_analyzed)
-            //for instruction in sorted(self.instructions):
-        }
         if as_gap && !self.is_sanely_ending {
-            if self.instructions.len() == 1 && self.instructions[0].2.as_ref().unwrap() == "jmp" {
-                let byte = disassembly.get_byte(self.instructions[0].0)?;
-                if byte == b'\xEB' {
+            // sane case: stub-jmp that is just a `EB <rel8>` short jump
+            if self.instructions.len() == 1
+                && matches!(self.instructions[0].iced.mnemonic(), Mnemonic::Jmp)
+            {
+                let byte = disassembly.get_byte(self.instructions[0].offset)?;
+                if byte == 0xEB {
                     return Ok(false);
                 }
             }
-            //# sane case, stub found that just jumps to a referenced function
-            else if self.num_blocks_analyzed == 1
-                && [String::from("jmp"), String::from("call")].contains(
-                    self.instructions[self.instructions.len() - 1]
-                        .2
-                        .as_ref()
-                        .unwrap(),
-                )
-            {
-                //# similar case to the one above, mostly stubs with tailcalls to a function or shared tail block.
+            // sane case: single-block tailcall (jmp/call as last)
+            else if self.num_blocks_analyzed == 1 {
+                let last = &self.instructions[self.instructions.len() - 1];
+                if matches!(last.iced.mnemonic(), Mnemonic::Jmp | Mnemonic::Call) {
+                    // tailcall-like; accept
+                } else {
+                    return Ok(false);
+                }
             } else {
                 return Ok(false);
             }
         }
-        //# in case we have a successful analysis, forward results to disassembly
         if self.num_blocks_analyzed > 0 {
             self.finalize_regular_analysis(disassembly)?;
         }
         Ok(true)
     }
 
-    pub fn get_blocks(
-        &self,
-    ) -> Result<Vec<Vec<(u64, u32, Option<String>, Option<String>, Vec<u8>)>>> {
+    pub fn get_blocks(&self) -> Result<Vec<Vec<DecodedInsn>>> {
         let mut ins = HashMap::new();
         for (cc, i) in self.instructions.iter().enumerate() {
-            ins.insert(i.0, cc);
+            ins.insert(i.offset, cc);
         }
         let mut potential_starts = self.jump_targets.clone();
         potential_starts.push(self.start_addr);
         potential_starts.sort_unstable();
         let mut blocks = vec![];
         for start in &potential_starts {
-            if !ins.contains_key(start) {
+            let Some(&start_idx) = ins.get(start) else {
                 continue;
-            }
+            };
             let mut block = vec![];
-            for i in ins[start]..self.instructions.len() {
-                let current = self.instructions[i].clone();
+            for i in start_idx..self.instructions.len() {
+                let current = &self.instructions[i];
                 block.push(current.clone());
 
-                // if one code reference is to another address than the next
-                if self.code_refs_from.contains_key(&current.0)
-                    && !CALL_INS.contains(&Some(current.2.as_ref().unwrap().as_str()))
+                // If one code reference is to another address than the next
+                if self.code_refs_from.contains_key(&current.offset)
+                    && !matches!(
+                        current.iced.flow_control(),
+                        FlowControl::Call | FlowControl::IndirectCall
+                    )
                     && i != self.instructions.len() - 1
                 {
-                    for r in &self.code_refs_from[&current.0] {
-                        if *r != self.instructions[i + 1].0 {
+                    for r in &self.code_refs_from[&current.offset] {
+                        if *r != self.instructions[i + 1].offset {
                             break;
                         }
                     }
                 }
 
                 if i != self.instructions.len() - 1
-                    && self.code_refs_to.contains_key(&self.instructions[i + 1].0)
-                    && (self.code_refs_to[&self.instructions[i + 1].0].len() > 1
-                        || potential_starts.contains(&self.instructions[i + 1].0))
+                    && self
+                        .code_refs_to
+                        .contains_key(&self.instructions[i + 1].offset)
+                    && (self.code_refs_to[&self.instructions[i + 1].offset].len() > 1
+                        || potential_starts.contains(&self.instructions[i + 1].offset))
                 {
                     break;
                 }
 
-                if END_INS.contains(&Some(current.2.as_ref().unwrap().as_str())) {
+                if is_end_instruction(current.iced.mnemonic(), current.iced.flow_control()) {
                     break;
                 }
             }
@@ -303,21 +287,20 @@ impl FunctionAnalysisState {
                 blocks.push(block);
             }
         }
-        //      self.blocks = blocks;
         Ok(blocks)
     }
 
     pub fn finalize_regular_analysis(&mut self, disassembly: &mut DisassemblyResult) -> Result<()> {
         let mut fn_min: u64 = 0xFFFFFFFFFFFFFFFF;
         for s in &self.instructions {
-            if s.0 < fn_min {
-                fn_min = s.0;
+            if s.offset < fn_min {
+                fn_min = s.offset;
             }
         }
         let mut fn_max: u64 = 0;
         for s in &self.instructions {
-            if s.0 + s.1 as u64 > fn_max {
-                fn_max = s.0 + s.1 as u64;
+            if s.offset + s.length as u64 > fn_max {
+                fn_max = s.offset + s.length as u64;
             }
         }
         disassembly
@@ -327,14 +310,21 @@ impl FunctionAnalysisState {
             .function_borders
             .insert(self.start_addr, (fn_min, fn_max));
         for ins in &self.instructions {
+            // Note: we no longer store the mnemonic string per instruction
+            // (it's available via iced enum). The legacy `instructions`
+            // map kept a (mnemonic_str, length) pair; for compatibility we
+            // store length-only with an empty string. Real consumers should
+            // walk `functions` instead and read the DecodedInsn.iced.
             disassembly
                 .instructions
-                .insert(ins.0, (ins.2.as_ref().unwrap().to_string(), ins.1));
-            for offset in 0..ins.1 {
-                disassembly.code_map.insert(ins.0 + offset as u64, ins.0);
+                .insert(ins.offset, (String::new(), ins.length));
+            for offset in 0..ins.length {
+                disassembly
+                    .code_map
+                    .insert(ins.offset + offset as u64, ins.offset);
                 disassembly
                     .ins2fn
-                    .insert(ins.0 + offset as u64, self.start_addr);
+                    .insert(ins.offset + offset as u64, self.start_addr);
             }
         }
         for cref in &self.code_refs {
@@ -375,29 +365,22 @@ impl FunctionAnalysisState {
         let conflict_addrs = all_refs_set.intersection(&non_instruction_start_bytes);
         for candidate_source_ref in conflict_addrs {
             let candidate = all_refs[candidate_source_ref];
-            match conflicts.get_mut(&candidate) {
-                Some(c) => c.push(*candidate_source_ref),
-                None => {
-                    conflicts.insert(candidate, vec![*candidate_source_ref]);
-                }
-            }
+            conflicts
+                .entry(candidate)
+                .or_default()
+                .push(*candidate_source_ref);
         }
         Ok(conflicts)
     }
 
     pub fn revert_analysis(&self) -> Result<()> {
-        //TODO
-        //        self.disassembly.function_borders.pop(self.start_addr, None)
-        //            for ins in self.instructions:
-        //     self.disassembly.instructions.pop(ins[0], None)
-        //     for byte in range(ins[1]):
-        //         self.disassembly.code_map.pop(ins[0] + byte, None)
-        //         self.disassembly.ins2fn.pop(ins[0] + byte, None)
-        // for cref in self.code_refs:
-        //     self.disassembly.removeCodeRefs(cref[0], cref[1])
-        // for dref in self.data_refs:
-        //     self.disassembly.removeDataRefs(dref[0], dref[1])
-        //     self.disassembly.functions.pop(self.start_addr, None)
+        // TODO: mirror Python `revertAnalysis`
         Ok(())
     }
+}
+
+/// Replaces the prior `END_INS` `&[Option<&str>]` constant. Returns true if
+/// the instruction is a "block-ending" instruction (return, hlt, int3).
+fn is_end_instruction(mnem: Mnemonic, fc: FlowControl) -> bool {
+    matches!(fc, FlowControl::Return) || matches!(mnem, Mnemonic::Hlt | Mnemonic::Int3)
 }

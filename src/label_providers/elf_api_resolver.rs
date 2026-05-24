@@ -25,9 +25,9 @@ impl ElfApiResolver {
             let mut address = 0x401700;
             if let Object::Elf(elf) = Object::parse(&binary_info.raw_data)? {
                 for reloc in elf.pltrelocs.iter() {
-                    if reloc.r_sym != 0 {
-                        if let Some(sym) = elf.dynsyms.get(reloc.r_sym) {
-                            if sym.is_import() && sym.is_function() {
+                    if reloc.r_sym != 0
+                        && let Some(sym) = elf.dynsyms.get(reloc.r_sym)
+                            && sym.is_import() && sym.is_function() {
                                 self.api_map.get_mut("lief").unwrap().insert(
                                     address,
                                     (
@@ -37,8 +37,6 @@ impl ElfApiResolver {
                                 );
                                 address += 0x10;
                             }
-                        }
-                    }
                 }
                 //     let mut lib = None;
                 //     if relocation.symbol.has_version && relocation.symbol.symbol_version.has_auxiliary_version{
@@ -59,11 +57,10 @@ impl ElfApiResolver {
         to_addr: u64,
         _absolute_addr: u64,
     ) -> Result<(Option<String>, Option<String>)> {
-        if let Some(s) = self.api_map.get("lief") {
-            if let Some((dll, api)) = s.get(&to_addr) {
+        if let Some(s) = self.api_map.get("lief")
+            && let Some((dll, api)) = s.get(&to_addr) {
                 return Ok((Some(dll.to_string()), Some(api.to_string())));
             }
-        }
         Ok((None, None))
     }
 }

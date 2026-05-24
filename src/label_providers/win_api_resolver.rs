@@ -52,11 +52,10 @@ impl OrdinalHelper {
 
     pub fn resolve_ordinal(&self, dll_name: &str, ordinal: &u16) -> Result<String> {
         let dll_name = dll_name.to_lowercase();
-        if let Some(s) = self.ordinals.get(&dll_name) {
-            if let Some(o) = s.get(ordinal) {
+        if let Some(s) = self.ordinals.get(&dll_name)
+            && let Some(o) = s.get(ordinal) {
                 return Ok(o.to_string());
             }
-        }
         Err(Error::LogicError(file!(), line!()))
     }
 }
@@ -99,7 +98,7 @@ impl WinApiResolver {
             //setup import table info from LIEF
             if let Object::PE(lief_binary) = Object::parse(&binary_info.raw_data)? {
                 for import in lief_binary.imports {
-                    if import.name != "" {
+                    if !import.name.is_empty() {
                         self.api_map.get_mut("lief").unwrap().insert(
                             import.offset as u64 + binary_info.base_addr,
                             (import.dll.to_lowercase(), import.name.to_string()),

@@ -1,33 +1,48 @@
 #![allow(clippy::too_many_arguments)]
-use crate::{error::Error, label_providers::ApiEntry, Disassembler, FunctionAnalysisState, Result};
+use crate::{
+    error::Error,
+    function::{capstone_compat_formatter, DecodedInsn},
+    label_providers::ApiEntry,
+    Disassembler, FunctionAnalysisState, Result,
+};
+use iced_x86::{Formatter, Mnemonic};
 use regex::Regex;
 use std::{
     collections::{HashMap, HashSet},
     convert::TryInto,
+    sync::LazyLock,
 };
 
-lazy_static! {
-    static ref MOV_REG_REG: Regex = Regex::new(r"(?P<reg1>[a-z]{3}), (?P<reg2>[a-z]{3})$").unwrap();
-    static ref MOV_REG_CONST: Regex =
-        Regex::new(r"(?P<reg>[a-z]{3}), (?P<val>0x[0-9a-f]{1,8})$").unwrap();
-    static ref MOV_REG_DWORD: Regex =
-        Regex::new(r"(?P<reg>[a-z]{3}), dword ptr \[(?P<addr>0x[0-9a-f]{1,8})\]$").unwrap();
-    static ref MOV_REG_QWORD: Regex =
-        Regex::new(r"(?P<reg>[a-z]{3}), qword ptr \[rip \+ (?P<addr>0x[0-9a-f]{1,8})\]$").unwrap();
-    static ref LEA_REG_DWORD: Regex =
-        Regex::new(r"(?P<reg>[a-z]{3}), dword ptr \[(?P<addr>0x[0-9a-f]{1,8})\]$").unwrap();
+static MOV_REG_REG: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?P<reg1>[a-z]{3}), (?P<reg2>[a-z]{3})$").unwrap());
+static MOV_REG_CONST: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?P<reg>[a-z]{3}), (?P<val>0x[0-9a-f]{1,8})$").unwrap());
+static MOV_REG_DWORD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?P<reg>[a-z]{3}), dword ptr \[(?P<addr>0x[0-9a-f]{1,8})\]$").unwrap()
+});
+static MOV_REG_QWORD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?P<reg>[a-z]{3}), qword ptr \[rip \+ (?P<addr>0x[0-9a-f]{1,8})\]$").unwrap()
+});
+static LEA_REG_DWORD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?P<reg>[a-z]{3}), dword ptr \[(?P<addr>0x[0-9a-f]{1,8})\]$").unwrap()
+});
+
+fn op_str_of(ins: &DecodedInsn) -> String {
+    if ins.iced.op_count() == 0 {
+        return String::new();
+    }
+    let mut fmt = capstone_compat_formatter();
+    let mut out = String::new();
+    fmt.format_all_operands(&ins.iced, &mut out);
+    out
 }
 
 #[derive(Debug)]
-pub struct IndirectCallAnalyser {
-    //    current_calling_addr: u64
-}
+pub struct IndirectCallAnalyser {}
 
 impl IndirectCallAnalyser {
     pub fn new() -> IndirectCallAnalyser {
-        IndirectCallAnalyser{
-//            current_calling_addr: 0
-        }
+        IndirectCallAnalyser {}
     }
 
     pub fn init(&mut self) -> Result<()> {
@@ -40,27 +55,20 @@ impl IndirectCallAnalyser {
         analysis_state: &mut FunctionAnalysisState,
         block_depth: i32,
     ) -> Result<(Vec<(u64, ApiEntry)>, Vec<(u64, u64)>)> {
-        //# after block reconstruction do simple data flow analysis to
-        // resolve open cases like "call <register>" as stored in
-        // self.call_register_ins
         let mut res = vec![];
         let mut res2 = vec![];
         let calling_addr_vec = analysis_state.call_register_ins.clone();
         for calling_addr in &calling_addr_vec {
-            //LOGGER.debug("#" * 20)
-            //            self.current_calling_addr = *calling_addr;
             let mut start_block = vec![];
             for ins in self.search_block(analysis_state, calling_addr)? {
-                if ins.0 <= *calling_addr {
+                if ins.offset <= *calling_addr {
                     start_block.push(ins);
                 }
             }
             if !start_block.is_empty() {
-                let mut s: String = start_block[start_block.len() - 1]
-                    .3
-                    .as_ref()
-                    .unwrap()
-                    .to_string();
+                // The "register being called" string — operand of the
+                // call <reg> instruction. Format from iced.
+                let mut s = op_str_of(&start_block[start_block.len() - 1]);
                 self.process_block(
                     analysis_state,
                     start_block,
@@ -82,25 +90,26 @@ impl IndirectCallAnalyser {
         &self,
         analysis_state: &FunctionAnalysisState,
         address: &u64,
-    ) -> Result<Vec<(u64, u32, Option<String>, Option<String>, Vec<u8>)>> {
+    ) -> Result<Vec<DecodedInsn>> {
         for block in &analysis_state.get_blocks()? {
             for i in block {
-                if address == &i.0 {
+                if address == &i.offset {
                     return Ok(block.clone());
                 }
             }
         }
         Ok(vec![])
-        //        Err(Error::LogicError(file!(), line!()))
     }
 
     pub fn process_block(
         &self,
         analysis_state: &mut FunctionAnalysisState,
-        block: Vec<(u64, u32, Option<String>, Option<String>, Vec<u8>)>,
+        block: Vec<DecodedInsn>,
         registers: &mut HashMap<String, u64>,
         register_name: &mut String,
-        processed: &mut HashSet<Vec<(u64, u32, Option<String>, Option<String>, Vec<u8>)>>,
+        // Dedup processed blocks by their start address (lighter + simpler
+        // than hashing the Vec<DecodedInsn> contents).
+        processed: &mut HashSet<u64>,
         depth: i32,
         current_calling_addr: u64,
         disassembler: &Disassembler,
@@ -110,96 +119,82 @@ impl IndirectCallAnalyser {
         if block.is_empty() {
             return Ok(false);
         }
-        if processed.contains(&block) {
-            //LOGGER.debug("already processed block 0x%08x; skipping", block[0][0])
+        let block_start = block[0].offset;
+        if processed.contains(&block_start) {
             return Ok(false);
         }
-        processed.insert(block.clone());
-        //LOGGER.debug("start processing block: 0x%08x\nlooking for register %s", block[0][0], register_name)
+        processed.insert(block_start);
+
         let mut abs_value_found = false;
         for ins in block.iter().rev() {
-            //LOGGER.debug("0x%08x: %s %s", ins[0], ins[2], ins[3])
-            if ins.2.as_ref().unwrap() == "mov" {
-                //#mov <reg>, <reg>
-                for match1 in MOV_REG_REG.captures_iter(ins.3.as_ref().unwrap()) {
+            let mnem = ins.iced.mnemonic();
+            let op_str = op_str_of(ins);
+            if matches!(mnem, Mnemonic::Mov) {
+                // mov <reg>, <reg>
+                for match1 in MOV_REG_REG.captures_iter(&op_str) {
                     if &match1["reg1"].to_string() == register_name {
                         *register_name = match1["reg2"].to_string();
                     }
                 }
-                //#mov <reg>, <const>
-                for match2 in MOV_REG_CONST.captures_iter(ins.3.as_ref().unwrap()) {
+                // mov <reg>, <const>
+                for match2 in MOV_REG_CONST.captures_iter(&op_str) {
                     registers.insert(
                         match2["reg"].to_string(),
                         u64::from_str_radix(&match2["val"][2..], 16)?,
                     );
-                    //LOGGER.debug("**moved value 0x%08x to register %s", int(match2.group("val"), 16), match2.group("reg"))
                     if &match2["reg"].to_string() == register_name {
                         abs_value_found = true;
                     }
                 }
-                //#mov <reg>, dword ptr [<addr>]
-                for match3 in MOV_REG_DWORD.captures_iter(ins.3.as_ref().unwrap()) {
-                    //# HACK: test to see if the address points to a import and
-                    //# use that instead of the actual memory value
+                // mov <reg>, dword ptr [<addr>]
+                for match3 in MOV_REG_DWORD.captures_iter(&op_str) {
                     let addr = u64::from_str_radix(&match3["addr"][2..], 16)?;
                     let (dll, api) = disassembler.resolve_api(addr, addr)?;
                     if dll.is_some() || api.is_some() {
                         registers.insert(match3["reg"].to_string(), addr);
-                        //LOGGER.debug("**moved API ref (%s:%s) @0x%08x to register %s", dll, api, addr, match3.group("reg"))
                         if &match3["reg"].to_string() == register_name {
                             abs_value_found = true;
                         }
                     } else if let Ok(dword) = self.get_dword(addr, disassembler) {
                         registers.insert(match3["reg"].to_string(), dword);
-                        //LOGGER.debug("**moved value 0x%08x to register %s", dword, match3.group("reg"))
                         if &match3["reg"].to_string() == register_name {
                             abs_value_found = true;
                         }
                     }
                 }
-                //# mov <reg>, qword ptr [reg + <addr>]
-                for match4 in MOV_REG_QWORD.captures_iter(ins.3.as_ref().unwrap()) {
-                    let rip = ins.0 + ins.1 as u64;
+                // mov <reg>, qword ptr [rip + <addr>]
+                for match4 in MOV_REG_QWORD.captures_iter(&op_str) {
+                    let rip = ins.offset + ins.length as u64;
                     if let Ok(dword) = self.get_dword(
                         rip + u64::from_str_radix(&match4["addr"][2..], 16)?,
                         disassembler,
                     ) {
                         registers.insert(match4["reg"].to_string(), rip + dword);
-                        //LOGGER.debug("**moved value 0x%08x + 0x%08x == 0x%08x to register %s", rip, dword, rip + dword, match4.group("reg"))
                         if &match4["reg"].to_string() == register_name {
                             abs_value_found = true;
                         }
                     }
                 }
-            } else if ins.2.as_ref().unwrap() == "lea" {
-                //# lea <reg>, dword ptr [<addr>]
-                for match1 in LEA_REG_DWORD.captures_iter(ins.3.as_ref().unwrap()) {
+            } else if matches!(mnem, Mnemonic::Lea) {
+                // lea <reg>, dword ptr [<addr>]
+                for match1 in LEA_REG_DWORD.captures_iter(&op_str) {
                     if let Ok(dword) =
                         self.get_dword(u64::from_str_radix(&match1["addr"][2..], 16)?, disassembler)
                     {
                         registers.insert(match1["reg"].to_string(), dword);
-                        //LOGGER.debug("**moved value 0x%08x to register %s", dword, match1.group("reg"))
                         if &match1["reg"].to_string() == register_name {
                             abs_value_found = true;
                         }
                     }
                 }
-                //# not handled: lea <reg>, dword ptr [<reg> +- <val>]
-                //# requires state-keeping of multiple registers
-                //# there exist potentially many more way how the register being called can be calculated
             }
-            //# for now we ignore them
-            else {
-            }
-            //# if the absolute value was found for the call <reg> instruction, detect API
+
             if abs_value_found {
                 analysis_state.set_leaf(false)?;
                 if registers.contains_key(register_name) {
                     let candidate = registers[register_name];
-                    //LOGGER.debug("candidate: 0x%x - %s, register: %s", candidate, ins[3], register_name)
                     let (dll, api) = disassembler.resolve_api(candidate, candidate)?;
                     if dll.is_some() || api.is_some() {
-                        //LOGGER.debug("successfully resolved: %s %s", dll, api)
                         let mut api_entry = ApiEntry {
                             referencing_addr: HashSet::new(),
                             dll_name: dll,
@@ -216,34 +211,31 @@ impl IndirectCallAnalyser {
                         .disassembly
                         .is_addr_within_memory_image(candidate)?
                     {
-                        //LOGGER.debug("successfully resolved: 0x%x", candidate)
                         cand_e.push((candidate, current_calling_addr));
-                    } else {
-                        //LOGGER.debug("candidate not resolved")
                     }
-                } else {
-                    //LOGGER.debug("no candidate to resolved")
                 }
                 return Ok(true);
             }
         }
-        //# process previous blocks
+
+        // Process previous blocks.
         if depth >= 0 {
-            let mut l = HashSet::new();
-            for block in processed.iter() {
-                for ins in block {
-                    l.insert(ins.0);
+            // All instruction offsets that already appear in any processed
+            // block — used to filter back-references.
+            let mut all_processed_offsets: HashSet<u64> = HashSet::new();
+            for blk in analysis_state.get_blocks()? {
+                if !blk.is_empty() && processed.contains(&blk[0].offset) {
+                    for ins in &blk {
+                        all_processed_offsets.insert(ins.offset);
+                    }
                 }
             }
             let mut refs_in = vec![];
             for (fr, to) in &analysis_state.code_refs {
-                for block in processed.iter() {
-                    if to == &block[0].0 && !l.contains(fr) {
-                        refs_in.push(fr);
-                    }
+                if processed.contains(to) && !all_processed_offsets.contains(fr) {
+                    refs_in.push(fr);
                 }
             }
-            //LOGGER.debug("start processing previous blocks")
             let mut bb = vec![];
             for i in refs_in {
                 if let Ok(b) = self.search_block(analysis_state, i) {
@@ -274,7 +266,8 @@ impl IndirectCallAnalyser {
         if !disassembler.disassembly.is_addr_within_memory_image(addr)? {
             return Err(Error::LogicError(file!(), line!()));
         }
-        let extracted_dword: &[u8; 4] = &disassembler.disassembly.get_bytes(addr, 4)?.try_into()?;
+        let extracted_dword: &[u8; 4] =
+            &disassembler.disassembly.get_bytes(addr, 4)?.try_into()?;
         Ok(u32::from_le_bytes(*extracted_dword) as u64)
     }
 }

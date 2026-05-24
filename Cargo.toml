@@ -1,30 +1,37 @@
 [package]
 name = "smda"
-description = "SMDA is a minimalist recursive disassembler library."
-version = "0.2.13"
+description = "Recursive x86/x64 disassembler library for control-flow recovery from memory dumps. Iced-x86-backed; zero-copy."
+version = "0.3.0"
 authors = ["Marirs <marirs@gmail.com>", "Andrey Mnatsakanov <andrey@3ig.kiev.ua>", "Jorge Alejandro Durán Royo<jorge.duran.royo@gmail.com>"]
-keywords = ["smda", "disassembler", "cfg", "capstone"]
+keywords = ["smda", "disassembler", "cfg", "iced", "x86"]
 categories = ["parsing", "development-tools::debugging"]
-license-file = "LICENSE"
+license = "MIT"
 readme = "README.md"
 repository = "https://github.com/marirs/smda-rs"
 homepage = "https://github.com/marirs/smda-rs"
-include = ["assets", "src"]
-edition = "2021"
+include = ["assets", "src", "LICENSE", "README.md", "CHANGELOG.md"]
+edition = "2024"
+rust-version = "1.95"
 
 [dependencies]
-capstone = "0.13.0"
-data-encoding = "2.6.0"
-goblin = { version = "0.10.0", features = ["alloc"] }
-hex = "0.4.3"
-itertools = "0.13.0"
-lazy_static = "1"
-maplit = "1.0.2"
-regex = "1.5.5"
-ring = "0.17"
+# Decoder. Pure Rust, ~2-3× faster than capstone, exposes typed operands.
+# We only need decode + Intel formatter + instruction-info (reg reads/writes).
+iced-x86 = { version = "1", default-features = false, features = ["std", "decoder", "intel", "instr_info"] }
+# goblin: PE + ELF parsers. We use `goblin::Object::parse` which requires
+# all formats (mach/archive/te) gated together, so keep goblin's defaults.
+goblin = { version = "0.10", features = ["alloc"] }
+hex = "0.4"
+itertools = "0.14"
+maplit = "1"
+# regex::bytes used to scan binary buffers for x86 function prologues.
+# fancy-regex has no bytes mode so SBOM consolidation with capa-rs isn't possible here.
+regex = "1"
+# Lightweight pure-Rust SHA-256 (replaces the much heavier `ring`, which was
+# used for a single hash of the input buffer).
+sha2 = { version = "0.10", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-thiserror = "1"
+thiserror = "2"
 
 [lib]
 name = "smda"

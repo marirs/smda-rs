@@ -25,12 +25,12 @@ pub fn get_base_address(binary: &[u8]) -> Result<u64> {
                 .program_headers
                 .iter()
                 .filter(|ph| ph.p_type == PT_LOAD)
-                .map(|ph| ph.p_vaddr.saturating_sub(ph.p_offset as u64))
+                .map(|ph| ph.p_vaddr.saturating_sub(ph.p_offset))
                 .min()
                 .unwrap_or(0);
 
-            if base == 0 {
-                if let Some(min_vaddr) = elf
+            if base == 0
+                && let Some(min_vaddr) = elf
                     .program_headers
                     .iter()
                     .filter(|ph| ph.p_type == PT_LOAD && ph.p_vaddr != 0)
@@ -39,7 +39,6 @@ pub fn get_base_address(binary: &[u8]) -> Result<u64> {
                 {
                     base = min_vaddr;
                 }
-            }
 
             Ok(base)
         }
@@ -174,9 +173,7 @@ pub fn extract_all_symbols(binary: &[u8]) -> Result<HashMap<u64, (Option<String>
             // 4. Fallback for unmapped dynamic symbols
             let fallback_symbols = extract_elf_dynamic_apis_fallback_internal(&elf, &lib_map, binary)?;
             for (addr, (lib, name)) in fallback_symbols {
-                if !symbol_map.contains_key(&addr) {
-                    symbol_map.insert(addr, (lib, name));
-                }
+                symbol_map.entry(addr).or_insert((lib, name));
             }
         }
         Err(e) => return Err(Error::ParseError(e)),
@@ -202,9 +199,7 @@ pub fn extract_elf_dynamic_apis(binary: &[u8]) -> Result<HashMap<u64, (Option<St
             // Fallback for dynamic APIs
             let fallback_symbols = extract_elf_dynamic_apis_fallback_internal(&elf, &lib_map, binary)?;
             for (addr, (lib, name)) in fallback_symbols {
-                if !api_map.contains_key(&addr) {
-                    api_map.insert(addr, (lib, name));
-                }
+                api_map.entry(addr).or_insert((lib, name));
             }
         }
         Err(e) => return Err(Error::ParseError(e)),
@@ -241,30 +236,28 @@ fn extract_dynamic_symbols_with_relocations(
     // Obtain the base address from the program headers
     let base_addr = elf.program_headers.iter()
         .filter(|ph| ph.p_type == PT_LOAD)
-        .map(|ph| ph.p_vaddr.saturating_sub(ph.p_offset as u64))
-        .min().unwrap_or_else(|| 0);
+        .map(|ph| ph.p_vaddr.saturating_sub(ph.p_offset))
+        .min().unwrap_or(0);
 
     for reloc in &elf.pltrelocs {
         let sym_idx = reloc.r_sym;
 
-        if let Some(symbol) = elf.dynsyms.get(sym_idx) {
-            if let Some(symbol_name) = elf.dynstrtab.get_at(symbol.st_name) {
-                if !symbol_name.is_empty() {
+        if let Some(symbol) = elf.dynsyms.get(sym_idx)
+            && let Some(symbol_name) = elf.dynstrtab.get_at(symbol.st_name)
+                && !symbol_name.is_empty() {
                     let library = detect_library_from_symbol(symbol_name, lib_map);
                     // Apply base address to the relocation offset
                     let final_addr = base_addr + reloc.r_offset;
                     symbols.insert(final_addr, (library, Some(symbol_name.to_string())));
                 }
-            }
-        }
     }
 
     for reloc in elf.dynrelas.iter().chain(elf.dynrels.iter()) {
         let sym_idx = reloc.r_sym;
 
-        if let Some(symbol) = elf.dynsyms.get(sym_idx) {
-            if let Some(symbol_name) = elf.dynstrtab.get_at(symbol.st_name) {
-                if !symbol_name.is_empty() {
+        if let Some(symbol) = elf.dynsyms.get(sym_idx)
+            && let Some(symbol_name) = elf.dynstrtab.get_at(symbol.st_name)
+                && !symbol_name.is_empty() {
                     let library = detect_library_from_symbol(symbol_name, lib_map);
 
                     // Apply base address to the relocation offset
@@ -272,8 +265,6 @@ fn extract_dynamic_symbols_with_relocations(
                     symbols.insert(final_addr, (library, Some(symbol_name.to_string())));
 
                 }
-            }
-        }
     }
 
     Ok(symbols)
@@ -283,14 +274,13 @@ fn extract_static_symbols(elf: &goblin::elf::Elf) -> Result<HashMap<u64, (Option
     let mut symbols = HashMap::new();
 
     for sym in &elf.syms {
-        if let Some(name) = elf.strtab.get_at(sym.st_name) {
-            if !name.is_empty() && sym.st_value != 0 {
+        if let Some(name) = elf.strtab.get_at(sym.st_name)
+            && !name.is_empty() && sym.st_value != 0 {
                 let symbol_type = sym.st_info & 0xf;
                 if symbol_type == 2 {  // STT_FUNC
                     symbols.insert(sym.st_value, (None, Some(name.to_string())));
                 }
             }
-        }
     }
 
     Ok(symbols)
@@ -300,14 +290,13 @@ fn extract_exported_symbols(elf: &goblin::elf::Elf) -> Result<HashMap<u64, (Opti
     let mut symbols = HashMap::new();
 
     for sym in &elf.dynsyms {
-        if let Some(name) = elf.dynstrtab.get_at(sym.st_name) {
-            if !name.is_empty() && sym.st_value != 0 {
+        if let Some(name) = elf.dynstrtab.get_at(sym.st_name)
+            && !name.is_empty() && sym.st_value != 0 {
                 let is_exported = sym.st_shndx != goblin::elf::section_header::SHN_UNDEF as usize;
                 if is_exported {
                     symbols.insert(sym.st_value, (Some("SELF".to_string()), Some(name.to_string())));
                 }
             }
-        }
     }
 
     Ok(symbols)

@@ -2,31 +2,35 @@ use crate::{
     error::Error, function_candidate::FunctionCandidate, DisassemblyResult, FunctionAnalysisState,
     Result,
 };
-use capstone::prelude::*;
+use crate::function::DecodedInsn;
+use iced_x86::{Decoder, DecoderOptions, Mnemonic};
 use itertools::Itertools;
 use regex::bytes::Regex as BytesRegex;
-use std::{collections::HashMap, collections::BTreeMap, convert::TryInto};
+use std::sync::LazyLock;
+use std::{collections::BTreeMap, collections::HashMap, convert::TryInto};
 
-lazy_static! {
-    static ref DEFAULT_PROLOGUES: Vec<BytesRegex> = vec![
+static DEFAULT_PROLOGUES: LazyLock<Vec<BytesRegex>> = LazyLock::new(|| {
+    vec![
         BytesRegex::new(r"(?-u)\x8B\xFF\x55\x8B\xEC").unwrap(),
         BytesRegex::new(r"(?-u)\x89\xFF\x55\x8B\xEC").unwrap(),
         BytesRegex::new(r"(?-u)\x55\x8B\xEC").unwrap(),
         BytesRegex::new(r"(?-u)\x55\x89\xE5").unwrap(),
-    ];
-    static ref REF_CANDIDATE: BytesRegex = BytesRegex::new(r"(?-u)\xE8").unwrap();
-    static ref BITNESS: BytesRegex = BytesRegex::new(r"(?-u)\xFF\x25").unwrap();
-    static ref STUB_CHAIN: BytesRegex =
-        BytesRegex::new(r"(?-u)(?P<block>(\xFF\x25[\S\s]{4}){2,})").unwrap();
-    static ref STUB_CHAIN_FUNC: BytesRegex =
-        BytesRegex::new(r"(?-u)\xFF\x25(?P<function>[\S\s]{4})").unwrap();
-    static ref STUB_CHAIN_BLOCK: BytesRegex =
-        BytesRegex::new(r"(?-u)(?P<block>(\xFF\x25[\S\s]{4}\x68[\S\s]{4}\xE9[\S\s]{4}){2,})")
-            .unwrap();
-    static ref STUB_CHAIN_BLOCK_FUNC: BytesRegex =
-        BytesRegex::new(r"(?-u)\xFF\x25(?P<function>[\S\s]{4})").unwrap();
-    static ref CELL_MATCH: BytesRegex = BytesRegex::new(r"(?-u)\xFF\x15").unwrap();
-}
+    ]
+});
+static REF_CANDIDATE: LazyLock<BytesRegex> =
+    LazyLock::new(|| BytesRegex::new(r"(?-u)\xE8").unwrap());
+static BITNESS: LazyLock<BytesRegex> = LazyLock::new(|| BytesRegex::new(r"(?-u)\xFF\x25").unwrap());
+static STUB_CHAIN: LazyLock<BytesRegex> =
+    LazyLock::new(|| BytesRegex::new(r"(?-u)(?P<block>(\xFF\x25[\S\s]{4}){2,})").unwrap());
+static STUB_CHAIN_FUNC: LazyLock<BytesRegex> =
+    LazyLock::new(|| BytesRegex::new(r"(?-u)\xFF\x25(?P<function>[\S\s]{4})").unwrap());
+static STUB_CHAIN_BLOCK: LazyLock<BytesRegex> = LazyLock::new(|| {
+    BytesRegex::new(r"(?-u)(?P<block>(\xFF\x25[\S\s]{4}\x68[\S\s]{4}\xE9[\S\s]{4}){2,})").unwrap()
+});
+static STUB_CHAIN_BLOCK_FUNC: LazyLock<BytesRegex> =
+    LazyLock::new(|| BytesRegex::new(r"(?-u)\xFF\x25(?P<function>[\S\s]{4})").unwrap());
+static CELL_MATCH: LazyLock<BytesRegex> =
+    LazyLock::new(|| BytesRegex::new(r"(?-u)\xFF\x15").unwrap());
 
 #[derive(Debug)]
 struct GapSequences {
@@ -160,7 +164,6 @@ impl GapSequences {
 #[derive(Debug)]
 pub struct FunctionCandidateManager {
     pub bitness: u32,
-    cs: Option<Capstone>,
     identified_alignment: u32,
     code_areas: Vec<(u64, u64)>,
     all_call_refs: HashMap<u64, u64>,
@@ -178,7 +181,6 @@ impl FunctionCandidateManager {
     pub fn new() -> FunctionCandidateManager {
         FunctionCandidateManager {
             bitness: 0,
-            cs: None,
             identified_alignment: 0,
             code_areas: vec![],
             all_call_refs: HashMap::new(),
@@ -195,19 +197,6 @@ impl FunctionCandidateManager {
 
     pub fn init(&mut self, disassembly: &DisassemblyResult) -> Result<()> {
         self.bitness = disassembly.binary_info.bitness;
-        self.cs = Some(
-            Capstone::new()
-                .x86()
-                .mode(if self.bitness == 32 {
-                    arch::x86::ArchMode::Mode32
-                } else {
-                    arch::x86::ArchMode::Mode64
-                })
-                .syntax(arch::x86::ArchSyntax::Intel)
-                .detail(true)
-                .build()
-                .map_err(Error::CapstoneError)?,
-        );
         self.identified_alignment = 0;
         self.code_areas = disassembly.binary_info.code_areas.clone();
         self.locate_candidates(disassembly)?;
@@ -361,7 +350,7 @@ impl FunctionCandidateManager {
     }
 
     fn locate_prologue_candidates(&mut self, disassembly: &DisassemblyResult) -> Result<()> {
-        for re_prologue in DEFAULT_PROLOGUES.to_vec() {
+        for re_prologue in DEFAULT_PROLOGUES.iter() {
             for prologue_match in re_prologue.find_iter(&disassembly.binary_info.binary) {
                 if !self.passes_code_filter(Some(
                     disassembly.binary_info.base_addr + prologue_match.start() as u64,
@@ -418,10 +407,7 @@ impl FunctionCandidateManager {
         if self.bitness == 32 {
             for call_match in BITNESS.find_iter(&disassembly.binary_info.binary) {
                 let function_addr =
-                    match self.resolve_pointer_reference(call_match.start() as u64, disassembly) {
-                        Ok(f) => Some(f),
-                        _ => None,
-                    };
+                    self.resolve_pointer_reference(call_match.start() as u64, disassembly).ok();
                 if !self.passes_code_filter(function_addr)? {
                     continue;
                 }
@@ -439,10 +425,7 @@ impl FunctionCandidateManager {
 
             for call_match in CELL_MATCH.find_iter(&disassembly.binary_info.binary) {
                 let function_addr =
-                    match self.resolve_pointer_reference(call_match.start() as u64, disassembly) {
-                        Ok(f) => Some(f),
-                        _ => None,
-                    };
+                    self.resolve_pointer_reference(call_match.start() as u64, disassembly).ok();
                 if !self.passes_code_filter(function_addr)? {
                     continue;
                 }
@@ -469,7 +452,7 @@ impl FunctionCandidateManager {
         if self.bitness == 32 {
             let addr_block: &[u8; 4] = disassembly.get_raw_bytes(offset + 2, 4)?.try_into()?;
             let function_pointer = u32::from_le_bytes(*addr_block) as u64;
-            return Ok(disassembly.dereference_dword(function_pointer)?);
+            return disassembly.dereference_dword(function_pointer);
         }
         if self.bitness == 64 {
             let addr_block: &[u8; 4] = disassembly.get_raw_bytes(offset + 2, 4)?.try_into()?;
@@ -592,15 +575,16 @@ impl FunctionCandidateManager {
 
     pub fn is_alignment_sequence(
         &self,
-        instruction_sequence: &capstone::Instructions,
+        instruction_sequence: &[DecodedInsn],
     ) -> Result<bool> {
         let mut is_alignment_sequence = false;
-        if instruction_sequence.len() > 0 {
-            let mut current_offset = instruction_sequence[0].address();
-            for instruction in instruction_sequence.as_ref() {
-                if self.gs.gs[&instruction.bytes().len()].contains(&instruction.bytes().to_vec()) {
-                    current_offset += instruction.bytes().len() as u64;
-                    if current_offset % 16 == 0 {
+        if !instruction_sequence.is_empty() {
+            let mut current_offset = instruction_sequence[0].offset;
+            for instruction in instruction_sequence {
+                let len = instruction.bytes.len();
+                if self.gs.gs.get(&len).is_some_and(|set| set.contains(&instruction.bytes)) {
+                    current_offset += len as u64;
+                    if current_offset.is_multiple_of(16) {
                         is_alignment_sequence = true;
                         break;
                     }
@@ -703,30 +687,15 @@ impl FunctionCandidateManager {
                 self.gap_pointer += 1;
                 continue;
             }
-            //try to find instructions that directly encode as NOP and
-            // skip them
-            let mut ins_buf = vec![];
+            // Try to find a single instruction at the current gap that's a
+            // NOP encoding; if so, skip it and continue looking.
             {
-                let ins_bb = self
-                    .cs
-                    .as_ref()
-                    .unwrap()
-                    .disasm_all(disassembly.get_raw_bytes(gap_offset, 15)?, gap_offset)
-                    .map_err(Error::CapstoneError)?;
-                if let Some(ins) = ins_bb.as_ref().iter().next() {
-                    ins_buf.push(ins)
-                }
-                // for ins in ins_bb.as_ref() {
-                //     ins_buf.push(ins);
-                //     break;
-                // }
-                if !ins_buf.is_empty() {
-                    //                i_address, i_size, i_mnemonic, i_op_str = ins.mnemonic()
-                    if ins_buf[0].mnemonic() == Some("nop") {
-                        //let nop_instruction = i_mnemonic + " " + i_op_str
-                        //nop_length = i_size
-                        //LOGGER.debug("nextGapCandidate() found nop instruction (%s) - gap_ptr += %d: 0x%08x", nop_instruction, nop_length, self.gap_pointer)
-                        self.gap_pointer += ins_buf[0].bytes().len() as u64;
+                let buf = disassembly.get_raw_bytes(gap_offset, 15)?;
+                let mut decoder = Decoder::with_ip(self.bitness, buf, gap_offset, DecoderOptions::NONE);
+                if decoder.can_decode() {
+                    let insn = decoder.decode();
+                    if !insn.is_invalid() && matches!(insn.mnemonic(), Mnemonic::Nop) {
+                        self.gap_pointer += decoder.position() as u64;
                         continue;
                     }
                 }

@@ -165,10 +165,10 @@ impl FunctionCandidate {
             is_exception_handler: false,
         };
 
-        if fc.addr % 4 == 0 {
+        if fc.addr.is_multiple_of(4) {
             fc.alignment = 4;
         }
-        if fc.addr % 16 == 0 {
+        if fc.addr.is_multiple_of(16) {
             fc.alignment = 16;
         }
         Ok(fc)

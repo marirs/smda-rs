@@ -32,8 +32,8 @@ pub enum Error {
     FromHexError(#[from] hex::FromHexError),
     #[error("json parse error: {0}")]
     JsonParseError(#[from] serde_json::Error),
-    #[error("{0}")]
-    CapstoneError(capstone::Error),
+    #[error("decoder error: {0:?}")]
+    DecodeError(iced_x86::DecoderError),
     #[error("{0}")]
     RegexError(#[from] regex::Error),
     #[error("{0}")]

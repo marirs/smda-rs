@@ -106,8 +106,7 @@ impl TailCallAnalyser {
             if let Ok(addr) = disassembler
                 .tailcall_analyzer
                 .get_function_by_start_addr(tailcall.destination_addr)
-            {
-                if disassembler.tailcall_analyzer.functions[&addr]
+                && disassembler.tailcall_analyzer.functions[&addr]
                     .instruction_start_bytes
                     .contains(&tailcall.destination_function)
                 {
@@ -127,7 +126,6 @@ impl TailCallAnalyser {
                         .ok_or(Error::LogicError(file!(), line!()))?
                         .is_tailcall_function = true;
                 }
-            }
         }
         Ok(newly_created_functions)
     }
@@ -216,13 +214,13 @@ impl TailCallAnalyser {
         let mut first_instruction = &instructions[0];
         let mut last_instruction = first_instruction;
         for instruction in instructions {
-            if instruction.0 > last_instruction.0 + last_instruction.1 as u64 {
-                intervals.push((first_instruction.0, last_instruction.0));
-                first_instruction = instruction
+            if instruction.offset > last_instruction.offset + last_instruction.length as u64 {
+                intervals.push((first_instruction.offset, last_instruction.offset));
+                first_instruction = instruction;
             }
-            last_instruction = instruction
+            last_instruction = instruction;
         }
-        intervals.push((first_instruction.0, last_instruction.0));
+        intervals.push((first_instruction.offset, last_instruction.offset));
         Ok(intervals)
     }
 }
