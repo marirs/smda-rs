@@ -220,7 +220,9 @@ impl FunctionAnalysisState {
             }
             // sane case: single-block tailcall (jmp/call as last)
             else if self.num_blocks_analyzed == 1 {
-                let last = &self.instructions[self.instructions.len() - 1];
+                let Some(last) = self.instructions.last() else {
+                    return Ok(false);
+                };
                 if matches!(last.iced.mnemonic(), Mnemonic::Jmp | Mnemonic::Call) {
                     // tailcall-like; accept
                 } else {

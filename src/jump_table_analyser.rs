@@ -179,32 +179,36 @@ impl JumpTableAnalyser {
         jumptable_address: u64,
         jumptable_size: Option<usize>,
     ) -> Result<Vec<u64>> {
-        let jumptable_size = jumptable_size.unwrap_or(0xFF);
+        // Hard cap the jumptable size — `jumptable_size` is parsed from a
+        // user-controlled operand and could be near `usize::MAX`. The cap
+        // bounds the loop independently of `get_bytes` Err'ing on OOB.
+        const MAX_JUMPTABLE_ENTRIES: usize = 4096;
+        let jumptable_size = jumptable_size.unwrap_or(0xFF).min(MAX_JUMPTABLE_ENTRIES);
         let mut jumptable_addresses = vec![];
         let bitness = disassembly.binary_info.bitness;
         let entry_size: u64 = if bitness == 32 { 4 } else { 8 };
         let mut table_entry = 0;
         if disassembly.is_addr_within_memory_image(jumptable_address)? {
             for i in 0..jumptable_size {
+                let Some(rel) = (i as u64).checked_mul(entry_size) else {
+                    break;
+                };
+                let Some(entry_addr) = jumptable_address.checked_add(rel) else {
+                    break;
+                };
                 if bitness == 32 {
-                    let packed_dword: &[u8; 4] = disassembly
-                        .get_bytes(jumptable_address + i as u64 * entry_size, entry_size)?
-                        .try_into()?;
+                    let packed_dword: &[u8; 4] =
+                        disassembly.get_bytes(entry_addr, entry_size)?.try_into()?;
                     table_entry = u32::from_le_bytes(*packed_dword) as u64;
                 } else if bitness == 64 {
-                    let packed_dword: &[u8; 8] = disassembly
-                        .get_bytes(jumptable_address + i as u64 * entry_size, entry_size)?
-                        .try_into()?;
+                    let packed_dword: &[u8; 8] =
+                        disassembly.get_bytes(entry_addr, entry_size)?.try_into()?;
                     table_entry = u64::from_le_bytes(*packed_dword);
                 }
                 if !disassembly.is_addr_within_memory_image(table_entry)? {
                     break;
                 }
-                state.add_data_ref(
-                    jump_instruction_address,
-                    jumptable_address + i as u64 * entry_size,
-                    entry_size,
-                )?;
+                state.add_data_ref(jump_instruction_address, entry_addr, entry_size)?;
                 jumptable_addresses.push(table_entry);
             }
         }
@@ -257,6 +261,7 @@ impl JumpTableAnalyser {
         off_jumptable: u64,
         disassembler: &Disassembler,
     ) -> Result<Vec<u64>> {
+        const MAX_JUMPTABLE_ENTRIES: usize = 4096;
         let mut jump_targets = vec![];
         if let Some(jumptable_size) = jumptable_size
             && off_jumptable != 0
@@ -264,10 +269,17 @@ impl JumpTableAnalyser {
                 .disassembly
                 .is_addr_within_memory_image(off_jumptable)?
         {
+            let jumptable_size = jumptable_size.min(MAX_JUMPTABLE_ENTRIES);
             for index in 0..jumptable_size {
+                let Some(rel) = (index as u64).checked_mul(4) else {
+                    break;
+                };
+                let Some(entry_addr) = off_jumptable.checked_add(rel) else {
+                    break;
+                };
                 let packed_dword: &[u8; 4] = disassembler
                     .disassembly
-                    .get_bytes(off_jumptable + index as u64 * 4, 4)?
+                    .get_bytes(entry_addr, 4)?
                     .try_into()?;
                 let entry = u32::from_le_bytes(*packed_dword) as u64;
                 jump_targets.push(entry);
@@ -323,41 +335,57 @@ impl JumpTableAnalyser {
         bonus_offset: u64,
         disassembler: &Disassembler,
     ) -> Result<Vec<u64>> {
-        let jumptable_size = jumptable_size.unwrap_or(0xFF);
+        const MAX_JUMPTABLE_ENTRIES: usize = 4096;
+        let jumptable_size = jumptable_size.unwrap_or(0xFF).min(MAX_JUMPTABLE_ENTRIES);
         let mut jump_targets = vec![];
         let jump_base = match alternative_base {
             Some(s) => s,
             None => off_jumptable,
         };
+        let base_addr = disassembler.disassembly.binary_info.base_addr;
         if jumptable_size != 0
             && off_jumptable != 0
             && disassembler
                 .disassembly
                 .is_addr_within_memory_image(off_jumptable)?
         {
+            // Pre-compute the rebased start outside the loop (it doesn't
+            // change between iterations).
+            let Some(rebased_start) = off_jumptable
+                .checked_add(bonus_offset)
+                .and_then(|s| s.checked_sub(base_addr))
+            else {
+                return Ok(jump_targets);
+            };
             for index in 0..jumptable_size {
-                let rebased =
-                    off_jumptable + bonus_offset - disassembler.disassembly.binary_info.base_addr;
+                let Some(rel) = (index as u64).checked_mul(4) else {
+                    break;
+                };
+                let Some(entry_addr) = rebased_start.checked_add(rel) else {
+                    break;
+                };
                 let packed_dword: &[u8; 4] = disassembler
                     .disassembly
-                    .get_bytes(rebased + index as u64 * 4, 4)?
+                    .get_bytes(entry_addr, 4)?
                     .try_into()?;
                 let entry = u32::from_le_bytes(*packed_dword) as u64;
-                if index != 0
-                    && self
-                        .table_offsets
-                        .contains(&(off_jumptable + index as u64 * 4))
-                {
+                let Some(table_offset_check) = off_jumptable.checked_add(rel) else {
+                    break;
+                };
+                if index != 0 && self.table_offsets.contains(&table_offset_check) {
                     break;
                 }
+                let Some(target_raw) = jump_base.checked_add(entry) else {
+                    break;
+                };
                 if !disassembler
                     .disassembly
-                    .is_addr_within_memory_image(jump_base + entry)?
+                    .is_addr_within_memory_image(target_raw)?
                 {
                     break;
                 }
                 if entry != 0 {
-                    let target = (jump_base + entry) & disassembler.get_bitmask();
+                    let target = target_raw & disassembler.get_bitmask();
                     jump_targets.push(target);
                 } else if alternative_base.is_none() {
                     break;

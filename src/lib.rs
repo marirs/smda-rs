@@ -154,16 +154,29 @@ impl BinaryInfo {
         digest.iter().map(|b| format!("{b:02X}")).collect()
     }
 
+    /// Returns `(section_name, va_start, va_end)` for each PE section. The
+    /// addresses are mapped virtual addresses (i.e. `base_addr +
+    /// virtual_address`), matching what `report::get_section` and
+    /// `function_candidate_manager::locate_exception_handler_candidates`
+    /// expect. Sections whose VA range overflows u64 are skipped.
+    ///
+    /// (Prior to 0.3.0 this returned file offsets, which silently broke the
+    /// `.pdata` exception-handler scan and `report::get_section` lookups.)
     pub fn get_sections(&self) -> Result<Vec<(String, u64, u64)>> {
         match Object::parse(&self.raw_data)? {
             Object::PE(pe) => {
                 let mut res = vec![];
+                let base = self.base_addr;
                 for sect in pe.sections {
-                    res.push((
-                        std::str::from_utf8(&sect.name)?.to_string(),
-                        sect.pointer_to_raw_data as u64,
-                        (sect.pointer_to_raw_data + sect.size_of_raw_data) as u64,
-                    ));
+                    let name = std::str::from_utf8(&sect.name)?.to_string();
+                    let Some(va_start) = base.checked_add(sect.virtual_address as u64) else {
+                        continue;
+                    };
+                    let size = sect.virtual_size.max(sect.size_of_raw_data) as u64;
+                    let Some(va_end) = va_start.checked_add(size) else {
+                        continue;
+                    };
+                    res.push((name, va_start, va_end));
                 }
                 Ok(res)
             }
@@ -366,32 +379,77 @@ impl DisassemblyResult {
 
     pub fn get_byte(&self, addr: u64) -> Result<u8> {
         if self.is_addr_within_memory_image(addr)? {
-            return Ok(self.binary_info.binary[addr as usize - self.binary_info.base_addr as usize]);
+            // is_addr_within_memory_image guarantees base_addr <= addr in
+            // u64 space — do the subtraction in u64 (never in usize after
+            // truncation, to stay correct on 32-bit targets).
+            let rel = addr - self.binary_info.base_addr;
+            let idx = usize::try_from(rel).map_err(|_| Error::NotEnoughBytesError(addr, 1))?;
+            return self
+                .binary_info
+                .binary
+                .get(idx)
+                .copied()
+                .ok_or(Error::NotEnoughBytesError(addr, 1));
         }
         Err(Error::LogicError(file!(), line!()))
     }
 
     pub fn get_raw_byte(&self, addr: u64) -> Result<u8> {
-        Ok(self.binary_info.binary[addr as usize])
+        let idx = usize::try_from(addr).map_err(|_| Error::NotEnoughBytesError(addr, 1))?;
+        self.binary_info
+            .binary
+            .get(idx)
+            .copied()
+            .ok_or(Error::NotEnoughBytesError(addr, 1))
     }
 
     pub fn get_raw_bytes(&self, offset: u64, bytes: u64) -> Result<&[u8]> {
-        Ok(&self.binary_info.binary[offset as usize..(offset + bytes) as usize])
+        let end = offset
+            .checked_add(bytes)
+            .ok_or(Error::NotEnoughBytesError(offset, bytes))?;
+        let (start_us, end_us) = (
+            usize::try_from(offset).map_err(|_| Error::NotEnoughBytesError(offset, bytes))?,
+            usize::try_from(end).map_err(|_| Error::NotEnoughBytesError(offset, bytes))?,
+        );
+        self.binary_info
+            .binary
+            .get(start_us..end_us)
+            .ok_or(Error::NotEnoughBytesError(offset, bytes))
     }
 
     pub fn get_bytes(&self, addr: u64, num_bytes: u64) -> Result<&[u8]> {
-        if self.is_addr_within_memory_image(addr)? {
-            let rel_start_addr = addr - self.binary_info.base_addr;
-            return Ok(&self.binary_info.binary
-                [rel_start_addr as usize..(rel_start_addr + num_bytes) as usize]);
+        if !self.is_addr_within_memory_image(addr)? {
+            return Err(Error::NotEnoughBytesError(addr, num_bytes));
         }
-        Err(Error::NotEnoughBytesError(addr, num_bytes))
+        let rel_start = addr - self.binary_info.base_addr;
+        let rel_end = rel_start
+            .checked_add(num_bytes)
+            .ok_or(Error::NotEnoughBytesError(addr, num_bytes))?;
+        if rel_end > self.binary_info.binary_size {
+            return Err(Error::NotEnoughBytesError(addr, num_bytes));
+        }
+        let (start_us, end_us) = (
+            usize::try_from(rel_start).map_err(|_| Error::NotEnoughBytesError(addr, num_bytes))?,
+            usize::try_from(rel_end).map_err(|_| Error::NotEnoughBytesError(addr, num_bytes))?,
+        );
+        self.binary_info
+            .binary
+            .get(start_us..end_us)
+            .ok_or(Error::NotEnoughBytesError(addr, num_bytes))
     }
 
     pub fn is_addr_within_memory_image(&self, offset: u64) -> Result<bool> {
-        let res = self.binary_info.base_addr <= offset
-            && offset < self.binary_info.base_addr + self.binary_info.binary_size;
-        Ok(res)
+        // Use checked_add to avoid overflowing when binary_size is at the
+        // top of the address space; an overflow conservatively means
+        // "address is not within image".
+        let Some(end) = self
+            .binary_info
+            .base_addr
+            .checked_add(self.binary_info.binary_size)
+        else {
+            return Ok(false);
+        };
+        Ok(self.binary_info.base_addr <= offset && offset < end)
     }
 
     pub fn passes_code_filter(&self, address: Option<u64>) -> Result<bool> {
@@ -409,30 +467,51 @@ impl DisassemblyResult {
     }
 
     pub fn dereference_dword(&self, addr: u64) -> Result<u64> {
-        if self.is_addr_within_memory_image(addr)? {
-            let rel_start_addr = addr - self.binary_info.base_addr;
-            let rel_end_addr = rel_start_addr + 4;
-            let extracted_dword: &[u8; 4] = &self.binary_info.binary
-                [rel_start_addr as usize..rel_end_addr as usize]
-                .try_into()?;
-            return Ok(u32::from_le_bytes(*extracted_dword) as u64);
+        if !self.is_addr_within_memory_image(addr)? {
+            return Err(Error::DereferenceError(addr));
         }
-        Err(Error::DereferenceError(addr))
+        let rel_start_addr = addr - self.binary_info.base_addr;
+        let rel_end_addr = rel_start_addr
+            .checked_add(4)
+            .ok_or(Error::DereferenceError(addr))?;
+        if rel_end_addr > self.binary_info.binary_size {
+            return Err(Error::DereferenceError(addr));
+        }
+        let (s, e) = (
+            usize::try_from(rel_start_addr).map_err(|_| Error::DereferenceError(addr))?,
+            usize::try_from(rel_end_addr).map_err(|_| Error::DereferenceError(addr))?,
+        );
+        let extracted_dword: &[u8; 4] = self
+            .binary_info
+            .binary
+            .get(s..e)
+            .ok_or(Error::DereferenceError(addr))?
+            .try_into()?;
+        Ok(u32::from_le_bytes(*extracted_dword) as u64)
     }
 
     pub fn dereference_qword(&self, addr: u64) -> Result<u64> {
-        if self.is_addr_within_memory_image(addr)? {
-            let rel_start_addr = addr - self.binary_info.base_addr;
-            let rel_end_addr = rel_start_addr + 8;
-            if rel_end_addr > self.binary_info.binary_size {
-                return Err(Error::DereferenceError(addr));
-            }
-            let extracted_dword: &[u8; 8] = &self.binary_info.binary
-                [rel_start_addr as usize..rel_end_addr as usize]
-                .try_into()?;
-            return Ok(u64::from_le_bytes(*extracted_dword));
+        if !self.is_addr_within_memory_image(addr)? {
+            return Err(Error::DereferenceError(addr));
         }
-        Err(Error::DereferenceError(addr))
+        let rel_start_addr = addr - self.binary_info.base_addr;
+        let rel_end_addr = rel_start_addr
+            .checked_add(8)
+            .ok_or(Error::DereferenceError(addr))?;
+        if rel_end_addr > self.binary_info.binary_size {
+            return Err(Error::DereferenceError(addr));
+        }
+        let (s, e) = (
+            usize::try_from(rel_start_addr).map_err(|_| Error::DereferenceError(addr))?,
+            usize::try_from(rel_end_addr).map_err(|_| Error::DereferenceError(addr))?,
+        );
+        let extracted_qword: &[u8; 8] = self
+            .binary_info
+            .binary
+            .get(s..e)
+            .ok_or(Error::DereferenceError(addr))?
+            .try_into()?;
+        Ok(u64::from_le_bytes(*extracted_qword))
     }
 
     pub fn add_code_refs(&mut self, addr_from: u64, addr_to: u64) -> Result<()> {
@@ -1136,10 +1215,13 @@ impl Disassembler {
     ) -> Result<()> {
         let i_address = ins.offset;
         let i_size = ins.length;
-        if let Ok(_jump_destination) = self.get_referenced_addr(op_str) {
-            state.add_code_ref(i_address, u64::from_str_radix(&op_str[2..], 16)?, true)?;
+        // Use the already-parsed jump_destination rather than re-parsing
+        // `op_str[2..]` (which previously panicked on `op_str.len() < 2`
+        // or operands that didn't start with `0x`).
+        if let Ok(jump_destination) = self.get_referenced_addr(op_str) {
+            state.add_code_ref(i_address, jump_destination, true)?;
         }
-        state.add_block_to_queue(i_address + i_size as u64)?;
+        state.add_block_to_queue(i_address.wrapping_add(i_size as u64))?;
         state.set_block_ending_instruction(true)?;
         Ok(())
     }
@@ -1153,7 +1235,7 @@ impl Disassembler {
         let mut tailcall_jumps = vec![];
         let i_address = ins.offset;
         let i_size = ins.length;
-        state.add_block_to_queue(i_address + i_size as u64)?;
+        state.add_block_to_queue(i_address.wrapping_add(i_size as u64))?;
         if let Ok(jump_destination) = self.get_referenced_addr(op_str) {
             tailcall_jumps.push((i_address, jump_destination));
             if self.disassembly.functions.contains_key(&jump_destination) {
@@ -1165,9 +1247,9 @@ impl Disassembler {
             {
                 // tailcall?
             } else {
-                state.add_block_to_queue(u64::from_str_radix(&op_str[2..], 16)?)?;
+                state.add_block_to_queue(jump_destination)?;
             }
-            state.add_code_ref(i_address, u64::from_str_radix(&op_str[2..], 16)?, true)?;
+            state.add_code_ref(i_address, jump_destination, true)?;
         }
         state.set_block_ending_instruction(true)?;
         Ok(tailcall_jumps)

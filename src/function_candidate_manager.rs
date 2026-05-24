@@ -276,29 +276,50 @@ impl FunctionCandidateManager {
         &mut self,
         disassembly: &DisassemblyResult,
     ) -> Result<()> {
-        if self.bitness == 64 {
-            for (section_name, section_va_start, section_va_end) in
-                disassembly.binary_info.get_sections()?
-            {
-                if section_name == ".pdata" {
-                    let rva_start = section_va_start - disassembly.binary_info.base_addr;
-                    let rva_end = section_va_end - disassembly.binary_info.base_addr;
-                    let mut offset = rva_start as usize;
-                    while offset < rva_end as usize {
-                        if offset + 4 <= rva_end as usize {
-                            let packed_dword: &[u8; 4] =
-                                &disassembly.binary_info.binary[offset..offset + 4].try_into()?;
-                            let rva_function_candidate = u32::from_le_bytes(*packed_dword) as u64;
-                            self.add_exception_candidate(
-                                disassembly.binary_info.base_addr + rva_function_candidate,
-                                disassembly,
-                            )?;
-                        } else {
-                            break;
-                        }
-                        offset += 12;
-                    }
+        if self.bitness != 64 {
+            return Ok(());
+        }
+        let base_addr = disassembly.binary_info.base_addr;
+        let buf_len = disassembly.binary_info.binary.len();
+        for (section_name, section_va_start, section_va_end) in
+            disassembly.binary_info.get_sections()?
+        {
+            if section_name != ".pdata" {
+                continue;
+            }
+            // get_sections returns mapped VAs; convert back to mapped-buffer offsets.
+            let Some(rva_start) = section_va_start.checked_sub(base_addr) else {
+                continue;
+            };
+            let Some(rva_end) = section_va_end.checked_sub(base_addr) else {
+                continue;
+            };
+            let Ok(mut offset) = usize::try_from(rva_start) else {
+                continue;
+            };
+            let Ok(end) = usize::try_from(rva_end) else {
+                continue;
+            };
+            // Clamp end to the mapped binary length — the section may
+            // declare a range that extends past EOF on a crafted file.
+            let end = end.min(buf_len);
+            while let Some(slice_end) = offset.checked_add(4) {
+                if slice_end > end {
+                    break;
                 }
+                let Some(packed) = disassembly.binary_info.binary.get(offset..slice_end) else {
+                    break;
+                };
+                let packed_dword: [u8; 4] = packed.try_into()?;
+                let rva_function_candidate = u32::from_le_bytes(packed_dword) as u64;
+                if let Some(addr) = base_addr.checked_add(rva_function_candidate) {
+                    self.add_exception_candidate(addr, disassembly)?;
+                }
+                // RUNTIME_FUNCTION entries are 12 bytes; advance.
+                let Some(next) = offset.checked_add(12) else {
+                    break;
+                };
+                offset = next;
             }
         }
         Ok(())
@@ -451,22 +472,42 @@ impl FunctionCandidateManager {
         offset: u64,
         disassembly: &DisassemblyResult,
     ) -> Result<u64> {
+        let addr_offset = offset.checked_add(2).ok_or(Error::IntegerOverflow(
+            "resolve_pointer_reference offset+2",
+            offset,
+            2,
+        ))?;
         if self.bitness == 32 {
-            let addr_block: &[u8; 4] = disassembly.get_raw_bytes(offset + 2, 4)?.try_into()?;
+            let addr_block: &[u8; 4] = disassembly.get_raw_bytes(addr_offset, 4)?.try_into()?;
             let function_pointer = u32::from_le_bytes(*addr_block) as u64;
             return disassembly.dereference_dword(function_pointer);
         }
         if self.bitness == 64 {
-            let addr_block: &[u8; 4] = disassembly.get_raw_bytes(offset + 2, 4)?.try_into()?;
+            let addr_block: &[u8; 4] = disassembly.get_raw_bytes(addr_offset, 4)?.try_into()?;
             let mut function_pointer = u32::from_le_bytes(*addr_block) as u64;
-            if disassembly.get_raw_bytes(offset, 2)? == b"\xFF\x25" {
-                function_pointer += offset + 7
-            } else if disassembly.get_raw_bytes(offset, 2)? == b"\xFF\x15" {
-                function_pointer += offset + 6;
+            // RIP-relative; the instruction is 6 (`FF 15`) or 7 (`FF 25`)
+            // bytes long depending on the opcode. wrapping_add matches the
+            // x86 semantics — if the RIP target wraps around the address
+            // space it's still a deterministic value, which the caller
+            // gates with `is_addr_within_memory_image`.
+            let prefix = disassembly.get_raw_bytes(offset, 2)?;
+            if prefix == b"\xFF\x25" {
+                function_pointer = function_pointer.wrapping_add(offset).wrapping_add(7);
+            } else if prefix == b"\xFF\x15" {
+                function_pointer = function_pointer.wrapping_add(offset).wrapping_add(6);
             } else {
                 return Err(Error::LogicError(file!(), line!()));
             }
-            return Ok(disassembly.binary_info.base_addr + function_pointer);
+            let absolute = disassembly
+                .binary_info
+                .base_addr
+                .checked_add(function_pointer)
+                .ok_or(Error::IntegerOverflow(
+                    "resolve_pointer_reference base+ptr",
+                    disassembly.binary_info.base_addr,
+                    function_pointer,
+                ))?;
+            return Ok(absolute);
         }
         Err(Error::LogicError(file!(), line!()))
     }
@@ -706,14 +747,18 @@ impl FunctionCandidateManager {
                 }
                 //# try to find effective NOPs and skip them.
                 let mut found_multi_byte_nop = false;
-                for gap_length in *self
+                // Iterate widest → narrowest so we match the longest
+                // multi-byte NOP first. The previous `15u32..1` range was
+                // empty (typo from the iced rewrite) and silently disabled
+                // multi-byte NOP gap detection.
+                let max_gap = *self
                     .gs
                     .gs
                     .keys()
                     .max()
                     .ok_or(Error::LogicError(file!(), line!()))?
-                    as u32..1
-                {
+                    as u32;
+                for gap_length in (2..=max_gap).rev() {
                     if self.gs.gs[&(gap_length as usize)].contains(
                         &disassembly
                             .get_raw_bytes(gap_offset, gap_length as u64)?

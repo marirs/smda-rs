@@ -124,8 +124,19 @@ impl FunctionCandidate {
 
         let rel_addr = addr - bi.base_addr;
 
-        // This check ensures that we have at least 5 bytes available from the relative address
-        if (rel_addr as usize + 5) > bi.binary.len() {
+        // Convert to usize with truncation check (matters on 32-bit
+        // targets) and verify there are at least 5 bytes available — using
+        // checked_add so a wrapped u32 doesn't bypass the bound check.
+        let rel_addr_usize = usize::try_from(rel_addr).map_err(|_| {
+            Error::InvalidAddress(format!("Relative address 0x{:x} exceeds usize", rel_addr))
+        })?;
+        let end = rel_addr_usize.checked_add(5).ok_or_else(|| {
+            Error::InvalidAddress(format!(
+                "Address arithmetic overflow at 0x{:x} (rel_addr: 0x{:x})",
+                addr, rel_addr
+            ))
+        })?;
+        if end > bi.binary.len() {
             return Err(Error::InvalidAddress(format!(
                 "Not enough bytes at address 0x{:x} (rel_addr: 0x{:x}, binary size: {})",
                 addr,
@@ -134,22 +145,17 @@ impl FunctionCandidate {
             )));
         }
 
-        // This check ensures that the relative address is within the bounds of the binary
-        let rel_addr_usize = rel_addr as usize;
-        if rel_addr_usize >= bi.binary.len() {
-            return Err(Error::InvalidAddress(format!(
-                "Relative address 0x{:x} is beyond binary size {}",
-                rel_addr,
-                bi.binary.len()
-            )));
-        }
+        let bytes_slice = bi
+            .binary
+            .get(rel_addr_usize..end)
+            .ok_or_else(|| Error::InvalidAddress(format!("Slice out of range at 0x{:x}", addr)))?;
 
         let mut fc = FunctionCandidate {
             cp: CommonPlagues::init(),
             bitness: bi.bitness,
             addr,
             rel_start_addr: rel_addr,
-            bytes: bi.binary[rel_addr_usize..rel_addr_usize + 5].try_into()?,
+            bytes: bytes_slice.try_into()?,
             lang_spec: None,
             call_ref_sources: HashSet::new(),
             finished: false,

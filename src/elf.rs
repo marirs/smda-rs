@@ -53,11 +53,20 @@ pub fn get_code_areas(_binary: &[u8], pe: &goblin::elf::Elf) -> Result<Vec<(u64,
             let section_start = section.sh_addr;
             let mut section_size = section.sh_size;
 
-            if section_size % section.sh_addralign != 0 {
-                section_size += section.sh_addralign - (section_size % section.sh_addralign);
+            // ELF spec: sh_addralign of 0 or 1 means no alignment constraint.
+            // A malformed binary with sh_addralign = 0 would otherwise panic
+            // on the `%` below.
+            if section.sh_addralign > 1 && !section_size.is_multiple_of(section.sh_addralign) {
+                let pad = section.sh_addralign - (section_size % section.sh_addralign);
+                section_size = match section_size.checked_add(pad) {
+                    Some(s) => s,
+                    None => continue, // overflowing alignment — skip section
+                };
             }
 
-            let section_end = section_start + section_size;
+            let Some(section_end) = section_start.checked_add(section_size) else {
+                continue;
+            };
             res.push((section_start, section_end));
         }
     }
@@ -72,6 +81,12 @@ fn align(v: &u64, alignment: &u64) -> u64 {
     v + (alignment - remainder)
 }
 
+/// Hard cap on mapped image size to prevent OOM on adversarial inputs.
+/// Matches the PE-side cap in `pe::map_binary`. ELF samples in the wild
+/// almost never exceed a few tens of MB; anything beyond this is malformed
+/// or hostile.
+const MAX_MAPPED_BYTES: u64 = 256 * 1024 * 1024;
+
 pub fn map_binary(binary: &[u8]) -> Result<Vec<u8>> {
     let elffile = match goblin::Object::parse(binary) {
         Ok(goblin::Object::Elf(elf)) => elf,
@@ -82,15 +97,20 @@ pub fn map_binary(binary: &[u8]) -> Result<Vec<u8>> {
     let mut max_virtual_address = 0_u64;
 
     for segment in &elffile.program_headers {
-        if segment.p_type == PT_LOAD && segment.p_vaddr > 0 {
-            max_virtual_address = max_virtual_address.max(segment.p_vaddr + segment.p_memsz);
+        if segment.p_type == PT_LOAD
+            && segment.p_vaddr > 0
+            && let Some(end) = segment.p_vaddr.checked_add(segment.p_memsz)
+        {
+            max_virtual_address = max_virtual_address.max(end);
         }
     }
 
     if max_virtual_address == 0 {
         for section in &elffile.section_headers {
-            if section.sh_addr > 0 {
-                max_virtual_address = max_virtual_address.max(section.sh_addr + section.sh_size);
+            if section.sh_addr > 0
+                && let Some(end) = section.sh_addr.checked_add(section.sh_size)
+            {
+                max_virtual_address = max_virtual_address.max(end);
             }
         }
     }
@@ -99,31 +119,83 @@ pub fn map_binary(binary: &[u8]) -> Result<Vec<u8>> {
         return Err(Error::UnsupportedFormatError);
     }
 
-    let virtual_size = max_virtual_address - base_addr;
-    let mut mapped_binary = vec![0u8; align(&virtual_size, &0x1000) as usize];
+    // `max_virtual_address` and `base_addr` are both attacker-controlled —
+    // checked_sub catches the case where base_addr was computed from one
+    // segment but max_virtual_address landed below it.
+    let virtual_size = max_virtual_address
+        .checked_sub(base_addr)
+        .ok_or(Error::IntegerOverflow(
+            "elf::map_binary virtual_size",
+            max_virtual_address,
+            base_addr,
+        ))?;
+    if virtual_size == 0 || virtual_size > MAX_MAPPED_BYTES {
+        return Err(Error::MalformedInputError(
+            "elf::map_binary virtual_size",
+            virtual_size,
+            MAX_MAPPED_BYTES,
+        ));
+    }
+    let aligned_size = align(&virtual_size, &0x1000);
+    if aligned_size > MAX_MAPPED_BYTES {
+        return Err(Error::MalformedInputError(
+            "elf::map_binary aligned_size",
+            aligned_size,
+            MAX_MAPPED_BYTES,
+        ));
+    }
+    let mapped_len = usize::try_from(aligned_size).map_err(|_| {
+        Error::IntegerOverflow("elf::map_binary aligned_size as usize", aligned_size, 0)
+    })?;
+    let mut mapped_binary = vec![0u8; mapped_len];
 
     for segment in &elffile.program_headers {
         if segment.p_type != PT_LOAD || segment.p_vaddr == 0 {
             continue;
         }
 
-        if segment.p_offset as usize >= binary.len() {
-            continue;
-        }
+        let p_offset_usize = match usize::try_from(segment.p_offset) {
+            Ok(v) if v < binary.len() => v,
+            _ => continue,
+        };
 
-        let rva = segment.p_vaddr - base_addr;
+        // p_vaddr < base_addr is possible on crafted ELFs because base_addr
+        // is computed across the PT_LOAD set; skip the segment in that case.
+        let Some(rva) = segment.p_vaddr.checked_sub(base_addr) else {
+            continue;
+        };
         let file_size = segment
             .p_filesz
             .min((binary.len() as u64).saturating_sub(segment.p_offset));
 
-        if rva + file_size <= mapped_binary.len() as u64 && file_size > 0 {
-            let src_start = segment.p_offset as usize;
-            let src_end = src_start + file_size as usize;
-            let dst_start = rva as usize;
-            let dst_end = dst_start + file_size as usize;
-
-            mapped_binary[dst_start..dst_end].copy_from_slice(&binary[src_start..src_end]);
+        let Some(dst_end_u64) = rva.checked_add(file_size) else {
+            continue;
+        };
+        if dst_end_u64 > mapped_binary.len() as u64 || file_size == 0 {
+            continue;
         }
+        let Some(src_end_u64) = (p_offset_usize as u64).checked_add(file_size) else {
+            continue;
+        };
+        if src_end_u64 > binary.len() as u64 {
+            continue;
+        }
+
+        let (Ok(dst_start), Ok(dst_end), Ok(src_end)) = (
+            usize::try_from(rva),
+            usize::try_from(dst_end_u64),
+            usize::try_from(src_end_u64),
+        ) else {
+            continue;
+        };
+
+        let (Some(dst), Some(src)) = (
+            mapped_binary.get_mut(dst_start..dst_end),
+            binary.get(p_offset_usize..src_end),
+        ) else {
+            continue;
+        };
+        dst.copy_from_slice(src);
     }
 
     for section in &elffile.section_headers {
@@ -131,20 +203,44 @@ pub fn map_binary(binary: &[u8]) -> Result<Vec<u8>> {
             continue;
         }
 
-        if section.sh_offset + section.sh_size >= binary.len() as u64 {
+        // sh_offset + sh_size overflow → skip; treat ">=" the same as ">"
+        // (a section covering the final byte is degenerate; ignore).
+        let Some(src_end_u64) = section.sh_offset.checked_add(section.sh_size) else {
+            continue;
+        };
+        if src_end_u64 > binary.len() as u64 {
             continue;
         }
 
-        let rva = section.sh_addr - base_addr;
-        if rva + section.sh_size <= mapped_binary.len() as u64 {
-            let src_start = section.sh_offset as usize;
-            let src_end = (section.sh_offset + section.sh_size) as usize;
-            let dst_start = rva as usize;
-            let dst_end = (rva + section.sh_size) as usize;
+        let Some(rva) = section.sh_addr.checked_sub(base_addr) else {
+            continue;
+        };
+        let Some(dst_end_u64) = rva.checked_add(section.sh_size) else {
+            continue;
+        };
+        if dst_end_u64 > mapped_binary.len() as u64 {
+            continue;
+        }
 
-            if mapped_binary[dst_start..dst_end].iter().all(|&b| b == 0) {
-                mapped_binary[dst_start..dst_end].copy_from_slice(&binary[src_start..src_end]);
-            }
+        let (Ok(src_start), Ok(src_end), Ok(dst_start), Ok(dst_end)) = (
+            usize::try_from(section.sh_offset),
+            usize::try_from(src_end_u64),
+            usize::try_from(rva),
+            usize::try_from(dst_end_u64),
+        ) else {
+            continue;
+        };
+
+        let (Some(dst), Some(src)) = (
+            mapped_binary.get_mut(dst_start..dst_end),
+            binary.get(src_start..src_end),
+        ) else {
+            continue;
+        };
+        // Only fill into still-zero regions so we don't overwrite the
+        // earlier PT_LOAD copy (matches the prior implementation's intent).
+        if dst.iter().all(|&b| b == 0) {
+            dst.copy_from_slice(src);
         }
     }
 
@@ -386,18 +482,39 @@ fn extract_elf_dynamic_apis_fallback_internal(
             0
         };
 
+    let Some(got_limit) = got_addr.checked_add(got_size) else {
+        return Ok(api_map);
+    };
     for (i, (api_name, library)) in imported_symbols.iter().enumerate() {
-        let got_entry_addr = got_addr + first_api_offset + (i as u64 * entry_size);
-
-        if got_entry_addr >= got_addr + got_size {
+        let Some(i_offset) = (i as u64).checked_mul(entry_size) else {
+            break;
+        };
+        let Some(rel_offset) = first_api_offset.checked_add(i_offset) else {
+            break;
+        };
+        let Some(got_entry_addr) = got_addr.checked_add(rel_offset) else {
+            break;
+        };
+        if got_entry_addr >= got_limit {
             break;
         }
 
-        let got_file_offset = got_offset + first_api_offset + (i as u64 * entry_size);
+        let Some(got_file_offset) = got_offset.checked_add(rel_offset) else {
+            break;
+        };
+        let Some(got_file_end) = got_file_offset.checked_add(entry_size) else {
+            break;
+        };
+        let (Ok(fo), Ok(fe)) = (
+            usize::try_from(got_file_offset),
+            usize::try_from(got_file_end),
+        ) else {
+            break;
+        };
 
-        if let Some(bytes) =
-            binary.get(got_file_offset as usize..(got_file_offset + entry_size) as usize)
-        {
+        if let Some(bytes) = binary.get(fo..fe) {
+            // chunks-exact guarantees `bytes.len() == entry_size`; defensive
+            // unwrap_or never fires.
             let ptr = if elf.is_64 {
                 u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]))
             } else {
@@ -420,30 +537,46 @@ fn get_dynamic_dependencies(binary: &[u8], elf: &goblin::elf::Elf) -> Result<Vec
 
     for phdr in &elf.program_headers {
         if phdr.p_type == PT_DYNAMIC {
-            let start = phdr.p_offset as usize;
-            let end = (phdr.p_offset + phdr.p_filesz) as usize;
-
-            if end > binary.len() {
+            // p_offset + p_filesz may overflow on a crafted ELF; skip the
+            // segment in that case.
+            let Some(end_u64) = phdr.p_offset.checked_add(phdr.p_filesz) else {
+                continue;
+            };
+            if end_u64 > binary.len() as u64 {
                 continue;
             }
+            let (Ok(start), Ok(end)) = (usize::try_from(phdr.p_offset), usize::try_from(end_u64))
+            else {
+                continue;
+            };
 
-            let dynamic_data = &binary[start..end];
+            let Some(dynamic_data) = binary.get(start..end) else {
+                continue;
+            };
             let entry_size = if elf.is_64 { 16 } else { 8 };
 
             for chunk in dynamic_data.chunks_exact(entry_size) {
+                // chunks_exact guarantees chunk.len() == entry_size, so the
+                // try_into() calls below cannot fail; .unwrap_or([0; N])
+                // is purely defensive against future refactors.
                 let (tag, val) = if elf.is_64 {
-                    let tag = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
-                    let val = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
-                    (tag, val)
+                    let tag_b: [u8; 8] = chunk[0..8].try_into().unwrap_or([0; 8]);
+                    let val_b: [u8; 8] = chunk[8..16].try_into().unwrap_or([0; 8]);
+                    (u64::from_le_bytes(tag_b), u64::from_le_bytes(val_b))
                 } else {
-                    let tag = u32::from_le_bytes(chunk[0..4].try_into().unwrap()) as u64;
-                    let val = u32::from_le_bytes(chunk[4..8].try_into().unwrap()) as u64;
-                    (tag, val)
+                    let tag_b: [u8; 4] = chunk[0..4].try_into().unwrap_or([0; 4]);
+                    let val_b: [u8; 4] = chunk[4..8].try_into().unwrap_or([0; 4]);
+                    (
+                        u32::from_le_bytes(tag_b) as u64,
+                        u32::from_le_bytes(val_b) as u64,
+                    )
                 };
 
                 if tag == 1 {
                     // DT_NEEDED
-                    if let Some(lib_name) = elf.dynstrtab.get_at(val as usize) {
+                    if let Ok(name_offset) = usize::try_from(val)
+                        && let Some(lib_name) = elf.dynstrtab.get_at(name_offset)
+                    {
                         dependencies.push(lib_name.to_string());
                     }
                 }

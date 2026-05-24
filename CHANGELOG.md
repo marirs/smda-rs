@@ -7,6 +7,72 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.3.0] — 2026-05-24
 
+### Security & robustness
+
+Hardened the PE / ELF parsers against malformed and adversarial inputs.
+Every panic path reachable from a crafted binary that the audit identified
+has been replaced with a returned `Error`.
+
+- **CRIT** Fixed `locate_exception_handler_candidates` crash on every 64-bit
+  PE with a `.pdata` section. `lib.rs::get_sections()` was returning
+  *file offsets* (`pointer_to_raw_data`) but the caller treated the
+  tuple values as VAs and subtracted `base_addr`, causing a u64
+  underflow → out-of-bounds slice. `get_sections()` now returns mapped
+  virtual addresses (matching what `report::get_section` also expects),
+  and the caller does its own checked conversion + bounds clamp.
+- **CRIT** Fixed ELF `sh_addralign = 0` division-by-zero panic in
+  `elf::get_code_areas`. Skipped alignment for `sh_addralign` of 0 or 1
+  (both mean "no alignment" per the ELF spec).
+- **CRIT** Capped ELF mapped-image allocation at 256 MB
+  (`elf::MAX_MAPPED_BYTES`). Previously ELF had no cap analogous to
+  PE's 100 MB limit; a single PT_LOAD with a high `p_vaddr` would
+  allocate gigabytes and OOM the host.
+- **CRIT** Replaced unchecked `p_vaddr + p_memsz`, `sh_addr + sh_size`,
+  and the surrounding base-address subtraction in `elf::map_binary`
+  with `checked_add` / `checked_sub`; overflowing segments and sections
+  are now skipped rather than wrapping.
+- **CRIT** Replaced unchecked `virt_size + virt_offset` and
+  `raw_offset + raw_size` u32 adds in `pe::map_binary` with checked
+  arithmetic; the slice copy now uses `.get_mut()` and skips sections
+  whose declared ranges are out of bounds.
+- **HIGH** Added end-bound checks to `dereference_dword`, `get_bytes`,
+  `get_raw_bytes`, `get_byte`, and `get_raw_byte` in `lib.rs`. The
+  previous implementations only checked the start address.
+- **HIGH** `function_analysis_state::finalize_analysis` no longer
+  indexes `instructions[len()-1]`; it uses `.last()` with a defensive
+  early return.
+- **HIGH** Hardened `function_candidate.rs` 5-byte read with
+  `checked_add` and `.get()` (matters on 32-bit targets).
+- **MED** Capped jump-table iteration in `jump_table_analyser` at 4096
+  entries (the size is parsed from a user-controlled operand and could
+  reach `usize::MAX`). Switched every `address + i*entry_size`
+  computation to `checked_add` / `checked_mul`.
+- **MED** Fixed `function_candidate_manager::next_gap_candidate` empty
+  range bug (`for gap_length in 15u32..1`) that silently disabled
+  multi-byte NOP gap detection. Now iterates `(2..=15).rev()`.
+- **MED** Fixed `analyze_loop_instruction` and
+  `analyze_cond_jmp_instruction` panic on operands whose formatted
+  string is shorter than two bytes or doesn't start with `0x`. They
+  now use the already-parsed `jump_destination` rather than slicing
+  `op_str[2..]`.
+- **MED** `resolve_pointer_reference` now uses `wrapping_add` for the
+  RIP-relative pointer math (matches x86 semantics) and `checked_add`
+  for the final base-address addition.
+- **MED** `extract_elf_dynamic_apis_fallback_internal` and
+  `get_dynamic_dependencies` use checked arithmetic on GOT/dynamic
+  entry offsets.
+
+### Added
+
+- `error::IntegerOverflow(&'static str, u64, u64)` — distinct from
+  `LogicError`; signals "malformed input" rather than "smda bug".
+- `error::MalformedInputError(&'static str, u64, u64)` — returned when
+  an input value exceeds a safety cap.
+- `error::try_usize` / `error::safe_add` / `error::safe_sub` helpers
+  that wrap `try_from` and `checked_add` / `checked_sub` with an
+  `Error::IntegerOverflow` mapping.
+
+
 This is a substantial overhaul of the disassembly backend. The text output (`Instruction::mnemonic`, `Instruction::operands`, `Instruction::bytes`) is preserved byte-for-byte with the old capstone-backed 0.2.x line so regex-based capa rules and other downstreams continue to match unchanged.
 
 ### Changed (breaking)
