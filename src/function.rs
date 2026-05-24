@@ -1,17 +1,20 @@
 //! Decoded function and instruction types.
 //!
-//! `Instruction` keeps the legacy String fields (`mnemonic`, `operands`,
-//! `bytes` as hex) for backward compatibility with capa-rs — but ALSO
-//! exposes the fully-decoded `iced_x86::Instruction` (16 bytes, `Copy`) so
-//! new consumers can use typed mnemonic / operand / flow-control access
-//! without paying the string-parsing tax.
+//! As of 0.4.0 `Instruction` is *fully zero-copy*: only the fully-decoded
+//! `iced_x86::Instruction` (16 bytes, `Copy`) is stored per instruction,
+//! plus offset + length. The mnemonic / operands strings are formatted on
+//! demand via [`Instruction::format_mnemonic`] / [`Instruction::format_operands`],
+//! and the raw bytes are looked up via [`Instruction::bytes_in`] against a
+//! `&BinaryInfo`. Pre-0.4.0 each `Instruction` carried owned `String`
+//! mnemonic + operands + hex-encoded bytes — a 6–15 MB allocation cost on
+//! a 100k-instruction binary that this refactor eliminates.
 //!
-//! For 0.3.0 the strings are formatted by iced configured to byte-match
-//! capstone's output (`0x` hex prefix, lowercase, space around `+` in
-//! memory ops, `dword ptr` / `qword ptr` size prefixes). This lets the
-//! analyzer's existing string-based heuristics continue to work unchanged.
+//! The formatter used by `format_mnemonic` / `format_operands` is
+//! configured by [`capstone_compat_formatter`] to byte-match capstone's
+//! output, so downstream consumers that pattern-match on the strings
+//! (e.g. capa-rs rules) get the same characters they did under capstone.
 
-use crate::{DisassemblyReport, DisassemblyResult, FileArchitecture, Result};
+use crate::{BinaryInfo, DisassemblyReport, DisassemblyResult, FileArchitecture, Result};
 use iced_x86::{FlowControl, Formatter, IntelFormatter, Mnemonic, OpKind, Register};
 use std::collections::HashMap;
 
@@ -47,9 +50,11 @@ pub fn capstone_compat_formatter() -> IntelFormatter {
 
 /// A single decoded x86/x64 instruction.
 ///
-/// Legacy capstone-shaped fields (`mnemonic`, `operands`, `bytes`) are kept
-/// for backward compatibility with capa-rs; new consumers should prefer the
-/// typed iced accessors (`mnemonic()`, `op_kind()`, `flow_control()`, …).
+/// 0.4.0 dropped the per-instruction `bytes` / `mnemonic` / `operands`
+/// String fields. Formatted strings are produced on demand via
+/// [`Instruction::format_mnemonic`] / [`Instruction::format_operands`];
+/// raw bytes are looked up via [`Instruction::bytes_in`] against the
+/// owning `BinaryInfo`.
 #[derive(Debug, Clone)]
 pub struct Instruction {
     pub arch: FileArchitecture,
@@ -57,43 +62,61 @@ pub struct Instruction {
     pub offset: u64,
     /// Byte length (1–15).
     pub length: u32,
-    /// Hex-encoded raw bytes (preserved for capa-rs compatibility).
-    pub bytes: String,
-    /// Capstone-compatible lowercase mnemonic ("mov", "call", "jmp", …).
-    pub mnemonic: String,
-    /// Capstone-compatible Intel operands string ("eax, 0x10",
-    /// "dword ptr [rip + 0x100]", …) or `None` if no operands.
-    pub operands: Option<String>,
-    /// Fully-decoded iced instruction (16 bytes, `Copy`). New consumers
-    /// should prefer this — it gives typed `Mnemonic` / `OpKind` / `Register`
-    /// / `FlowControl` enum access without re-parsing the strings above.
+    /// Fully-decoded iced instruction (16 bytes, `Copy`). The single
+    /// source of truth for mnemonic / operand / flow-control queries —
+    /// prefer the typed accessors (`mnemonic_enum()`, `op_kind()`, …)
+    /// over re-formatting via `format_mnemonic()`.
     pub iced: iced_x86::Instruction,
 }
 
 impl Instruction {
-    /// Construct from a `DecodedInsn` carrier.
+    /// Construct from a `DecodedInsn` carrier. Zero-allocation in 0.4.0
+    /// (no string formatting at construction time).
     #[must_use]
     pub fn new(arch: FileArchitecture, bitness: u32, ins: &DecodedInsn) -> Self {
-        let mut fmt = capstone_compat_formatter();
-        let mut mnemonic = String::new();
-        fmt.format_mnemonic(&ins.iced, &mut mnemonic);
-        let operands = if ins.iced.op_count() == 0 {
-            None
-        } else {
-            let mut out = String::new();
-            fmt.format_all_operands(&ins.iced, &mut out);
-            Some(out)
-        };
         Self {
             arch,
             bitness,
             offset: ins.offset,
             length: ins.length,
-            bytes: hex::encode(&ins.bytes),
-            mnemonic,
-            operands,
             iced: ins.iced,
         }
+    }
+
+    /// Format the mnemonic on demand. Allocates a fresh `String` per call —
+    /// hot-path consumers that read the mnemonic repeatedly should cache
+    /// the result locally or use `mnemonic_enum()` for typed comparisons.
+    #[must_use]
+    pub fn format_mnemonic(&self) -> String {
+        let mut fmt = capstone_compat_formatter();
+        let mut out = String::new();
+        fmt.format_mnemonic(&self.iced, &mut out);
+        out
+    }
+
+    /// Format the operands on demand. Returns `None` for zero-operand
+    /// instructions (e.g. `ret`). Allocates a fresh `String` per call.
+    #[must_use]
+    pub fn format_operands(&self) -> Option<String> {
+        if self.iced.op_count() == 0 {
+            return None;
+        }
+        let mut fmt = capstone_compat_formatter();
+        let mut out = String::new();
+        fmt.format_all_operands(&self.iced, &mut out);
+        Some(out)
+    }
+
+    /// Look up the raw instruction bytes in the given `BinaryInfo`.
+    /// Zero-copy: returns a `&[u8]` borrowing from the input file.
+    pub fn bytes_in<'b>(&self, binary_info: &'b BinaryInfo<'_>) -> Result<&'b [u8]> {
+        binary_info.bytes_at(self.offset, self.length)
+    }
+
+    /// Convenience: hex-encoded bytes (compat shim for callers that
+    /// previously read `Instruction::bytes` directly).
+    pub fn bytes_hex(&self, binary_info: &BinaryInfo<'_>) -> Result<String> {
+        Ok(hex::encode(self.bytes_in(binary_info)?))
     }
 
     // ---- typed accessors (new in 0.3.0; preferred over string parsing) ----
@@ -344,17 +367,24 @@ impl Function {
 
 /// Internal carrier type. The analyzer stashes one per decoded instruction
 /// into `FunctionAnalysisState` / `DisassemblyResult`, then `Function::new`
-/// transforms them into public `Instruction` values (which also format the
-/// capstone-compatible string fields).
+/// transforms them into public `Instruction` values.
 ///
-/// Bytes are owned (max 15 bytes per x86/x64 insn — trivial cost, and
-/// avoids self-referential-struct headaches with the analyzer state).
-#[derive(Debug, Clone)]
+/// 0.4.0 dropped the per-instruction `bytes: Vec<u8>` field — the bytes
+/// are looked up via [`DecodedInsn::bytes_in`] against the owning
+/// `BinaryInfo` on demand. For a 100k-instruction binary this avoids
+/// ~4 MB of per-instruction `Vec<u8>` allocation.
+#[derive(Debug, Clone, Copy)]
 pub struct DecodedInsn {
     pub offset: u64,
     pub length: u32,
     pub iced: iced_x86::Instruction,
-    pub bytes: Vec<u8>,
+}
+
+impl DecodedInsn {
+    /// Look up the raw instruction bytes in `binary_info`. Zero-copy.
+    pub fn bytes_in<'b>(&self, binary_info: &'b BinaryInfo<'_>) -> Result<&'b [u8]> {
+        binary_info.bytes_at(self.offset, self.length)
+    }
 }
 
 pub fn is_printable_ascii(chars: &[u8]) -> Result<bool> {

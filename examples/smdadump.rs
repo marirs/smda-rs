@@ -19,10 +19,20 @@ fn main() -> ExitCode {
         }
     };
 
-    let report = match smda::Disassembler::disassemble_file(&path, false, false, None) {
+    // Zero-copy disassembly: load the file ourselves, then pass the buffer
+    // to `parse`. The returned report borrows from `buf`, so `buf` must
+    // outlive `report` (enforced by the borrow checker).
+    let buf = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("read {path}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let report = match smda::Disassembler::parse(&buf, Some(&path), false, false) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("disassemble_file failed: {e}");
+            eprintln!("parse failed: {e}");
             return ExitCode::from(1);
         }
     };
@@ -34,12 +44,12 @@ fn main() -> ExitCode {
     println!("base addr    : 0x{:x}", report.base_addr);
     println!("functions    : {}", report.functions.len());
 
-    if !report.imports.is_empty() {
+    if !report.binary_info.imports.is_empty() {
         println!(
             "imports      : {} entries (showing first 5)",
-            report.imports.len()
+            report.binary_info.imports.len()
         );
-        for (dll, api, _) in report.imports.iter().take(5) {
+        for (dll, api, _) in report.binary_info.imports.iter().take(5) {
             println!("  {dll}!{api}");
         }
     }

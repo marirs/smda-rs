@@ -5,6 +5,110 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-05-24 — Full zero-copy
+
+Supersedes 0.3.0. The 0.3.0 release was a partial increment — it shipped
+the iced-x86 decoder swap and the security hardening, but the planned
+zero-copy refactor was deferred. 0.4.0 lands that work. Downstream
+consumers should migrate directly from 0.2.x to 0.4.0 (skipping 0.3.0).
+0.3.0 remains functional for anyone who already pulled it; it is not
+yanked, but it is not recommended for new dependents.
+
+### Memory impact
+
+For a 10 MB binary with ~100k decoded instructions, peak memory drops
+from roughly 3× the input size to roughly 1.05× (input bytes + the iced
+instruction Vec + a small section table). Concretely:
+
+- The mapped-image `Vec<u8>` in `BinaryInfo.binary` is gone. Replaced
+  by a `Vec<SectionMap>` (typically < 10 entries) describing where each
+  section lives in both file and virtual-address space.
+- `DisassemblyReport.buffer: Vec<u8>` (clone of the mapped image) is
+  gone.
+- Per-`Instruction` String fields (`mnemonic`, `operands`, `bytes` hex)
+  are gone. Replaced by `format_mnemonic()` / `format_operands()` /
+  `bytes_in(&binary_info)` helpers that allocate only when called.
+- Per-`DecodedInsn` `bytes: Vec<u8>` is gone. `DecodedInsn` is now
+  16-byte `Copy`, making the analyser's per-instruction state cheaper
+  to move around.
+
+### Breaking changes
+
+- **New `BinaryInfo<'a>` lifetime parameter.** Borrows the input bytes
+  for `'a`. Constructed via `BinaryInfo::from_buffer(&buf)`. The empty
+  default is `BinaryInfo::empty() -> BinaryInfo<'static>`.
+- **`BinaryInfo` API changes:**
+  - `binary: Vec<u8>` → removed.
+  - `raw_data: Vec<u8>` → `raw_data: &'a [u8]`.
+  - New: `section_maps: Vec<SectionMap>`, `binary_size: u64` (now the
+    VA range, not the file size).
+  - New helpers: `bytes_at(va, len)`, `bytes_at_best_effort(va, max)`,
+    `section_slices()`, `compute_binary_size()`.
+- **New `DisassemblyResult<'a>` / `Disassembler<'a>` lifetime
+  parameters.**
+- **`DisassemblyReport<'a>` carries `binary_info: BinaryInfo<'a>`** —
+  the old `buffer: Vec<u8>` field is gone. Consumers that previously
+  did `report.buffer[idx]` should call `report.binary_info.bytes_at(va, len)`
+  with the virtual address instead.
+- **`Disassembler::disassemble_file` is removed.** The new entry point
+  is `Disassembler::parse(raw: &'a [u8], path: Option<&str>,
+  high_accuracy, resolve_tailcalls) -> Result<DisassemblyReport<'a>>`.
+  Callers load the file themselves:
+  ```rust
+  let buf = std::fs::read("Sample.exe")?;
+  let report = smda::Disassembler::parse(&buf, Some("Sample.exe"), false, false)?;
+  ```
+- **`Disassembler::new()` is removed** (replaced by `with_binary` used
+  internally; public callers go through `parse`).
+- **`Instruction` String fields removed.** Replace `instruction.mnemonic`
+  with `instruction.format_mnemonic()`, `instruction.operands` with
+  `instruction.format_operands()`, `instruction.bytes` with
+  `instruction.bytes_in(&binary_info)` or `instruction.bytes_hex(&binary_info)`.
+  For hot-path consumers that read the same instruction repeatedly,
+  cache the formatted string locally; for typed comparisons use
+  `instruction.mnemonic_enum()` / `op_kind()` / `flow_control()`.
+- **`DecodedInsn.bytes: Vec<u8>` removed.** `DecodedInsn` is now `Copy`.
+- **`SectionMap` exported** at the crate root for callers that want to
+  inspect the section table directly.
+
+### Added
+
+- `BinaryInfo::bytes_at(va, len) -> Result<&[u8]>` — primary byte
+  accessor. Section-table lookup + slice into borrowed input. Returns
+  `Err(NotEnoughBytesError)` on out-of-section or short reads.
+- `BinaryInfo::bytes_at_best_effort(va, max_len) -> Result<&[u8]>` —
+  returns up to `max_len` bytes; used by the iced decoder's lookahead
+  window.
+- `BinaryInfo::section_slices() -> impl Iterator<Item = (u64, &[u8])>` —
+  per-section iteration for regex scanners.
+- `Disassembler::parse(&'a [u8], …) -> Result<DisassemblyReport<'a>>` —
+  zero-copy disassembly entry.
+- `Instruction::format_mnemonic` / `format_operands` / `bytes_in` /
+  `bytes_hex` helpers.
+- `DecodedInsn::bytes_in` helper.
+
+### Internal
+
+- `pe::map_binary` and `elf::map_binary` rewritten to return
+  `Vec<SectionMap>` instead of allocating a contiguous mapped image.
+  All security guards from 0.3.0 (checked arithmetic, allocation caps,
+  PE header bounds, ELF `sh_addralign=0` guard, segment / section
+  overflow guards) are preserved.
+- All regex-based candidate scanners in `function_candidate_manager`
+  and `jump_table_analyser` iterate `section_slices()` and translate
+  match positions to VAs.
+- All byte-helper callsites (`get_byte`, `get_raw_byte`, `get_bytes`,
+  `get_raw_bytes`, `dereference_dword`, `dereference_qword`) go
+  through `bytes_at` with checked arithmetic.
+
+### Verified
+
+Smoke-tested against 7 PE / ELF / .NET samples — `mimikatz.exe_`,
+`Demo64.dll` (the 0.3.0 `.pdata` regression case), three .NET PEs, two
+ELFs. Function counts, import counts, and per-function block / insn /
+outref counts are **bit-for-bit identical** to the 0.3.0 baseline.
+
+
 ## [0.3.0] — 2026-05-24
 
 ### Security & robustness

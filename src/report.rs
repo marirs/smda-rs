@@ -1,18 +1,22 @@
 use crate::{
-    DisassemblyResult, FileArchitecture, FileFormat, Result, error::Error, function::Function,
-    statistics::DisassemblyStatistics,
+    BinaryInfo, DisassemblyResult, FileArchitecture, FileFormat, Result, error::Error,
+    function::Function, statistics::DisassemblyStatistics,
 };
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
-pub struct DisassemblyReport {
+pub struct DisassemblyReport<'a> {
     pub format: FileFormat,
     pub architecture: FileArchitecture,
     pub base_addr: u64,
     binary_size: u64,
     binweight: u32,
     pub bitness: u32,
-    pub buffer: Vec<u8>,
+    /// Borrowed view onto the original input bytes — replaces the owned
+    /// `buffer: Vec<u8>` (mapped image clone) field that 0.3.x carried.
+    /// Use `binary_info.bytes_at(va, len)` to read; `raw_data` is exposed
+    /// for callers that need the file SHA-256-equivalent slice.
+    pub binary_info: BinaryInfo<'a>,
     code_areas: Vec<(u64, u64)>,
     pub code_sections: Vec<(String, u64, u64)>,
     empty_section: (String, u64, u64),
@@ -33,8 +37,8 @@ pub struct DisassemblyReport {
     pub addr_to_api: HashMap<u64, (Option<String>, Option<String>)>,
 }
 
-impl DisassemblyReport {
-    pub fn new(disassembly: &mut DisassemblyResult) -> Result<DisassemblyReport> {
+impl<'a> DisassemblyReport<'a> {
+    pub fn new(disassembly: &mut DisassemblyResult<'a>) -> Result<DisassemblyReport<'a>> {
         let mut res = DisassemblyReport {
             format: disassembly.binary_info.file_format,
             architecture: disassembly.binary_info.file_architecture,
@@ -42,7 +46,7 @@ impl DisassemblyReport {
             binary_size: disassembly.binary_info.binary_size,
             binweight: 0,
             bitness: disassembly.binary_info.bitness,
-            buffer: disassembly.binary_info.binary.clone(),
+            binary_info: disassembly.binary_info.clone(),
             code_areas: disassembly.binary_info.code_areas.clone(),
             code_sections: disassembly.binary_info.get_sections()?,
             empty_section: ("".to_string(), 0, 0),

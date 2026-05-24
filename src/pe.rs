@@ -1,4 +1,4 @@
-use crate::{Result, error::Error};
+use crate::{Result, SectionMap, error::Error};
 use std::convert::TryInto;
 
 pub fn get_bitness(binary: &[u8]) -> Result<u32> {
@@ -73,8 +73,16 @@ pub fn get_code_areas(binary: &[u8], pe: &goblin::pe::PE) -> Result<Vec<(u64, u6
 /// in 0.2.x and the analogous ELF cap in `elf::MAX_MAPPED_BYTES`).
 const MAX_MAPPED_BYTES: u64 = 100 * 1024 * 1024;
 
-pub fn map_binary(binary: &[u8]) -> Result<Vec<u8>> {
-    let mut mapped_binary = vec![];
+/// Parse the PE section table and return a `Vec<SectionMap>` describing
+/// where each loaded section lives in both file and virtual-address space.
+/// Zero-copy: this is metadata only, no bytes are copied. Callers
+/// (`BinaryInfo`) thread the result through `bytes_at(va, len)` to read
+/// section bytes on demand.
+///
+/// Pre-0.4.0 this allocated a contiguous mapped image (`Vec<u8>`) the
+/// size of the virtual layout; 0.4.0 replaces that with the section
+/// table so callers borrow directly from the input.
+pub fn map_binary(binary: &[u8], base_addr: u64) -> Result<Vec<SectionMap>> {
     let pe_offset = get_pe_offset(binary)? as usize;
     let mut num_sections = 0;
     let mut optional_header_size = 0xF8;
@@ -147,55 +155,74 @@ pub fn map_binary(binary: &[u8]) -> Result<Vec<u8>> {
         }
     }
 
-    if max_virt_section_offset > 0 && max_virt_section_offset < MAX_MAPPED_BYTES {
-        // Safe: bounded above.
-        let mapped_len = max_virt_section_offset as usize;
-        mapped_binary.resize(mapped_len, 0_u8);
-        // Copy the headers — clamp to (mapped_len, binary.len()) so we
-        // never panic on a section table that lies about raw_offset.
-        let header_copy_len = (min_raw_section_offset as usize)
-            .min(binary.len())
-            .min(mapped_binary.len());
-        if header_copy_len > 0 {
-            mapped_binary[..header_copy_len].clone_from_slice(&binary[..header_copy_len]);
-        }
+    if max_virt_section_offset == 0 || max_virt_section_offset >= MAX_MAPPED_BYTES {
+        return Err(Error::PEOutOfBoundsSectionError);
+    }
+
+    let mut section_maps = Vec::with_capacity(section_infos.len() + 1);
+
+    // Synthetic "headers" section covering the PE header + section table.
+    // Pre-0.4.0 these bytes were copied into the front of the mapped image
+    // (the `min_raw_section_offset` clamp); we now expose them in VA space
+    // by adding a section that runs from base_addr to the first section.
+    let header_len = (min_raw_section_offset as usize).min(binary.len());
+    if header_len > 0 {
+        section_maps.push(SectionMap {
+            va_start: base_addr,
+            va_end: base_addr.saturating_add(header_len as u64),
+            file_offset: 0,
+            file_size: header_len,
+        });
     }
 
     for section_info in &section_infos {
         let virt_offset = section_info["virt_offset"] as u64;
         let raw_offset = section_info["raw_offset"] as u64;
         let raw_size = section_info["raw_size"] as u64;
+        let virt_size = section_info["virt_size"] as u64;
 
-        // All arithmetic on attacker-controlled u32-as-u64; use checked_add
-        // and skip the section on any overflow rather than wrapping.
-        let Some(mapped_to) = virt_offset.checked_add(raw_size) else {
+        // Skip sections with overflowing arithmetic rather than wrapping.
+        let Some(va_start) = base_addr.checked_add(virt_offset) else {
             continue;
         };
+        // The VA range is the larger of virtual_size and the on-disk size
+        // (matches the historical behaviour of the mapped-image loader,
+        // where the section occupied max(virt_size, raw_size) bytes).
+        let va_extent = virt_size.max(raw_size);
+        let Some(va_end) = va_start.checked_add(va_extent) else {
+            continue;
+        };
+        // Clamp the on-disk extent to what the file actually contains —
+        // a malformed PE that declares more bytes than exist would
+        // otherwise let `bytes_at` over-read.
         let Some(binary_raw_end) = raw_offset.checked_add(raw_size) else {
             continue;
         };
-
-        if binary_raw_end > binary.len() as u64 || mapped_to > mapped_binary.len() as u64 {
+        let file_size = if binary_raw_end <= binary.len() as u64 {
+            raw_size
+        } else {
+            (binary.len() as u64).saturating_sub(raw_offset)
+        };
+        let (Ok(file_offset), Ok(file_size)) =
+            (usize::try_from(raw_offset), usize::try_from(file_size))
+        else {
+            continue;
+        };
+        if file_offset >= binary.len() {
             continue;
         }
-
-        let (Ok(dst_start), Ok(dst_end), Ok(src_start), Ok(src_end)) = (
-            usize::try_from(virt_offset),
-            usize::try_from(mapped_to),
-            usize::try_from(raw_offset),
-            usize::try_from(binary_raw_end),
-        ) else {
-            continue;
-        };
-
-        let (Some(dst), Some(src)) = (
-            mapped_binary.get_mut(dst_start..dst_end),
-            binary.get(src_start..src_end),
-        ) else {
-            continue;
-        };
-        dst.clone_from_slice(src);
+        section_maps.push(SectionMap {
+            va_start,
+            va_end,
+            file_offset,
+            file_size,
+        });
     }
 
-    Ok(mapped_binary)
+    // Keep sorted by va_start so `BinaryInfo::locate` finds the right
+    // section quickly. For PE the section table is already in order, but
+    // a malformed file could break that — sort defensively.
+    section_maps.sort_by_key(|s| s.va_start);
+
+    Ok(section_maps)
 }

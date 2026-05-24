@@ -280,34 +280,17 @@ impl FunctionCandidateManager {
             return Ok(());
         }
         let base_addr = disassembly.binary_info.base_addr;
-        let buf_len = disassembly.binary_info.binary.len();
         for (section_name, section_va_start, section_va_end) in
             disassembly.binary_info.get_sections()?
         {
             if section_name != ".pdata" {
                 continue;
             }
-            // get_sections returns mapped VAs; convert back to mapped-buffer offsets.
-            let Some(rva_start) = section_va_start.checked_sub(base_addr) else {
-                continue;
-            };
-            let Some(rva_end) = section_va_end.checked_sub(base_addr) else {
-                continue;
-            };
-            let Ok(mut offset) = usize::try_from(rva_start) else {
-                continue;
-            };
-            let Ok(end) = usize::try_from(rva_end) else {
-                continue;
-            };
-            // Clamp end to the mapped binary length — the section may
-            // declare a range that extends past EOF on a crafted file.
-            let end = end.min(buf_len);
-            while let Some(slice_end) = offset.checked_add(4) {
-                if slice_end > end {
-                    break;
-                }
-                let Some(packed) = disassembly.binary_info.binary.get(offset..slice_end) else {
+            let mut va = section_va_start;
+            while va.checked_add(4).is_some_and(|e| e <= section_va_end) {
+                // bytes_at returns Err if the .pdata section is malformed
+                // or extends past the on-disk bytes — break in that case.
+                let Ok(packed) = disassembly.binary_info.bytes_at(va, 4) else {
                     break;
                 };
                 let packed_dword: [u8; 4] = packed.try_into()?;
@@ -316,151 +299,138 @@ impl FunctionCandidateManager {
                     self.add_exception_candidate(addr, disassembly)?;
                 }
                 // RUNTIME_FUNCTION entries are 12 bytes; advance.
-                let Some(next) = offset.checked_add(12) else {
+                let Some(next) = va.checked_add(12) else {
                     break;
                 };
-                offset = next;
+                va = next;
             }
         }
         Ok(())
     }
 
     fn locate_stub_chain_candidates(&mut self, disassembly: &DisassemblyResult) -> Result<()> {
-        for block in STUB_CHAIN.find_iter(&disassembly.binary_info.binary) {
-            for call_match in STUB_CHAIN_FUNC
-                .find_iter(&disassembly.binary_info.binary[block.start()..block.end()])
-            {
-                let stub_addr = disassembly.binary_info.base_addr
-                    + block.start() as u64
-                    + call_match.start() as u64;
-                if !self.passes_code_filter(Some(stub_addr))? {
-                    continue;
+        let base_addr = disassembly.binary_info.base_addr;
+        for (section_va, section_bytes) in disassembly.binary_info.section_slices() {
+            for block in STUB_CHAIN.find_iter(section_bytes) {
+                for call_match in
+                    STUB_CHAIN_FUNC.find_iter(&section_bytes[block.start()..block.end()])
+                {
+                    let stub_addr = section_va + block.start() as u64 + call_match.start() as u64;
+                    if !self.passes_code_filter(Some(stub_addr))? {
+                        continue;
+                    }
+                    if self.add_prologue_candidate(stub_addr & self.get_bitmask(), disassembly)? {
+                        self.set_initial_candidate(stub_addr & self.get_bitmask())?;
+                        self.candidates
+                            .get_mut(&stub_addr)
+                            .ok_or(Error::LogicError(file!(), line!()))?
+                            .set_is_stub();
+                    }
                 }
-                if self.add_prologue_candidate(stub_addr & self.get_bitmask(), disassembly)? {
-                    self.set_initial_candidate(stub_addr & self.get_bitmask())?;
-                    self.candidates
-                        .get_mut(&stub_addr)
-                        .ok_or(Error::LogicError(file!(), line!()))?
-                        .set_is_stub();
+            }
+            for block in STUB_CHAIN_BLOCK.find_iter(section_bytes) {
+                for call_match in
+                    STUB_CHAIN_BLOCK_FUNC.find_iter(&section_bytes[block.start()..block.end()])
+                {
+                    let stub_addr = section_va + block.start() as u64 + call_match.start() as u64;
+                    if !self.passes_code_filter(Some(stub_addr))? {
+                        continue;
+                    }
+                    if self.add_prologue_candidate(stub_addr & self.get_bitmask(), disassembly)? {
+                        self.set_initial_candidate(stub_addr & self.get_bitmask())?;
+                        self.candidates
+                            .get_mut(&stub_addr)
+                            .ok_or(Error::LogicError(file!(), line!()))?
+                            .set_is_stub();
+                    }
                 }
             }
         }
-        for block in STUB_CHAIN_BLOCK.find_iter(&disassembly.binary_info.binary) {
-            for call_match in STUB_CHAIN_BLOCK_FUNC
-                .find_iter(&disassembly.binary_info.binary[block.start()..block.end()])
-            {
-                let stub_addr = disassembly.binary_info.base_addr
-                    + block.start() as u64
-                    + call_match.start() as u64;
-                if !self.passes_code_filter(Some(stub_addr))? {
-                    continue;
-                }
-                if self.add_prologue_candidate(stub_addr & self.get_bitmask(), disassembly)? {
-                    self.set_initial_candidate(stub_addr & self.get_bitmask())?;
-                    self.candidates
-                        .get_mut(&stub_addr)
-                        .ok_or(Error::LogicError(file!(), line!()))?
-                        .set_is_stub();
-                    //                for offset in 0..10{
-                    //                    disassembly.data_map.add(stub_addr + 6 + offset)
-                    //                }
-                }
-            }
-        }
+        let _ = base_addr; // keep for symmetry with prior version
         Ok(())
     }
 
     fn locate_prologue_candidates(&mut self, disassembly: &DisassemblyResult) -> Result<()> {
         for re_prologue in DEFAULT_PROLOGUES.iter() {
-            for prologue_match in re_prologue.find_iter(&disassembly.binary_info.binary) {
-                if !self.passes_code_filter(Some(
-                    disassembly.binary_info.base_addr + prologue_match.start() as u64,
-                ))? {
-                    continue;
+            for (section_va, section_bytes) in disassembly.binary_info.section_slices() {
+                for prologue_match in re_prologue.find_iter(section_bytes) {
+                    let va = section_va + prologue_match.start() as u64;
+                    if !self.passes_code_filter(Some(va))? {
+                        continue;
+                    }
+                    self.add_prologue_candidate(va & self.get_bitmask(), disassembly)?;
+                    self.set_initial_candidate(va & self.get_bitmask())?;
                 }
-                self.add_prologue_candidate(
-                    (disassembly.binary_info.base_addr + prologue_match.start() as u64)
-                        & self.get_bitmask(),
-                    disassembly,
-                )?;
-                self.set_initial_candidate(
-                    (disassembly.binary_info.base_addr + prologue_match.start() as u64)
-                        & self.get_bitmask(),
-                )?;
             }
         }
         Ok(())
     }
 
     fn locate_reference_candidates(&mut self, disassembly: &DisassemblyResult) -> Result<()> {
-        let matches = REF_CANDIDATE.find_iter(&disassembly.binary_info.binary);
-        for call_match in matches {
-            if !self.passes_code_filter(Some(
-                disassembly.binary_info.base_addr + call_match.start() as u64,
-            ))? {
-                continue;
-            }
-            if disassembly.binary_info.binary.len() - call_match.start() > 5 {
-                let packed_call: &[u8; 4] = &disassembly
-                    .get_raw_bytes(call_match.start() as u64 + 1, 4)?
-                    .try_into()?;
-                let rel_call_offset = i32::from_le_bytes(*packed_call) as i64;
-                if rel_call_offset == 0 {
+        let base_addr = disassembly.binary_info.base_addr;
+        for (section_va, section_bytes) in disassembly.binary_info.section_slices() {
+            for call_match in REF_CANDIDATE.find_iter(section_bytes) {
+                let va = section_va + call_match.start() as u64;
+                if !self.passes_code_filter(Some(va))? {
                     continue;
                 }
-                let call_destination = ((disassembly.binary_info.base_addr as i64
-                    + rel_call_offset
-                    + call_match.start() as i64
-                    + 5)
-                    & self.get_bitmask() as i64) as u64;
-                if disassembly.is_addr_within_memory_image(call_destination)?
-                    && self.add_reference_candidate(
-                        call_destination,
-                        disassembly.binary_info.base_addr + call_match.start() as u64,
-                        disassembly,
-                    )?
-                {
-                    self.set_initial_candidate(call_destination)?;
+                if section_bytes.len() - call_match.start() > 5 {
+                    let packed_call: &[u8; 4] = &section_bytes
+                        [call_match.start() + 1..call_match.start() + 5]
+                        .try_into()?;
+                    let rel_call_offset = i32::from_le_bytes(*packed_call) as i64;
+                    if rel_call_offset == 0 {
+                        continue;
+                    }
+                    let call_destination =
+                        ((va as i64 + rel_call_offset + 5) & self.get_bitmask() as i64) as u64;
+                    if disassembly.is_addr_within_memory_image(call_destination)?
+                        && self.add_reference_candidate(call_destination, va, disassembly)?
+                    {
+                        self.set_initial_candidate(call_destination)?;
+                    }
                 }
             }
         }
 
         if self.bitness == 32 {
-            for call_match in BITNESS.find_iter(&disassembly.binary_info.binary) {
-                let function_addr = self
-                    .resolve_pointer_reference(call_match.start() as u64, disassembly)
-                    .ok();
-                if !self.passes_code_filter(function_addr)? {
-                    continue;
-                }
-                let function_addr = function_addr.unwrap();
-                if disassembly.is_addr_within_memory_image(function_addr)?
-                    && self.add_reference_candidate(
-                        function_addr,
-                        disassembly.binary_info.base_addr + call_match.start() as u64,
-                        disassembly,
-                    )?
-                {
-                    self.set_initial_candidate(function_addr)?;
+            for (section_va, section_bytes) in disassembly.binary_info.section_slices() {
+                for call_match in BITNESS.find_iter(section_bytes) {
+                    let va = section_va + call_match.start() as u64;
+                    // resolve_pointer_reference takes a base-relative
+                    // offset (VA - base_addr) — translate.
+                    let Some(rel) = va.checked_sub(base_addr) else {
+                        continue;
+                    };
+                    let function_addr = self.resolve_pointer_reference(rel, disassembly).ok();
+                    if !self.passes_code_filter(function_addr)? {
+                        continue;
+                    }
+                    let function_addr = function_addr.unwrap();
+                    if disassembly.is_addr_within_memory_image(function_addr)?
+                        && self.add_reference_candidate(function_addr, va, disassembly)?
+                    {
+                        self.set_initial_candidate(function_addr)?;
+                    }
                 }
             }
 
-            for call_match in CELL_MATCH.find_iter(&disassembly.binary_info.binary) {
-                let function_addr = self
-                    .resolve_pointer_reference(call_match.start() as u64, disassembly)
-                    .ok();
-                if !self.passes_code_filter(function_addr)? {
-                    continue;
-                }
-                let function_addr = function_addr.unwrap();
-                if disassembly.is_addr_within_memory_image(function_addr)?
-                    && self.add_reference_candidate(
-                        function_addr,
-                        disassembly.binary_info.base_addr + call_match.start() as u64,
-                        disassembly,
-                    )?
-                {
-                    self.set_initial_candidate(function_addr)?;
+            for (section_va, section_bytes) in disassembly.binary_info.section_slices() {
+                for call_match in CELL_MATCH.find_iter(section_bytes) {
+                    let va = section_va + call_match.start() as u64;
+                    let Some(rel) = va.checked_sub(base_addr) else {
+                        continue;
+                    };
+                    let function_addr = self.resolve_pointer_reference(rel, disassembly).ok();
+                    if !self.passes_code_filter(function_addr)? {
+                        continue;
+                    }
+                    let function_addr = function_addr.unwrap();
+                    if disassembly.is_addr_within_memory_image(function_addr)?
+                        && self.add_reference_candidate(function_addr, va, disassembly)?
+                    {
+                        self.set_initial_candidate(function_addr)?;
+                    }
                 }
             }
         }
@@ -616,17 +586,26 @@ impl FunctionCandidateManager {
         Ok(self.candidate_offsets.clone())
     }
 
-    pub fn is_alignment_sequence(&self, instruction_sequence: &[DecodedInsn]) -> Result<bool> {
+    pub fn is_alignment_sequence(
+        &self,
+        instruction_sequence: &[DecodedInsn],
+        disassembly: &DisassemblyResult,
+    ) -> Result<bool> {
         let mut is_alignment_sequence = false;
         if !instruction_sequence.is_empty() {
             let mut current_offset = instruction_sequence[0].offset;
             for instruction in instruction_sequence {
-                let len = instruction.bytes.len();
+                let len = instruction.length as usize;
+                // 0.4.0: bytes are looked up on demand from BinaryInfo
+                // instead of being owned by the DecodedInsn.
+                let Ok(bytes) = instruction.bytes_in(&disassembly.binary_info) else {
+                    break;
+                };
                 if self
                     .gs
                     .gs
                     .get(&len)
-                    .is_some_and(|set| set.contains(&instruction.bytes))
+                    .is_some_and(|set| set.contains(&bytes.to_vec()))
                 {
                     current_offset += len as u64;
                     if current_offset.is_multiple_of(16) {

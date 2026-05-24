@@ -53,15 +53,23 @@ impl JumpTableAnalyser {
 
     pub fn find_jump_tables(&mut self, disassembly: &DisassemblyResult) -> Result<Vec<u64>> {
         let mut jumptables = vec![];
-        for match_offset in BYTES.find_iter(&disassembly.binary_info.binary) {
-            let packed_dword: &[u8; 4] = disassembly
-                .get_raw_bytes(match_offset.start() as u64 + 3, 4)?
-                .try_into()?;
-            let rel_table_offset = u32::from_le_bytes(*packed_dword) as u64;
-            let ins_offset = disassembly.binary_info.base_addr + match_offset.start() as u64;
-            let table_offset = ins_offset + rel_table_offset + 7;
-            if disassembly.is_addr_within_memory_image(table_offset)? {
-                jumptables.push(table_offset);
+        for (section_va, section_bytes) in disassembly.binary_info.section_slices() {
+            for match_offset in BYTES.find_iter(section_bytes) {
+                let ins_offset = section_va + match_offset.start() as u64;
+                let Ok(packed) = disassembly.binary_info.bytes_at(ins_offset + 3, 4) else {
+                    continue;
+                };
+                let packed_dword: [u8; 4] = packed.try_into()?;
+                let rel_table_offset = u32::from_le_bytes(packed_dword) as u64;
+                let Some(table_offset) = ins_offset
+                    .checked_add(rel_table_offset)
+                    .and_then(|t| t.checked_add(7))
+                else {
+                    continue;
+                };
+                if disassembly.is_addr_within_memory_image(table_offset)? {
+                    jumptables.push(table_offset);
+                }
             }
         }
         Ok(jumptables)

@@ -156,7 +156,7 @@ impl FunctionAnalysisState {
         let mut backtracked = vec![];
         for instruction in &self.instructions {
             if instruction.offset < addr_from {
-                backtracked.push(instruction.clone());
+                backtracked.push(*instruction);
             }
         }
         if backtracked.len() < num_instructions as usize {
@@ -185,7 +185,7 @@ impl FunctionAnalysisState {
     pub fn add_instruction(&mut self, ins: DecodedInsn) -> Result<()> {
         let i_address = ins.offset;
         let i_size = ins.length as u64;
-        self.instructions.push(ins.clone());
+        self.instructions.push(ins);
         self.instruction_start_bytes.insert(i_address);
         self.current_block.push(ins);
         for byte in 0..i_size {
@@ -254,7 +254,7 @@ impl FunctionAnalysisState {
             let mut block = vec![];
             for i in start_idx..self.instructions.len() {
                 let current = &self.instructions[i];
-                block.push(current.clone());
+                block.push(*current);
 
                 // If one code reference is to another address than the next
                 if self.code_refs_from.contains_key(&current.offset)

@@ -88,13 +88,39 @@ impl std::fmt::Display for FileArchitecture {
     }
 }
 
-#[derive(Debug)]
-pub struct BinaryInfo {
+/// One contiguous mapping between a VA range and a slice of the input file.
+///
+/// Replaces the per-binary `Vec<u8>` "mapped image" of 0.3.x — instead of
+/// reorganising bytes into a virtual-address layout we record where each
+/// section lives in both spaces and slice into the borrowed input on
+/// demand. For raw memory dumps the section table collapses to a single
+/// entry; for PE/ELF there's one entry per loaded section.
+///
+/// `file_size <= va_end - va_start`: the remainder is the BSS-style gap
+/// between the on-disk bytes and the in-memory size. Reads into that gap
+/// return `Err(NotEnoughBytesError)` so callers can decide whether to
+/// treat them as zero or skip.
+#[derive(Debug, Clone, Copy)]
+pub struct SectionMap {
+    pub va_start: u64,
+    pub va_end: u64,
+    pub file_offset: usize,
+    pub file_size: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct BinaryInfo<'a> {
     pub file_format: FileFormat,
     pub file_architecture: FileArchitecture,
     pub base_addr: u64,
-    pub binary: Vec<u8>,
-    pub raw_data: Vec<u8>,
+    /// The original input bytes — borrowed, not owned. Goblin parses
+    /// from this directly when needed.
+    pub raw_data: &'a [u8],
+    /// Section table describing where bytes live in both file and VA
+    /// space. Sorted by `va_start`.
+    pub section_maps: Vec<SectionMap>,
+    /// Total VA range covered by the mapping (`max va_end - base_addr`).
+    /// Note: this is the *virtual* footprint, not `raw_data.len()`.
     pub binary_size: u64,
     pub bitness: u32,
     pub code_areas: Vec<(u64, u64)>,
@@ -110,20 +136,17 @@ pub struct BinaryInfo {
     pub exports: Vec<(String, usize, Option<String>)>,
 }
 
-impl Default for BinaryInfo {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl BinaryInfo {
-    pub fn new() -> BinaryInfo {
+impl<'a> BinaryInfo<'a> {
+    /// Empty placeholder, primarily used to satisfy the
+    /// `DisassemblyResult::new()` initial-construction pattern before a
+    /// real binary is loaded. Carries no borrowed data.
+    pub fn empty() -> BinaryInfo<'static> {
         BinaryInfo {
             file_format: FileFormat::ELF,
             file_architecture: FileArchitecture::I386,
             base_addr: 0,
-            binary: vec![],
-            raw_data: vec![],
+            raw_data: &[],
+            section_maps: vec![],
             binary_size: 0,
             bitness: 32,
             code_areas: vec![],
@@ -140,11 +163,31 @@ impl BinaryInfo {
         }
     }
 
-    pub fn init(&mut self, content: &[u8]) -> Result<()> {
-        self.raw_data = content.to_vec();
-        self.binary_size = content.len() as u64;
-        self.sha256 = BinaryInfo::sha256_digest(content);
-        Ok(())
+    /// Build a `BinaryInfo<'a>` borrowing `content`. Computes the SHA-256
+    /// of the raw input and leaves the section table empty — the caller
+    /// (the disassembler) is responsible for populating `section_maps`
+    /// and the format-specific metadata.
+    pub fn from_buffer(content: &'a [u8]) -> Result<BinaryInfo<'a>> {
+        Ok(BinaryInfo {
+            file_format: FileFormat::ELF,
+            file_architecture: FileArchitecture::I386,
+            base_addr: 0,
+            raw_data: content,
+            section_maps: vec![],
+            binary_size: 0,
+            bitness: 32,
+            code_areas: vec![],
+            component: String::new(),
+            family: String::new(),
+            file_path: String::new(),
+            is_library: false,
+            is_buffer: false,
+            sha256: BinaryInfo::sha256_digest(content),
+            entry_point: 0,
+            sections: vec![],
+            imports: vec![],
+            exports: vec![],
+        })
     }
 
     fn sha256_digest(content: &[u8]) -> String {
@@ -152,6 +195,98 @@ impl BinaryInfo {
         hasher.update(content);
         let digest = hasher.finalize();
         digest.iter().map(|b| format!("{b:02X}")).collect()
+    }
+
+    /// Locate `va` in the section table and return the section + the
+    /// offset within it. Linear search over typically <10 entries; faster
+    /// than binary search for small tables thanks to branch prediction.
+    fn locate(&self, va: u64) -> Option<(&SectionMap, usize)> {
+        for sect in &self.section_maps {
+            if sect.va_start <= va && va < sect.va_end {
+                let offset_in_section = (va - sect.va_start) as usize;
+                return Some((sect, offset_in_section));
+            }
+        }
+        None
+    }
+
+    /// Read `len` bytes starting at virtual address `va`. Returns a
+    /// borrowed slice into `raw_data` — zero allocation.
+    ///
+    /// Returns `Err(NotEnoughBytesError)` if `va` is not within any
+    /// section, if the read would cross a section boundary, or if it
+    /// would extend past the on-disk bytes into a BSS-style gap.
+    pub fn bytes_at(&self, va: u64, len: u32) -> Result<&[u8]> {
+        let (sect, offset_in_section) = self
+            .locate(va)
+            .ok_or(Error::NotEnoughBytesError(va, len as u64))?;
+        let end_offset = offset_in_section
+            .checked_add(len as usize)
+            .ok_or(Error::NotEnoughBytesError(va, len as u64))?;
+        // Reads that would extend past the on-disk part of the section
+        // (into a BSS gap or past the section end) are errors. Callers
+        // that want zero-fill semantics can handle the Err.
+        if end_offset > sect.file_size {
+            return Err(Error::NotEnoughBytesError(va, len as u64));
+        }
+        let file_start = sect
+            .file_offset
+            .checked_add(offset_in_section)
+            .ok_or(Error::NotEnoughBytesError(va, len as u64))?;
+        let file_end = sect
+            .file_offset
+            .checked_add(end_offset)
+            .ok_or(Error::NotEnoughBytesError(va, len as u64))?;
+        self.raw_data
+            .get(file_start..file_end)
+            .ok_or(Error::NotEnoughBytesError(va, len as u64))
+    }
+
+    /// Best-effort variant of `bytes_at` that returns up to `max_len`
+    /// bytes (fewer if a section boundary or EOF intervenes). Used by
+    /// the iced decoder's lookahead window where a short read is
+    /// acceptable (iced will decode whatever fits).
+    pub fn bytes_at_best_effort(&self, va: u64, max_len: u32) -> Result<&[u8]> {
+        let (sect, offset_in_section) = self
+            .locate(va)
+            .ok_or(Error::NotEnoughBytesError(va, max_len as u64))?;
+        let available = sect.file_size.saturating_sub(offset_in_section);
+        if available == 0 {
+            return Err(Error::NotEnoughBytesError(va, max_len as u64));
+        }
+        let take = (max_len as usize).min(available);
+        let file_start = sect
+            .file_offset
+            .checked_add(offset_in_section)
+            .ok_or(Error::NotEnoughBytesError(va, max_len as u64))?;
+        let file_end = file_start
+            .checked_add(take)
+            .ok_or(Error::NotEnoughBytesError(va, max_len as u64))?;
+        self.raw_data
+            .get(file_start..file_end)
+            .ok_or(Error::NotEnoughBytesError(va, max_len as u64))
+    }
+
+    /// Convenience: highest VA covered by any section (exclusive). Set
+    /// at construction; recomputed by callers as sections are added.
+    pub fn compute_binary_size(&self) -> u64 {
+        self.section_maps
+            .iter()
+            .map(|s| s.va_end.saturating_sub(self.base_addr))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Yield `(va_start, &[u8])` for each section. Used by candidate
+    /// scanners that need to find byte patterns and translate match
+    /// positions back to virtual addresses. The byte slice is a direct
+    /// borrow into `raw_data` — zero allocation.
+    pub fn section_slices(&self) -> impl Iterator<Item = (u64, &[u8])> {
+        self.section_maps.iter().filter_map(|s| {
+            let end = s.file_offset.checked_add(s.file_size)?;
+            let bytes = self.raw_data.get(s.file_offset..end)?;
+            Some((s.va_start, bytes))
+        })
     }
 
     /// Returns `(section_name, va_start, va_end)` for each PE section. The
@@ -163,7 +298,7 @@ impl BinaryInfo {
     /// (Prior to 0.3.0 this returned file offsets, which silently broke the
     /// `.pdata` exception-handler scan and `report::get_section` lookups.)
     pub fn get_sections(&self) -> Result<Vec<(String, u64, u64)>> {
-        match Object::parse(&self.raw_data)? {
+        match Object::parse(self.raw_data)? {
             Object::PE(pe) => {
                 let mut res = vec![];
                 let base = self.base_addr;
@@ -185,7 +320,7 @@ impl BinaryInfo {
     }
 
     pub fn get_oep(&self) -> Result<u64> {
-        match Object::parse(&self.raw_data)? {
+        match Object::parse(self.raw_data)? {
             Object::PE(pe) => Ok(pe.entry as u64),
             _ => Ok(0),
         }
@@ -193,11 +328,11 @@ impl BinaryInfo {
 }
 
 #[derive(Debug)]
-pub struct DisassemblyResult {
+pub struct DisassemblyResult<'a> {
     analysis_start_ts: SystemTime,
     analysis_end_ts: SystemTime,
     analysis_timeout: bool,
-    pub binary_info: BinaryInfo,
+    pub binary_info: BinaryInfo<'a>,
     identified_alignment: usize,
     pub code_map: HashMap<u64, u64>,
     pub data_map: HashSet<u64>,
@@ -225,19 +360,15 @@ pub struct DisassemblyResult {
     code_areas: Vec<u8>,
 }
 
-impl Default for DisassemblyResult {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl DisassemblyResult {
-    pub fn new() -> DisassemblyResult {
+impl<'a> DisassemblyResult<'a> {
+    /// Construct a fresh `DisassemblyResult` borrowing `binary_info`'s
+    /// underlying input bytes for the lifetime `'a`.
+    pub fn new(binary_info: BinaryInfo<'a>) -> DisassemblyResult<'a> {
         DisassemblyResult {
             analysis_start_ts: SystemTime::now(),
             analysis_end_ts: SystemTime::now(),
             analysis_timeout: false,
-            binary_info: BinaryInfo::new(),
+            binary_info,
             identified_alignment: 0,
             code_map: HashMap::new(),
             data_map: HashSet::new(),
@@ -263,7 +394,7 @@ impl DisassemblyResult {
         }
     }
 
-    pub fn init(&mut self, bi: BinaryInfo) -> Result<()> {
+    pub fn init(&mut self, bi: BinaryInfo<'a>) -> Result<()> {
         self.analysis_start_ts = SystemTime::now();
         self.analysis_end_ts = SystemTime::now();
         self.binary_info = bi;
@@ -294,7 +425,7 @@ impl DisassemblyResult {
         }
 
         if self.binary_info.file_format == FileFormat::ELF {
-            let elf_apis = elf::extract_elf_dynamic_apis(&self.binary_info.raw_data)?;
+            let elf_apis = elf::extract_elf_dynamic_apis(self.binary_info.raw_data)?;
             for (addr, (dll, api)) in elf_apis {
                 if api.is_some() {
                     let canonical_addr = if addr >= self.binary_info.base_addr {
@@ -377,65 +508,43 @@ impl DisassemblyResult {
         Ok(self.confidence_threshold)
     }
 
+    /// Read one byte at virtual address `addr`.
     pub fn get_byte(&self, addr: u64) -> Result<u8> {
-        if self.is_addr_within_memory_image(addr)? {
-            // is_addr_within_memory_image guarantees base_addr <= addr in
-            // u64 space — do the subtraction in u64 (never in usize after
-            // truncation, to stay correct on 32-bit targets).
-            let rel = addr - self.binary_info.base_addr;
-            let idx = usize::try_from(rel).map_err(|_| Error::NotEnoughBytesError(addr, 1))?;
-            return self
-                .binary_info
-                .binary
-                .get(idx)
-                .copied()
-                .ok_or(Error::NotEnoughBytesError(addr, 1));
-        }
-        Err(Error::LogicError(file!(), line!()))
-    }
-
-    pub fn get_raw_byte(&self, addr: u64) -> Result<u8> {
-        let idx = usize::try_from(addr).map_err(|_| Error::NotEnoughBytesError(addr, 1))?;
-        self.binary_info
-            .binary
-            .get(idx)
+        let slice = self.binary_info.bytes_at(addr, 1)?;
+        slice
+            .first()
             .copied()
             .ok_or(Error::NotEnoughBytesError(addr, 1))
     }
 
-    pub fn get_raw_bytes(&self, offset: u64, bytes: u64) -> Result<&[u8]> {
-        let end = offset
-            .checked_add(bytes)
-            .ok_or(Error::NotEnoughBytesError(offset, bytes))?;
-        let (start_us, end_us) = (
-            usize::try_from(offset).map_err(|_| Error::NotEnoughBytesError(offset, bytes))?,
-            usize::try_from(end).map_err(|_| Error::NotEnoughBytesError(offset, bytes))?,
-        );
-        self.binary_info
-            .binary
-            .get(start_us..end_us)
-            .ok_or(Error::NotEnoughBytesError(offset, bytes))
+    /// Read one byte at a base-relative offset (i.e. `base_addr + offset`).
+    /// Pre-0.4.0 this indexed directly into the mapped image; in the
+    /// section-map model we translate to VA-space and go through `bytes_at`.
+    pub fn get_raw_byte(&self, offset: u64) -> Result<u8> {
+        let va = self
+            .binary_info
+            .base_addr
+            .checked_add(offset)
+            .ok_or(Error::NotEnoughBytesError(offset, 1))?;
+        self.get_byte(va)
     }
 
+    /// Read `bytes` bytes at a base-relative offset.
+    pub fn get_raw_bytes(&self, offset: u64, bytes: u64) -> Result<&[u8]> {
+        let va = self
+            .binary_info
+            .base_addr
+            .checked_add(offset)
+            .ok_or(Error::NotEnoughBytesError(offset, bytes))?;
+        let len = u32::try_from(bytes).map_err(|_| Error::NotEnoughBytesError(offset, bytes))?;
+        self.binary_info.bytes_at(va, len)
+    }
+
+    /// Read `num_bytes` bytes at virtual address `addr`.
     pub fn get_bytes(&self, addr: u64, num_bytes: u64) -> Result<&[u8]> {
-        if !self.is_addr_within_memory_image(addr)? {
-            return Err(Error::NotEnoughBytesError(addr, num_bytes));
-        }
-        let rel_start = addr - self.binary_info.base_addr;
-        let rel_end = rel_start
-            .checked_add(num_bytes)
-            .ok_or(Error::NotEnoughBytesError(addr, num_bytes))?;
-        if rel_end > self.binary_info.binary_size {
-            return Err(Error::NotEnoughBytesError(addr, num_bytes));
-        }
-        let (start_us, end_us) = (
-            usize::try_from(rel_start).map_err(|_| Error::NotEnoughBytesError(addr, num_bytes))?,
-            usize::try_from(rel_end).map_err(|_| Error::NotEnoughBytesError(addr, num_bytes))?,
-        );
-        self.binary_info
-            .binary
-            .get(start_us..end_us)
-            .ok_or(Error::NotEnoughBytesError(addr, num_bytes))
+        let len =
+            u32::try_from(num_bytes).map_err(|_| Error::NotEnoughBytesError(addr, num_bytes))?;
+        self.binary_info.bytes_at(addr, len)
     }
 
     pub fn is_addr_within_memory_image(&self, offset: u64) -> Result<bool> {
@@ -467,51 +576,25 @@ impl DisassemblyResult {
     }
 
     pub fn dereference_dword(&self, addr: u64) -> Result<u64> {
-        if !self.is_addr_within_memory_image(addr)? {
-            return Err(Error::DereferenceError(addr));
-        }
-        let rel_start_addr = addr - self.binary_info.base_addr;
-        let rel_end_addr = rel_start_addr
-            .checked_add(4)
-            .ok_or(Error::DereferenceError(addr))?;
-        if rel_end_addr > self.binary_info.binary_size {
-            return Err(Error::DereferenceError(addr));
-        }
-        let (s, e) = (
-            usize::try_from(rel_start_addr).map_err(|_| Error::DereferenceError(addr))?,
-            usize::try_from(rel_end_addr).map_err(|_| Error::DereferenceError(addr))?,
-        );
-        let extracted_dword: &[u8; 4] = self
+        let slice = self
             .binary_info
-            .binary
-            .get(s..e)
-            .ok_or(Error::DereferenceError(addr))?
-            .try_into()?;
-        Ok(u32::from_le_bytes(*extracted_dword) as u64)
+            .bytes_at(addr, 4)
+            .map_err(|_| Error::DereferenceError(addr))?;
+        let arr: &[u8; 4] = slice
+            .try_into()
+            .map_err(|_| Error::DereferenceError(addr))?;
+        Ok(u32::from_le_bytes(*arr) as u64)
     }
 
     pub fn dereference_qword(&self, addr: u64) -> Result<u64> {
-        if !self.is_addr_within_memory_image(addr)? {
-            return Err(Error::DereferenceError(addr));
-        }
-        let rel_start_addr = addr - self.binary_info.base_addr;
-        let rel_end_addr = rel_start_addr
-            .checked_add(8)
-            .ok_or(Error::DereferenceError(addr))?;
-        if rel_end_addr > self.binary_info.binary_size {
-            return Err(Error::DereferenceError(addr));
-        }
-        let (s, e) = (
-            usize::try_from(rel_start_addr).map_err(|_| Error::DereferenceError(addr))?,
-            usize::try_from(rel_end_addr).map_err(|_| Error::DereferenceError(addr))?,
-        );
-        let extracted_qword: &[u8; 8] = self
+        let slice = self
             .binary_info
-            .binary
-            .get(s..e)
-            .ok_or(Error::DereferenceError(addr))?
-            .try_into()?;
-        Ok(u64::from_le_bytes(*extracted_qword))
+            .bytes_at(addr, 8)
+            .map_err(|_| Error::DereferenceError(addr))?;
+        let arr: &[u8; 8] = slice
+            .try_into()
+            .map_err(|_| Error::DereferenceError(addr))?;
+        Ok(u64::from_le_bytes(*arr))
     }
 
     pub fn add_code_refs(&mut self, addr_from: u64, addr_to: u64) -> Result<()> {
@@ -640,23 +723,26 @@ impl DisassemblyResult {
 }
 
 #[derive(Debug)]
-pub struct Disassembler {
+pub struct Disassembler<'a> {
     common_start_bytes: HashMap<u32, HashMap<u8, u32>>,
     tailcall_analyzer: TailCallAnalyser,
     indirect_call_analyser: IndirectCallAnalyser,
     jumptable_analyzer: JumpTableAnalyser,
     fc_manager: FunctionCandidateManager,
     tfidf: MnemonicTfIdf,
-    pub disassembly: DisassemblyResult,
+    pub disassembly: DisassemblyResult<'a>,
     label_providers: Vec<LabelProvider>,
 }
 
-impl Disassembler {
+impl<'a> Disassembler<'a> {
     pub fn get_bitmask(&self) -> u64 {
         0xFFFFFFFFFFFFFFFF
     }
 
-    pub fn new() -> Result<Disassembler> {
+    /// Constructor used internally by `parse` / `disassemble_file` after
+    /// the `BinaryInfo` has been populated. Public callers should use
+    /// `Disassembler::parse(&buf, ...)` instead.
+    fn with_binary(binary_info: BinaryInfo<'a>) -> Result<Disassembler<'a>> {
         let mut res = Disassembler {
             common_start_bytes: HashMap::new(),
             tailcall_analyzer: TailCallAnalyser::new(),
@@ -664,7 +750,7 @@ impl Disassembler {
             jumptable_analyzer: JumpTableAnalyser::new(),
             fc_manager: FunctionCandidateManager::new(),
             tfidf: MnemonicTfIdf::new(),
-            disassembly: DisassemblyResult::new(),
+            disassembly: DisassemblyResult::new(binary_info),
             label_providers: label_providers::init()?,
         };
         res.common_start_bytes.insert(
@@ -698,25 +784,29 @@ impl Disassembler {
     }
 
     fn determine_bitness(&mut self) -> Result<u32> {
-        let binary = &self.disassembly.binary_info.binary;
+        // Scan the raw input bytes for E8 call patterns. In 0.3.x this
+        // walked the mapped image; the raw input version is equivalent
+        // for bitness detection — we only need the relative-offset
+        // statistics, not the absolute targets.
+        let raw = self.disassembly.binary_info.raw_data;
         let mut candidate_first_bytes: HashMap<u32, HashMap<u8, u32>> =
             [(32, HashMap::new()), (64, HashMap::new())]
                 .iter()
                 .cloned()
                 .collect();
         for bitness in [32, 64] {
-            for call_match in BITNESS.find_iter(binary) {
-                if binary.len() - call_match.start() > 5 {
+            for call_match in BITNESS.find_iter(raw) {
+                if raw.len() - call_match.start() > 5 {
                     let packed_call: &[u8; 4] =
-                        &binary[call_match.start() + 1..call_match.start() + 5].try_into()?;
+                        &raw[call_match.start() + 1..call_match.start() + 5].try_into()?;
                     let rel_call_offset = i32::from_le_bytes(*packed_call);
                     let call_destination = rel_call_offset
                         .overflowing_add(call_match.start() as i32)
                         .0
                         .overflowing_add(5)
                         .0;
-                    if call_destination > 0 && (call_destination as usize) < binary.len() {
-                        let first_byte = binary[call_destination as usize];
+                    if call_destination > 0 && (call_destination as usize) < raw.len() {
+                        let first_byte = raw[call_destination as usize];
                         if let Some(s) = candidate_first_bytes.get_mut(&bitness) {
                             *s.entry(first_byte).or_insert(0) += 1;
                         }
@@ -752,30 +842,44 @@ impl Disassembler {
         }
     }
 
-    pub fn disassemble_file(
-        file_name: &str,
+    // `disassemble_file` was removed in 0.4.0. The 0.3.x signature
+    // returned an owned `DisassemblyReport` that cloned the mapped image
+    // into the report; the zero-copy refactor makes that pattern
+    // impossible to express in safe Rust without either leaking memory
+    // or using a self-referential helper crate (yoke / ouroboros).
+    //
+    // Callers should load the file themselves and pass the buffer to
+    // `parse(&buf, Some(path), …)`:
+    //
+    // ```no_run
+    // let buf = std::fs::read("Sample.exe")?;
+    // let report = smda::Disassembler::parse(&buf, Some("Sample.exe"), false, false)?;
+    // // `buf` must outlive `report`
+    // ```
+
+    /// Zero-copy disassembly entry point. The returned `DisassemblyReport`
+    /// borrows from `raw` for the lifetime `'a`; no copies of the input
+    /// bytes are made.
+    pub fn parse<'b>(
+        raw: &'b [u8],
+        path: Option<&str>,
         high_accuracy: bool,
         resolve_tailcalls: bool,
-        data: Option<&Vec<u8>>,
-    ) -> Result<DisassemblyReport> {
-        let mut disassembler = Disassembler::new()?;
-        let file_content = match data {
-            Some(d) => d.to_vec(),
-            _ => Disassembler::load_file(file_name)?,
-        };
-        let mut binary_info = BinaryInfo::new();
-        binary_info.init(&file_content)?;
-        binary_info.file_path = file_name.to_string();
-        match Object::parse(&file_content)? {
+    ) -> Result<DisassemblyReport<'b>> {
+        let mut binary_info = BinaryInfo::from_buffer(raw)?;
+        if let Some(p) = path {
+            binary_info.file_path = p.to_string();
+        }
+        match Object::parse(raw)? {
             Object::Elf(elf) => {
                 binary_info.file_format = FileFormat::ELF;
-                binary_info.base_addr = elf::get_base_address(&file_content)?;
-                binary_info.bitness = elf::get_bitness(&file_content)?;
+                binary_info.base_addr = elf::get_base_address(raw)?;
+                binary_info.bitness = elf::get_bitness(raw)?;
                 binary_info.file_architecture = match binary_info.bitness {
                     64 => FileArchitecture::AMD64,
                     _ => FileArchitecture::I386,
                 };
-                binary_info.code_areas = elf::get_code_areas(&file_content, &elf)?;
+                binary_info.code_areas = elf::get_code_areas(raw, &elf)?;
                 binary_info.sections = elf
                     .section_headers
                     .iter()
@@ -790,18 +894,17 @@ impl Disassembler {
                         )
                     })
                     .collect();
-                binary_info.binary = elf::map_binary(&binary_info.raw_data)?;
-                binary_info.binary_size = binary_info.binary.len() as u64;
+                binary_info.section_maps = elf::map_binary(raw, binary_info.base_addr)?;
             }
             Object::PE(pe) => {
                 binary_info.file_format = FileFormat::PE;
-                binary_info.base_addr = pe::get_base_address(&file_content)?;
-                binary_info.bitness = pe::get_bitness(&file_content)?;
+                binary_info.base_addr = pe::get_base_address(raw)?;
+                binary_info.bitness = pe::get_bitness(raw)?;
                 binary_info.file_architecture = match binary_info.bitness {
                     64 => FileArchitecture::AMD64,
                     _ => FileArchitecture::I386,
                 };
-                binary_info.code_areas = pe::get_code_areas(&file_content, &pe)?;
+                binary_info.code_areas = pe::get_code_areas(raw, &pe)?;
                 binary_info.sections = pe
                     .sections
                     .iter()
@@ -834,14 +937,14 @@ impl Disassembler {
                         (s.name.unwrap_or("").to_string(), s.rva, forward)
                     })
                     .collect();
-                binary_info.binary = pe::map_binary(&binary_info.raw_data)?;
-                binary_info.binary_size = binary_info.binary.len() as u64;
+                binary_info.section_maps = pe::map_binary(raw, binary_info.base_addr)?;
             }
             _ => return Err(Error::UnsupportedFormatError),
         }
-        disassembler.analyse_buffer(binary_info, high_accuracy, resolve_tailcalls)?;
-        let report = DisassemblyReport::new(&mut disassembler.disassembly)?;
-        Ok(report)
+        binary_info.binary_size = binary_info.compute_binary_size();
+        let mut disassembler = Disassembler::with_binary(binary_info)?;
+        disassembler.analyse_buffer(high_accuracy, resolve_tailcalls)?;
+        DisassemblyReport::new(&mut disassembler.disassembly)
     }
 
     fn get_symbol_candidates(&self) -> Result<Vec<u64>> {
@@ -857,16 +960,20 @@ impl Disassembler {
         Ok(symbol_offsets.iter().copied().collect())
     }
 
+    /// Run analysis on the already-loaded `binary_info` (set via
+    /// `with_binary`). Pre-0.4.0 this took an owned `BinaryInfo`
+    /// argument; the new API splits construction (`with_binary`) from
+    /// analysis to make the lifetime threading explicit.
     pub fn analyse_buffer(
         &mut self,
-        bin: BinaryInfo,
         high_accuracy: bool,
         resolve_tailcalls: bool,
-    ) -> Result<&DisassemblyResult> {
-        self.update_label_providers(&bin)?;
-        self.disassembly.init(bin)?;
+    ) -> Result<&DisassemblyResult<'a>> {
+        // The binary_info is already in self.disassembly (set by with_binary).
+        // Just kick off the analysis.
+        self.update_label_providers_from_disassembly()?;
         if self.disassembly.binary_info.file_format == FileFormat::ELF {
-            match elf::extract_elf_dynamic_apis(&self.disassembly.binary_info.raw_data) {
+            match elf::extract_elf_dynamic_apis(self.disassembly.binary_info.raw_data) {
                 Ok(elf_apis) => {
                     for (addr, (dll, api)) in elf_apis {
                         let api_entry = label_providers::ApiEntry {
@@ -944,17 +1051,13 @@ impl Disassembler {
     }
 
     fn get_disasm_window_buffer(&self, addr: u64) -> Vec<u8> {
-        if addr < self.disassembly.binary_info.base_addr
-            || addr
-                >= self.disassembly.binary_info.base_addr
-                    + self.disassembly.binary_info.binary.len() as u64
-        {
-            return vec![];
+        // Best-effort 15-byte read at the candidate VA — returns Err if
+        // the address isn't in any section. Empty Vec keeps the caller's
+        // "no decode possible" path working.
+        match self.disassembly.binary_info.bytes_at_best_effort(addr, 15) {
+            Ok(s) => s.to_vec(),
+            Err(_) => vec![],
         }
-        let relative_start = (addr - self.disassembly.binary_info.base_addr) as usize;
-        let len = self.disassembly.binary_info.binary.len();
-        let relative_end = (relative_start + 15).min(len);
-        self.disassembly.binary_info.binary[relative_start..relative_end].to_vec()
     }
 
     fn handle_call_target(
@@ -1113,11 +1216,15 @@ impl Disassembler {
         if let Some((dll, api)) = self.disassembly.addr_to_api.get(&thunk_addr) {
             return Ok(Some((dll.clone(), api.clone())));
         }
-        let rel_addr = thunk_addr - self.disassembly.binary_info.base_addr;
-        if rel_addr + 16 > self.disassembly.binary_info.binary_size {
+        // Read up to 16 bytes at the thunk VA — best-effort so a short
+        // section near EOF still gets scanned for what it has.
+        let Ok(bytes) = self
+            .disassembly
+            .binary_info
+            .bytes_at_best_effort(thunk_addr, 16)
+        else {
             return Ok(None);
-        }
-        let bytes = &self.disassembly.binary_info.binary[rel_addr as usize..rel_addr as usize + 16];
+        };
         for i in 0..12 {
             if i + 5 < bytes.len() && bytes[i] == 0xFF && bytes[i + 1] == 0x25 {
                 let offset =
@@ -1282,12 +1389,10 @@ impl Disassembler {
                 break;
             }
             let len = decoder.position() - pos_before;
-            let bytes = buf[pos_before..pos_before + len].to_vec();
             out.push(DecodedInsn {
                 offset: insn.ip(),
                 length: len as u32,
                 iced: insn,
-                bytes,
             });
         }
         out
@@ -1341,7 +1446,17 @@ impl Disassembler {
                     cache_pos += i_size as usize;
                     state.set_next_instruction_reachable(true)?;
 
-                    if ins.bytes == b"\x00\x00" {
+                    // Check for the "00 00" suspicious-instruction marker by
+                    // peeking at the bytes for this instruction. bytes_at
+                    // returns Err on a section boundary, which we treat as
+                    // "not the suspicious pattern".
+                    if self
+                        .disassembly
+                        .binary_info
+                        .bytes_at(i_address, i_size)
+                        .map(|b| b == b"\x00\x00")
+                        .unwrap_or(false)
+                    {
                         state.suspicious_ins_count += 1;
                         if state.suspicious_ins_count > 1 {
                             self.fc_manager.update_analysis_aborted(
@@ -1399,7 +1514,7 @@ impl Disassembler {
                         let instruction_sequence = self.decode_window(i_address);
                         let is_align = self
                             .fc_manager
-                            .is_alignment_sequence(&instruction_sequence)?;
+                            .is_alignment_sequence(&instruction_sequence, &self.disassembly)?;
                         let is_cand = self.fc_manager.is_function_candidate(i_address)?;
                         if is_align || is_cand {
                             state.set_block_ending_instruction(true)?;
@@ -1426,7 +1541,7 @@ impl Disassembler {
                         && !self.disassembly.data_map.contains(&i_address)
                         && !state.is_processed(&i_address)?
                     {
-                        state.add_instruction(ins.clone())?;
+                        state.add_instruction(*ins)?;
                     } else if self.disassembly.code_map.contains_key(&i_address) {
                         state.set_block_ending_instruction(true)?;
                         state.set_collision(true)?;
@@ -1512,9 +1627,17 @@ impl Disassembler {
         Ok(String::new())
     }
 
-    fn update_label_providers(&mut self, bi: &BinaryInfo) -> Result<()> {
-        for provider in &mut self.label_providers {
-            provider.update(bi)?;
+    fn update_label_providers_from_disassembly(&mut self) -> Result<()> {
+        // Disjoint-field borrow: split self into the two fields we touch
+        // so we can pass `&binary_info` (immut) to a method taking
+        // `&mut label_providers`. Avoids needing `unsafe`.
+        let Disassembler {
+            label_providers,
+            disassembly,
+            ..
+        } = self;
+        for provider in label_providers.iter_mut() {
+            provider.update(&disassembly.binary_info)?;
         }
         Ok(())
     }

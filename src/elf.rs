@@ -1,4 +1,4 @@
-use crate::{Result, error::Error};
+use crate::{Result, SectionMap, error::Error};
 use goblin::elf::program_header::{PT_DYNAMIC, PT_LOAD};
 use std::collections::{HashMap, HashSet};
 
@@ -81,19 +81,26 @@ fn align(v: &u64, alignment: &u64) -> u64 {
     v + (alignment - remainder)
 }
 
-/// Hard cap on mapped image size to prevent OOM on adversarial inputs.
-/// Matches the PE-side cap in `pe::map_binary`. ELF samples in the wild
-/// almost never exceed a few tens of MB; anything beyond this is malformed
-/// or hostile.
+/// Hard cap on the declared VA range — prevents an attacker-crafted ELF
+/// from making `bytes_at` lookups misbehave on a multi-gigabyte VA span.
+/// Matches the PE-side cap in `pe::MAX_MAPPED_BYTES`.
 const MAX_MAPPED_BYTES: u64 = 256 * 1024 * 1024;
 
-pub fn map_binary(binary: &[u8]) -> Result<Vec<u8>> {
+/// Parse the ELF segment + section tables and return a `Vec<SectionMap>`
+/// describing where each loaded segment / section lives in both file and
+/// virtual-address space. Zero-copy: this is metadata only, no bytes are
+/// copied. Callers (`BinaryInfo`) thread the result through
+/// `bytes_at(va, len)` to read on demand.
+///
+/// Pre-0.4.0 this allocated a contiguous mapped image (`Vec<u8>`) the
+/// size of the virtual layout; 0.4.0 replaces that with the section
+/// table.
+pub fn map_binary(binary: &[u8], base_addr: u64) -> Result<Vec<SectionMap>> {
     let elffile = match goblin::Object::parse(binary) {
         Ok(goblin::Object::Elf(elf)) => elf,
         _ => return Err(Error::UnsupportedFormatError),
     };
 
-    let base_addr = get_base_address(binary)?;
     let mut max_virtual_address = 0_u64;
 
     for segment in &elffile.program_headers {
@@ -136,19 +143,11 @@ pub fn map_binary(binary: &[u8]) -> Result<Vec<u8>> {
             MAX_MAPPED_BYTES,
         ));
     }
-    let aligned_size = align(&virtual_size, &0x1000);
-    if aligned_size > MAX_MAPPED_BYTES {
-        return Err(Error::MalformedInputError(
-            "elf::map_binary aligned_size",
-            aligned_size,
-            MAX_MAPPED_BYTES,
-        ));
-    }
-    let mapped_len = usize::try_from(aligned_size).map_err(|_| {
-        Error::IntegerOverflow("elf::map_binary aligned_size as usize", aligned_size, 0)
-    })?;
-    let mut mapped_binary = vec![0u8; mapped_len];
+    let _ = align; // align() still used by other code paths if any; silence unused warning.
 
+    let mut section_maps: Vec<SectionMap> = Vec::new();
+
+    // PT_LOAD segments are the authoritative layout for ELF.
     for segment in &elffile.program_headers {
         if segment.p_type != PT_LOAD || segment.p_vaddr == 0 {
             continue;
@@ -161,90 +160,72 @@ pub fn map_binary(binary: &[u8]) -> Result<Vec<u8>> {
 
         // p_vaddr < base_addr is possible on crafted ELFs because base_addr
         // is computed across the PT_LOAD set; skip the segment in that case.
-        let Some(rva) = segment.p_vaddr.checked_sub(base_addr) else {
+        let Some(_rva) = segment.p_vaddr.checked_sub(base_addr) else {
             continue;
         };
+        // Clamp file_size to what the file actually contains, so a section
+        // declaring more bytes than exist on disk doesn't let `bytes_at`
+        // over-read.
         let file_size = segment
             .p_filesz
             .min((binary.len() as u64).saturating_sub(segment.p_offset));
-
-        let Some(dst_end_u64) = rva.checked_add(file_size) else {
-            continue;
-        };
-        if dst_end_u64 > mapped_binary.len() as u64 || file_size == 0 {
+        if file_size == 0 {
             continue;
         }
-        let Some(src_end_u64) = (p_offset_usize as u64).checked_add(file_size) else {
+        let Some(va_end) = segment.p_vaddr.checked_add(segment.p_memsz) else {
             continue;
         };
-        if src_end_u64 > binary.len() as u64 {
-            continue;
-        }
-
-        let (Ok(dst_start), Ok(dst_end), Ok(src_end)) = (
-            usize::try_from(rva),
-            usize::try_from(dst_end_u64),
-            usize::try_from(src_end_u64),
-        ) else {
+        let Ok(file_size_us) = usize::try_from(file_size) else {
             continue;
         };
-
-        let (Some(dst), Some(src)) = (
-            mapped_binary.get_mut(dst_start..dst_end),
-            binary.get(p_offset_usize..src_end),
-        ) else {
-            continue;
-        };
-        dst.copy_from_slice(src);
+        section_maps.push(SectionMap {
+            va_start: segment.p_vaddr,
+            va_end,
+            file_offset: p_offset_usize,
+            file_size: file_size_us,
+        });
     }
 
+    // Also include any SHF_ALLOC section whose VA isn't already covered by
+    // a PT_LOAD segment. This catches edge cases in stripped binaries where
+    // section headers exist but program headers don't fully describe the
+    // layout. Sections already inside an existing VA range are skipped.
     for section in &elffile.section_headers {
         if section.sh_addr == 0 || section.sh_addr < base_addr {
             continue;
         }
-
-        // sh_offset + sh_size overflow → skip; treat ">=" the same as ">"
-        // (a section covering the final byte is degenerate; ignore).
         let Some(src_end_u64) = section.sh_offset.checked_add(section.sh_size) else {
             continue;
         };
         if src_end_u64 > binary.len() as u64 {
             continue;
         }
-
-        let Some(rva) = section.sh_addr.checked_sub(base_addr) else {
+        let Some(va_end) = section.sh_addr.checked_add(section.sh_size) else {
             continue;
         };
-        let Some(dst_end_u64) = rva.checked_add(section.sh_size) else {
-            continue;
-        };
-        if dst_end_u64 > mapped_binary.len() as u64 {
+        // Skip if any existing PT_LOAD-derived section already covers this VA.
+        if section_maps
+            .iter()
+            .any(|s| s.va_start <= section.sh_addr && section.sh_addr < s.va_end)
+        {
             continue;
         }
-
-        let (Ok(src_start), Ok(src_end), Ok(dst_start), Ok(dst_end)) = (
+        let (Ok(file_offset), Ok(file_size)) = (
             usize::try_from(section.sh_offset),
-            usize::try_from(src_end_u64),
-            usize::try_from(rva),
-            usize::try_from(dst_end_u64),
+            usize::try_from(section.sh_size),
         ) else {
             continue;
         };
-
-        let (Some(dst), Some(src)) = (
-            mapped_binary.get_mut(dst_start..dst_end),
-            binary.get(src_start..src_end),
-        ) else {
-            continue;
-        };
-        // Only fill into still-zero regions so we don't overwrite the
-        // earlier PT_LOAD copy (matches the prior implementation's intent).
-        if dst.iter().all(|&b| b == 0) {
-            dst.copy_from_slice(src);
-        }
+        section_maps.push(SectionMap {
+            va_start: section.sh_addr,
+            va_end,
+            file_offset,
+            file_size,
+        });
     }
 
-    Ok(mapped_binary)
+    section_maps.sort_by_key(|s| s.va_start);
+    Ok(section_maps)
 }
 
 /// Extracts ALL symbols (dynamic + static + exported)

@@ -97,7 +97,7 @@ impl WinApiResolver {
         self.is_buffer = binary_info.is_buffer;
         if !self.is_buffer {
             //setup import table info from LIEF
-            if let Object::PE(lief_binary) = Object::parse(&binary_info.raw_data)? {
+            if let Object::PE(lief_binary) = Object::parse(binary_info.raw_data)? {
                 for import in lief_binary.imports {
                     if !import.name.is_empty() {
                         self.api_map.get_mut("lief").unwrap().insert(

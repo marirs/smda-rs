@@ -13,7 +13,7 @@ impl ElfSymbolProvider {
     }
 
     pub fn update(&mut self, binary_info: &BinaryInfo) -> Result<()> {
-        if let goblin::Object::Elf(elf) = goblin::Object::parse(&binary_info.raw_data)? {
+        if let goblin::Object::Elf(elf) = goblin::Object::parse(binary_info.raw_data)? {
             self.parse_oep(&elf)?;
             //            self.parse_exports(&elf)?;
             self.parse_symbols(&elf.syms, &elf.strtab)?;

@@ -127,28 +127,17 @@ impl FunctionCandidate {
         // Convert to usize with truncation check (matters on 32-bit
         // targets) and verify there are at least 5 bytes available — using
         // checked_add so a wrapped u32 doesn't bypass the bound check.
-        let rel_addr_usize = usize::try_from(rel_addr).map_err(|_| {
-            Error::InvalidAddress(format!("Relative address 0x{:x} exceeds usize", rel_addr))
-        })?;
-        let end = rel_addr_usize.checked_add(5).ok_or_else(|| {
+        // Read the first 5 bytes at the candidate VA through the
+        // section-map abstraction. `bytes_at` returns Err if the candidate
+        // address isn't in any loaded section or there aren't 5 bytes
+        // available — exactly the conditions the old binary-length check
+        // covered.
+        let bytes_slice = bi.bytes_at(addr, 5).map_err(|_| {
             Error::InvalidAddress(format!(
-                "Address arithmetic overflow at 0x{:x} (rel_addr: 0x{:x})",
-                addr, rel_addr
+                "Not enough bytes at address 0x{:x} (rel_addr: 0x{:x})",
+                addr, rel_addr,
             ))
         })?;
-        if end > bi.binary.len() {
-            return Err(Error::InvalidAddress(format!(
-                "Not enough bytes at address 0x{:x} (rel_addr: 0x{:x}, binary size: {})",
-                addr,
-                rel_addr,
-                bi.binary.len()
-            )));
-        }
-
-        let bytes_slice = bi
-            .binary
-            .get(rel_addr_usize..end)
-            .ok_or_else(|| Error::InvalidAddress(format!("Slice out of range at 0x{:x}", addr)))?;
 
         let mut fc = FunctionCandidate {
             cp: CommonPlagues::init(),

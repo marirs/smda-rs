@@ -23,7 +23,7 @@ impl ElfApiResolver {
         if !self.is_buffer {
             //setup import table info from LIEF
             let mut address = 0x401700;
-            if let Object::Elf(elf) = Object::parse(&binary_info.raw_data)? {
+            if let Object::Elf(elf) = Object::parse(binary_info.raw_data)? {
                 for reloc in elf.pltrelocs.iter() {
                     if reloc.r_sym != 0
                         && let Some(sym) = elf.dynsyms.get(reloc.r_sym)
