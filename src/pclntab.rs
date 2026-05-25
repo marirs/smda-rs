@@ -170,19 +170,45 @@ fn parse_v12(
     out: &mut HashMap<u64, String>,
 ) -> Option<()> {
     let ptrsize = *tab.get(7)?;
+    let ps = ptrsize as usize;
     let nfunc = read_uintptr(tab, 8, ptrsize)?;
     if nfunc == 0 || nfunc > 1_000_000 {
         return None;
     }
-    let entry_size = 2 * ptrsize as usize;
-    let functab_off = 8 + ptrsize as usize;
+    let entry_size = ps.checked_mul(2)?;
+    let functab_off = 8usize.checked_add(ps)?;
+    // 0.5.1 security: every offset arithmetic step uses checked_*. funcoff
+    // and nameoff come from the on-disk pclntab — they are attacker-
+    // controlled. Wrapping would panic in debug and silently corrupt in
+    // release.
     for i in 0..nfunc as usize {
-        let row = functab_off + i * entry_size;
-        let entry_va = read_uintptr(tab, row, ptrsize)?;
-        let funcoff = read_uintptr(tab, row + ptrsize as usize, ptrsize)? as usize;
-        // _func name lookup:
-        let nameoff = read_u32(tab, funcoff + ptrsize as usize)? as usize;
-        if let Some(name) = read_cstr(raw, tab_file_offset + nameoff)
+        let Some(row) = i
+            .checked_mul(entry_size)
+            .and_then(|x| x.checked_add(functab_off))
+        else {
+            return Some(());
+        };
+        let Some(entry_va) = read_uintptr(tab, row, ptrsize) else {
+            continue;
+        };
+        let Some(funcoff_pos) = row.checked_add(ps) else {
+            continue;
+        };
+        let funcoff = match read_uintptr(tab, funcoff_pos, ptrsize) {
+            Some(f) => f as usize,
+            None => continue,
+        };
+        let Some(nameoff_pos) = funcoff.checked_add(ps) else {
+            continue;
+        };
+        let nameoff = match read_u32(tab, nameoff_pos) {
+            Some(n) => n as usize,
+            None => continue,
+        };
+        let Some(name_file_off) = tab_file_offset.checked_add(nameoff) else {
+            continue;
+        };
+        if let Some(name) = read_cstr(raw, name_file_off)
             && !name.is_empty()
         {
             out.insert(entry_va, name);
@@ -217,21 +243,47 @@ fn parse_v116(
     out: &mut HashMap<u64, String>,
 ) -> Option<()> {
     let ptrsize = *tab.get(7)?;
+    let ps = ptrsize as usize;
     let nfunc = read_uintptr(tab, 8, ptrsize)?;
     if nfunc == 0 || nfunc > 1_000_000 {
         return None;
     }
-    let ps = ptrsize as usize;
-    let funcname_offset = read_uintptr(tab, 8 + 2 * ps, ptrsize)? as usize;
-    let pcln_offset = read_uintptr(tab, 8 + 6 * ps, ptrsize)? as usize;
-    let entry_size = 2 * ps;
+    let funcname_offset =
+        read_uintptr(tab, 8usize.checked_add(ps.checked_mul(2)?)?, ptrsize)? as usize;
+    let pcln_offset = read_uintptr(tab, 8usize.checked_add(ps.checked_mul(6)?)?, ptrsize)? as usize;
+    let entry_size = ps.checked_mul(2)?;
     let functab_off = pcln_offset;
     for i in 0..nfunc as usize {
-        let row = functab_off + i * entry_size;
-        let entry_va = read_uintptr(tab, row, ptrsize)?;
-        let funcoff = read_uintptr(tab, row + ps, ptrsize)? as usize;
-        let nameoff = read_u32(tab, funcoff + ps)? as usize;
-        if let Some(name) = read_cstr(raw, tab_file_offset + funcname_offset + nameoff)
+        let Some(row) = i
+            .checked_mul(entry_size)
+            .and_then(|x| x.checked_add(functab_off))
+        else {
+            return Some(());
+        };
+        let Some(entry_va) = read_uintptr(tab, row, ptrsize) else {
+            continue;
+        };
+        let Some(funcoff_pos) = row.checked_add(ps) else {
+            continue;
+        };
+        let funcoff = match read_uintptr(tab, funcoff_pos, ptrsize) {
+            Some(f) => f as usize,
+            None => continue,
+        };
+        let Some(nameoff_pos) = funcoff.checked_add(ps) else {
+            continue;
+        };
+        let nameoff = match read_u32(tab, nameoff_pos) {
+            Some(n) => n as usize,
+            None => continue,
+        };
+        let Some(name_file_off) = tab_file_offset
+            .checked_add(funcname_offset)
+            .and_then(|x| x.checked_add(nameoff))
+        else {
+            continue;
+        };
+        if let Some(name) = read_cstr(raw, name_file_off)
             && !name.is_empty()
         {
             out.insert(entry_va, name);
@@ -273,28 +325,59 @@ fn parse_v118(
     out: &mut HashMap<u64, String>,
 ) -> Option<()> {
     let ptrsize = *tab.get(7)?;
+    let ps = ptrsize as usize;
     let nfunc = read_uintptr(tab, 8, ptrsize)?;
     if nfunc == 0 || nfunc > 1_000_000 {
         return None;
     }
-    let ps = ptrsize as usize;
-    let mut text_start = read_uintptr(tab, 8 + 2 * ps, ptrsize)?;
+    let mut text_start = read_uintptr(tab, 8usize.checked_add(ps.checked_mul(2)?)?, ptrsize)?;
     if text_start == 0 {
         text_start = text_section_va_fallback;
     }
-    let funcname_offset = read_uintptr(tab, 8 + 3 * ps, ptrsize)? as usize;
-    let pcln_offset = read_uintptr(tab, 8 + 7 * ps, ptrsize)? as usize;
+    let funcname_offset =
+        read_uintptr(tab, 8usize.checked_add(ps.checked_mul(3)?)?, ptrsize)? as usize;
+    let pcln_offset = read_uintptr(tab, 8usize.checked_add(ps.checked_mul(7)?)?, ptrsize)? as usize;
     // v1.18+ functab entries are fixed 8 bytes (two u32s) regardless of ptrsize.
     let entry_size = 8usize;
     for i in 0..nfunc as usize {
-        let row = pcln_offset + i * entry_size;
-        let entry_off = read_u32(tab, row)? as u64;
-        let funcoff = read_u32(tab, row + 4)? as usize;
-        // funcoff is the offset into pctab (which sits after the functab).
-        // The _func struct layout: +0 entry_off (u32), +4 nameoff (u32).
-        let nameoff = read_u32(tab, pcln_offset + funcoff + 4)? as usize;
-        let entry_va = text_start.checked_add(entry_off)?;
-        if let Some(name) = read_cstr(raw, tab_file_offset + funcname_offset + nameoff)
+        let Some(row) = i
+            .checked_mul(entry_size)
+            .and_then(|x| x.checked_add(pcln_offset))
+        else {
+            return Some(());
+        };
+        let Some(entry_off) = read_u32(tab, row).map(|v| v as u64) else {
+            continue;
+        };
+        let Some(funcoff_pos) = row.checked_add(4) else {
+            continue;
+        };
+        let funcoff = match read_u32(tab, funcoff_pos) {
+            Some(f) => f as usize,
+            None => continue,
+        };
+        // _func struct: +0 entry_off (u32), +4 nameoff (u32). pctab sits
+        // after the functab so the absolute offset is pcln_offset + funcoff + 4.
+        let Some(nameoff_pos) = pcln_offset
+            .checked_add(funcoff)
+            .and_then(|x| x.checked_add(4))
+        else {
+            continue;
+        };
+        let nameoff = match read_u32(tab, nameoff_pos) {
+            Some(n) => n as usize,
+            None => continue,
+        };
+        let Some(entry_va) = text_start.checked_add(entry_off) else {
+            continue;
+        };
+        let Some(name_file_off) = tab_file_offset
+            .checked_add(funcname_offset)
+            .and_then(|x| x.checked_add(nameoff))
+        else {
+            continue;
+        };
+        if let Some(name) = read_cstr(raw, name_file_off)
             && !name.is_empty()
         {
             out.insert(entry_va, name);

@@ -123,16 +123,21 @@ pub fn map_binary(binary: &[u8], base_addr: u64) -> Result<Vec<SectionMap>> {
         let Some(va_end) = seg.vmaddr.checked_add(seg.vmsize) else {
             continue;
         };
-        let file_offset = seg.fileoff as usize;
-        let declared_size = seg.filesize as usize;
-        let file_size = if file_offset
-            .checked_add(declared_size)
-            .map(|e| e <= binary.len())
-            .unwrap_or(false)
-        {
-            declared_size
-        } else {
-            binary.len().saturating_sub(file_offset)
+        // 0.5.1 security: u64 -> usize casts on attacker-controlled
+        // fileoff / filesize. 32-bit hosts would silently truncate;
+        // try_from rejects oversized values instead.
+        let Ok(file_offset) = usize::try_from(seg.fileoff) else {
+            continue;
+        };
+        let Ok(declared_size) = usize::try_from(seg.filesize) else {
+            continue;
+        };
+        // Clamp declared_size to what the file actually contains. A
+        // malformed Mach-O that declares filesize past the buffer end
+        // would otherwise let downstream bytes_at over-read.
+        let file_size = match file_offset.checked_add(declared_size) {
+            Some(end) if end <= binary.len() => declared_size,
+            _ => binary.len().saturating_sub(file_offset),
         };
         section_maps.push(SectionMap {
             va_start: seg.vmaddr,
@@ -162,7 +167,11 @@ pub fn get_sections(mach: &MachO) -> Vec<(String, u64, usize)> {
                     seg_name.trim_end_matches('\0'),
                     sect_name.trim_end_matches('\0')
                 );
-                out.push((combined, sect.addr, sect.size as usize));
+                // 0.5.1: u64 -> usize via try_from; skip oversized
+                // sections rather than truncating on 32-bit hosts.
+                if let Ok(size) = usize::try_from(sect.size) {
+                    out.push((combined, sect.addr, size));
+                }
             }
         }
     }
@@ -179,7 +188,13 @@ pub fn get_imports(mach: &MachO) -> Vec<(String, String, usize)> {
     };
     imports
         .iter()
-        .map(|i| (i.dylib.to_string(), i.name.to_string(), i.offset as usize))
+        .filter_map(|i| {
+            // 0.5.1: usize::try_from rejects oversized offsets on
+            // 32-bit hosts rather than silently truncating.
+            usize::try_from(i.offset)
+                .ok()
+                .map(|off| (i.dylib.to_string(), i.name.to_string(), off))
+        })
         .collect()
 }
 
@@ -193,7 +208,11 @@ pub fn get_exports(mach: &MachO) -> Vec<(String, usize, Option<String>)> {
     };
     exports
         .iter()
-        .map(|e| (e.name.clone(), e.offset as usize, None))
+        .filter_map(|e| {
+            usize::try_from(e.offset)
+                .ok()
+                .map(|off| (e.name.clone(), off, None))
+        })
         .collect()
 }
 
