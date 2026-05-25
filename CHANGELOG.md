@@ -5,6 +5,49 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-05-25 — Hardening + Mach-O polish (additive)
+
+Patch release. No API changes from 0.5.0. Bundles the post-0.5.0
+security audit fixes with two Mach-O quality-of-life improvements.
+
+### Security (post-0.5.0 audit)
+
+- **`pclntab.rs`: unchecked offset arithmetic on attacker-controlled
+  fields.** The Go pclntab parser took `funcoff` / `nameoff` /
+  `pcln_offset` values directly from the on-disk runtime table and
+  added them with `+`. On malformed Go binaries this would panic in
+  debug builds and silently wrap in release, leading to garbage
+  symbols. All offset arithmetic in `parse_v12` / `parse_v116` /
+  `parse_v118` now uses `checked_add` / `checked_mul` and skips
+  individual bad entries rather than panicking or corrupting.
+- **`macho.rs`: `u64 as usize` truncation on 32-bit hosts.** Casts on
+  `seg.fileoff`, `seg.filesize`, `sect.size`, `import.offset`,
+  `export.offset` would silently truncate to wrong values on 32-bit
+  targets. Replaced with `usize::try_from`; oversized values skip the
+  entry rather than corrupt.
+
+### Fixed — Mach-O discovery
+
+- **`get_code_areas` restricted to instruction-bearing sections.** Was
+  including the entire `__TEXT` segment (load-commands header + all
+  sections), producing a junk 1-insn "function" at `base_addr`. Now
+  iterates sections and accepts only those with
+  `S_ATTR_PURE_INSTRUCTIONS` / `S_ATTR_SOME_INSTRUCTIONS` set, or
+  whose `sectname` is `__text` / `__stubs` / `__stub_helper` /
+  `__symbol_stub`. Falls back to whole-segment when section parsing
+  fails (corrupted / stripped binaries).
+- **Apple-clang x86_64 prologue patterns added** to
+  `DEFAULT_PROLOGUES`. The pre-0.5.1 set was MSVC + GCC / clang-Linux
+  flavoured and missed most Apple-built binaries (which is why
+  `/bin/ls` returned zero functions in 0.5.0). Added:
+  - `55 48 89 E5` (push rbp; mov rbp, rsp) — classic x86_64 prologue.
+  - `48 81 EC ?? ?? ?? ??` (sub rsp, imm32) — large-frame leaf
+    functions.
+  - `48 89 6C 24 ??` (mov [rsp+disp8], rbp) — alternate save.
+  - `41 56 53` (push r14; push rbx).
+  - `41 55 41 54` (push r13; push r12).
+  - `53 48 83 EC` (push rbx; sub rsp, ...).
+
 ## [0.5.0] — 2026-05-25 — Breaking-change batch
 
 Four interlocking API breaks shipped as one coherent major bump so

@@ -43,6 +43,16 @@ static DEFAULT_PROLOGUES: LazyLock<Vec<BytesRegex>> = LazyLock::new(|| {
         BytesRegex::new(r"(?-u)\x48\x89\x5C\x24[\S\s]").unwrap(), // mov [rsp+disp8], rbx
         BytesRegex::new(r"(?-u)\x48\x83\xEC[\S\s]").unwrap(),     // sub rsp, imm8
         BytesRegex::new(r"(?-u)\x41\x57\x41\x56").unwrap(),       // push r15; push r14
+        // 0.5.2 — Apple-clang x86_64 patterns that previously slipped
+        // through (smda-rs missed most /bin/ls-style binaries because of
+        // these absences). All very specific multi-byte sequences so the
+        // false-positive rate stays low.
+        BytesRegex::new(r"(?-u)\x55\x48\x89\xE5").unwrap(), // push rbp; mov rbp, rsp
+        BytesRegex::new(r"(?-u)\x48\x81\xEC[\S\s]{4}").unwrap(), // sub rsp, imm32 (large frame)
+        BytesRegex::new(r"(?-u)\x48\x89\x6C\x24[\S\s]").unwrap(), // mov [rsp+disp8], rbp
+        BytesRegex::new(r"(?-u)\x41\x56\x53").unwrap(),     // push r14; push rbx
+        BytesRegex::new(r"(?-u)\x41\x55\x41\x54").unwrap(), // push r13; push r12
+        BytesRegex::new(r"(?-u)\x53\x48\x83\xEC").unwrap(), // push rbx; sub rsp, ...
     ]
 });
 static REF_CANDIDATE: LazyLock<BytesRegex> =

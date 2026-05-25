@@ -80,25 +80,58 @@ pub fn get_bitness(mach: &MachO) -> u32 {
     if mach.is_64 { 64 } else { 32 }
 }
 
-/// Code-area extents — (va_start, va_end) of every segment that
-/// either (a) carries VM_PROT_EXECUTE in `initprot`, or (b) is named
-/// `__TEXT` / starts with `__TEXT`. The name fallback catches binaries
-/// where the protection bits aren't set as we'd expect (goblin's field
-/// layout for `initprot` varies between Mach-O dialects).
+/// Mach-O section-flag attributes (`section_64.flags` high 24 bits).
+/// Bit 31 = `S_ATTR_PURE_INSTRUCTIONS`, bit 10 = `S_ATTR_SOME_INSTRUCTIONS`.
 const VM_PROT_EXECUTE: u32 = 0x04;
+const S_ATTR_PURE_INSTRUCTIONS: u32 = 0x8000_0000;
+const S_ATTR_SOME_INSTRUCTIONS: u32 = 0x0000_0400;
 
+/// Code-area extents — (va_start, va_end) of every section that
+/// actually holds instructions. 0.5.2 tightened this from "the entire
+/// executable segment" to "sections with `S_ATTR_PURE_INSTRUCTIONS` /
+/// `S_ATTR_SOME_INSTRUCTIONS` flags, or whose sectname is a known
+/// code-bearing one (`__text`, `__stubs`, `__stub_helper`)". The pre-
+/// 0.5.2 behaviour included the `__TEXT` segment's load-commands
+/// header bytes, which produced a junk 1-insn "function" at base_addr.
+///
+/// Falls back to the whole segment (old behaviour) only when the
+/// segment exposes no sections that goblin could parse — necessary for
+/// raw / stripped binaries where the section table is gone.
 #[must_use]
 pub fn get_code_areas(mach: &MachO) -> Vec<(u64, u64)> {
     let mut areas = Vec::new();
     for seg in &mach.segments {
-        let name = std::str::from_utf8(&seg.segname).unwrap_or("");
-        let name = name.trim_end_matches('\0');
-        let is_text = name.starts_with("__TEXT");
-        let is_exec = seg.initprot & VM_PROT_EXECUTE != 0;
-        if !(is_text || is_exec) {
+        let seg_name = std::str::from_utf8(&seg.segname).unwrap_or("");
+        let seg_name = seg_name.trim_end_matches('\0');
+        let is_text_seg = seg_name.starts_with("__TEXT");
+        let is_exec_seg = seg.initprot & VM_PROT_EXECUTE != 0;
+        if !(is_text_seg || is_exec_seg) {
             continue;
         }
-        if let Some(end) = seg.vmaddr.checked_add(seg.vmsize) {
+        let mut added_any = false;
+        if let Ok(sections) = seg.sections() {
+            for (sect, _data) in sections {
+                let sect_name = std::str::from_utf8(&sect.sectname).unwrap_or("");
+                let sect_name = sect_name.trim_end_matches('\0');
+                let has_instr_flag =
+                    sect.flags & (S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS) != 0;
+                let is_code_section = matches!(
+                    sect_name,
+                    "__text" | "__stubs" | "__stub_helper" | "__symbol_stub"
+                );
+                if !(has_instr_flag || is_code_section) {
+                    continue;
+                }
+                if let Some(end) = sect.addr.checked_add(sect.size) {
+                    areas.push((sect.addr, end));
+                    added_any = true;
+                }
+            }
+        }
+        // Fallback when the segment has no parsed sections (corrupted /
+        // stripped binary): include the whole segment so we don't lose
+        // discovery entirely.
+        if !added_any && let Some(end) = seg.vmaddr.checked_add(seg.vmsize) {
             areas.push((seg.vmaddr, end));
         }
     }
