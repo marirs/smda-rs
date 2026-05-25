@@ -3,6 +3,9 @@
 #[macro_use]
 extern crate maplit;
 
+mod delphi;
+mod demangle;
+mod dwarf;
 pub mod elf;
 pub mod function;
 mod function_analysis_state;
@@ -13,6 +16,7 @@ mod jump_table_analyser;
 mod label_provider;
 mod label_providers;
 mod mnemonic_tf_idf;
+mod pclntab;
 mod pe;
 pub mod report;
 mod statistics;
@@ -905,6 +909,105 @@ impl<'a> Disassembler<'a> {
         Self::parse_inner(raw, path, high_accuracy, resolve_tailcalls, None)
     }
 
+    /// (0.4.2 N11) Raw-buffer entry point — bypass PE / ELF header parsing.
+    /// Use this for shellcode, unpacked modules, memory dumps, or any byte
+    /// blob without a recognised executable header.
+    ///
+    /// The whole buffer is treated as one section mapped at `base_addr`,
+    /// with no imports / exports / code-area subdivision. The returned
+    /// report has `binary_info.is_buffer = true` and `file_format = ELF`
+    /// as a least-surprise default (a dedicated `FileFormat::Buffer`
+    /// variant would be a breaking change reserved for 0.5.0). Consumers
+    /// should check `is_buffer` rather than relying on the format tag.
+    ///
+    /// `bitness` must be 32 or 64. `base_addr` is the virtual address the
+    /// buffer maps to — defaults are sensible at 0 if the caller has no
+    /// preference. Mirrors `disassembleBuffer` in the Python upstream.
+    pub fn parse_buffer<'b>(
+        raw: &'b [u8],
+        base_addr: u64,
+        bitness: u32,
+        high_accuracy: bool,
+        resolve_tailcalls: bool,
+    ) -> Result<DisassemblyReport<'b>> {
+        Self::parse_buffer_inner(
+            raw,
+            base_addr,
+            bitness,
+            high_accuracy,
+            resolve_tailcalls,
+            None,
+        )
+    }
+
+    /// (0.4.2 N11) `parse_buffer` with a wall-clock analysis timeout.
+    pub fn parse_buffer_with_timeout<'b>(
+        raw: &'b [u8],
+        base_addr: u64,
+        bitness: u32,
+        high_accuracy: bool,
+        resolve_tailcalls: bool,
+        timeout: std::time::Duration,
+    ) -> Result<DisassemblyReport<'b>> {
+        Self::parse_buffer_inner(
+            raw,
+            base_addr,
+            bitness,
+            high_accuracy,
+            resolve_tailcalls,
+            Some(timeout),
+        )
+    }
+
+    fn parse_buffer_inner<'b>(
+        raw: &'b [u8],
+        base_addr: u64,
+        bitness: u32,
+        high_accuracy: bool,
+        resolve_tailcalls: bool,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<DisassemblyReport<'b>> {
+        if !matches!(bitness, 32 | 64) {
+            return Err(Error::MalformedInputError(
+                "parse_buffer: bitness must be 32 or 64",
+                bitness as u64,
+                0,
+            ));
+        }
+        let len = raw.len();
+        let va_end = base_addr
+            .checked_add(len as u64)
+            .ok_or(Error::IntegerOverflow(
+                "parse_buffer: base_addr + len",
+                base_addr,
+                len as u64,
+            ))?;
+        let mut binary_info = BinaryInfo::from_buffer(raw)?;
+        binary_info.is_buffer = true;
+        binary_info.file_format = FileFormat::ELF; // see doc-comment caveat
+        binary_info.base_addr = base_addr;
+        binary_info.bitness = bitness;
+        binary_info.entry_point = base_addr;
+        binary_info.file_architecture = match bitness {
+            64 => FileArchitecture::AMD64,
+            _ => FileArchitecture::I386,
+        };
+        binary_info.code_areas = vec![(base_addr, va_end)];
+        binary_info.sections = vec![("raw".to_string(), base_addr, len)];
+        binary_info.section_maps = vec![SectionMap {
+            va_start: base_addr,
+            va_end,
+            file_offset: 0,
+            file_size: len,
+        }];
+        binary_info.binary_size = binary_info.compute_binary_size();
+        let mut disassembler = Disassembler::with_binary(binary_info)?;
+        disassembler.analysis_timeout = timeout;
+        disassembler.analysis_started = Some(std::time::Instant::now());
+        disassembler.analyse_buffer(high_accuracy, resolve_tailcalls)?;
+        DisassemblyReport::new(&mut disassembler.disassembly)
+    }
+
     fn parse_inner<'b>(
         raw: &'b [u8],
         path: Option<&str>,
@@ -994,6 +1097,66 @@ impl<'a> Disassembler<'a> {
         let mut disassembler = Disassembler::with_binary(binary_info)?;
         disassembler.analysis_timeout = timeout;
         disassembler.analysis_started = Some(std::time::Instant::now());
+
+        // 0.4.2 (N1): Go pclntab parse — recover function names from the
+        // runtime's PC-line-table blob, if present. Names are seeded into
+        // `function_symbols` so the analyser picks them up and the report
+        // surfaces them. Addresses are also pulled into the candidate
+        // scanner via `get_symbol_candidates`.
+        {
+            let bi = &disassembler.disassembly.binary_info;
+            // For v1.18 / v1.20 we need the .text section VA as the textStart
+            // fallback. Pick the first executable section.
+            let text_va = bi
+                .sections
+                .iter()
+                .find(|(n, _, _)| n == ".text" || n == ".init" || n == "__text")
+                .map(|(_, va, _)| *va)
+                .unwrap_or(bi.base_addr);
+            let go = pclntab::parse(bi.raw_data, text_va);
+            if !go.func_names.is_empty() {
+                for (addr, name) in go.func_names {
+                    disassembler.disassembly.function_symbols.insert(addr, name);
+                }
+            }
+        }
+
+        // 0.4.2 (MinGW DWARF): for PE binaries, walk .debug_info /
+        // .debug_str if present and recover function names from
+        // DW_TAG_subprogram DIEs. MinGW-GCC writes these by default;
+        // MSVC does not (it uses PDB sidecars). Silent no-op when no
+        // DWARF sections are present.
+        if disassembler.disassembly.binary_info.file_format == FileFormat::PE {
+            let raw = disassembler.disassembly.binary_info.raw_data;
+            let base = disassembler.disassembly.binary_info.base_addr;
+            let dwarf_syms = dwarf::parse_pe(raw, base);
+            for (addr, name) in dwarf_syms {
+                // Don't overwrite a Go pclntab name (Go binaries are very
+                // unlikely to also carry DWARF, but defensive).
+                disassembler
+                    .disassembly
+                    .function_symbols
+                    .entry(addr)
+                    .or_insert(name);
+            }
+        }
+
+        // 0.4.2: Delphi VMT scanner — detects Delphi-compiled binaries by
+        // their self-reference vmtSelfPtr pattern, recovers class names
+        // from each VMT's Pascal short string, and seeds the user
+        // virtual method table as `ClassName::vmt_<idx>` symbols. PE
+        // and ELF both. Silent no-op on non-Delphi binaries.
+        {
+            let delphi_methods = delphi::parse(&disassembler.disassembly.binary_info);
+            for (addr, name) in delphi_methods {
+                disassembler
+                    .disassembly
+                    .function_symbols
+                    .entry(addr)
+                    .or_insert(name);
+            }
+        }
+
         disassembler.analyse_buffer(high_accuracy, resolve_tailcalls)?;
         DisassemblyReport::new(&mut disassembler.disassembly)
     }
@@ -1007,6 +1170,12 @@ impl<'a> Disassembler<'a> {
             for s in (provider.get_functions_symbols()?).keys() {
                 symbol_offsets.insert(*s);
             }
+        }
+        // 0.4.2: pre-populated function_symbols (Go pclntab, MinGW DWARF,
+        // Delphi VMT) are authoritative function-start hints — make sure
+        // their addresses are picked up as candidates.
+        for s in self.disassembly.function_symbols.keys() {
+            symbol_offsets.insert(*s);
         }
         // 0.4.1 (M4): seed candidates from the PE export directory. The
         // export RVAs sit on BinaryInfo.exports — they were collected at

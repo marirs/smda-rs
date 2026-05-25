@@ -5,6 +5,100 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-05-25 — Analysis helpers + raw-buffer entry (additive)
+
+Additive-only release. No breaking changes from 0.4.1; consumers can
+bump `smda = "0.4"` and pick up everything below without source edits.
+
+### Added — Function-level analysis helpers
+
+- **`Function::dominator_tree()` / `Function::nesting_depth()`** (N15).
+  Iterative dataflow dominator computation over `Function.blockrefs`;
+  `nesting_depth()` returns the maximum loop-nest depth per block by
+  detecting back-edges against the dominator relation. Mirrors
+  `SmdaFunction.getBlockDominatorTree` / `getNestingDepth` in the Python
+  upstream. Per-function CFGs are small (typically < 100 blocks) so the
+  iterative algorithm is fast enough; no Lengauer-Tarjan needed.
+- **`Function::pic_hash()` / `Function::opcode_hash()`** (N16).
+  Position-independent SHA-256 (first 8 bytes, little-endian `u64`)
+  over the function's instruction stream. PIC hash emits a canonical
+  structural signature per instruction — iced `Code` variant, operand
+  kinds, register operands, memory base/index/scale — and deliberately
+  omits memory displacements, RIP-relative offsets, and near-branch
+  targets. Immediate values are kept (they often carry semantic
+  fingerprints: syscall numbers, constants, string lengths). Opcode
+  hash hashes only the `Mnemonic` sequence — broadest clustering
+  granularity. Block iteration is sorted by VA for HashMap-order
+  determinism. Used by malware-clustering pipelines (capa-rs
+  downstream, smda's own n-gram db). Mirrors `SmdaFunction.getPicHash`
+  / `getOpcHash` upstream.
+
+### Added — raw memory-dump entry point
+
+- **`Disassembler::parse_buffer(raw, base_addr, bitness, ...)`** (N11).
+  Bypass PE / ELF header parsing for shellcode / memory dumps / unpacked
+  modules where there is no file format wrapper. Synthesises a single
+  `SectionMap` covering the entire buffer at `base_addr`; sets
+  `BinaryInfo.is_buffer = true`. Mirrors `disassembleBuffer` upstream.
+
+### Added — symbol resolvers
+
+- **Rust symbol demangling** (N3). New `demangle` module wraps
+  `rustc-demangle` for legacy (`_ZN…`) and v0 (`_R…`) Rust mangling.
+  Wired into the ELF symbol provider via `parse_symbols`; non-Rust
+  names round-trip unchanged. DWARF names also flow through it
+  (MinGW + Rust toolchains gain it transparently).
+- **MinGW DWARF symbol resolver**. New `dwarf` module walks
+  `.debug_info` / `.debug_abbrev` / `.debug_str` on PE files compiled
+  with MinGW-GCC and recovers `(low_pc_va, name)` pairs from
+  `DW_TAG_subprogram` DIEs. Prefers `DW_AT_linkage_name` over
+  `DW_AT_name`; handles both absolute-VA (newer MinGW) and RVA
+  (older MinGW) `low_pc` encodings. Silent no-op when no debug
+  sections are present. Uses `gimli 0.32`.
+
+### Added — function discovery
+
+- **PE exception-handler reliability**. The 0.4.1 `.pdata` sweep now
+  validates the full UNWIND_INFO chain (version field, in-range
+  `UnwindInfoAddress`, sane `CountOfCodes`) before accepting a
+  `BeginAddress` as a function candidate. Drops false-positive seeds
+  from malformed `.pdata` in packed binaries.
+- **Go `pclntab` parser**. New `pclntab` module detects Go binaries via
+  the runtime magic (`0xFFFFFFFB` v1.2, `0xFFFFFFFA` v1.16, `0xFFFFFFF1`
+  v1.18, `0xFFFFFFF0` v1.20), parses the function table, and seeds
+  `function_symbols` + candidate scanner with Go function names.
+  Massive name-recovery win on stripped Go binaries. Conservative
+  parser: any bounds / sanity check failure skips the entry rather
+  than failing the analysis.
+- **Delphi VMT scanner**. New `delphi` module scans every readable
+  section for the `vmtSelfPtr` self-reference signature (32-bit and
+  64-bit Delphi), recovers class names from each VMT's Pascal short
+  string, and walks the user-virtual-method table to seed method
+  addresses as `ClassName::vmt_<index>` symbols. Conservative class-name
+  filter (printable ASCII, length ≤ 100, well-formed Pascal short
+  string) drops false-positive hits; vtable walk stops on null
+  pointer, out-of-image pointer, or after 256 methods. Silent no-op
+  on non-Delphi binaries.
+
+### Internal — symbol pipeline
+
+- `function_analysis_state::finalize_analysis` no longer wipes
+  pre-populated `function_symbols` entries with an empty `state.label`
+  (the label-provider `get_symbol` path is unimplemented today, so the
+  blind insert was clobbering Go pclntab and MinGW DWARF names that
+  parse_inner had seeded). The insert is now guarded:
+  `if !label.is_empty() || !function_symbols.contains_key(...)`.
+- `get_symbol_candidates` now also pulls addresses from pre-populated
+  `function_symbols`, so seeded names become candidate function starts
+  in the scanner.
+
+### Dependencies
+
+- Added `rustc-demangle = "0.1"` (tiny, no transitive deps).
+- Added `gimli = { version = "0.32", default-features = false, features = ["read", "std"] }`
+  for the MinGW DWARF parser. Pure Rust.
+
+
 ## [0.4.1] — 2026-05-24 — Upstream parity (additive)
 
 Closes the bulk of the Python-upstream feature gap that 0.4.0 left

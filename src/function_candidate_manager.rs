@@ -300,6 +300,24 @@ impl FunctionCandidateManager {
         Ok(identified_alignment)
     }
 
+    /// PE x64 `.pdata` sweep — seeds the candidate scanner with function
+    /// starts published by the exception-handler runtime.
+    ///
+    /// 0.4.2 (M3) tightens validation: each `RUNTIME_FUNCTION` entry now
+    /// has its `EndAddress`, `UnwindInfoAddress`, and the pointed-at
+    /// `UNWIND_INFO` header checked before the `BeginAddress` is accepted
+    /// as a candidate. Drops false-positive seeds from packed or
+    /// partially-overwritten `.pdata` sections that the 0.4.1 blind sweep
+    /// accepted unconditionally.
+    ///
+    /// Validation rules (all must hold):
+    /// - `EndAddress > BeginAddress`
+    /// - `EndAddress - BeginAddress < 16 MiB` (anything larger is almost
+    ///   certainly a junk entry rather than a real function range)
+    /// - `UnwindInfoAddress` resolves to a VA inside the image
+    /// - The `UNWIND_INFO` first byte's low 3 bits (Version) is 1 or 2
+    /// - The implied UNWIND_INFO record (4-byte header + `2 * CountOfCodes`
+    ///   bytes) fits inside the image
     fn locate_exception_handler_candidates(
         &mut self,
         disassembly: &DisassemblyResult,
@@ -308,29 +326,57 @@ impl FunctionCandidateManager {
             return Ok(());
         }
         let base_addr = disassembly.binary_info.base_addr;
-        for (section_name, section_va_start, section_va_end) in
-            disassembly.binary_info.get_sections()?
-        {
+        let bi = &disassembly.binary_info;
+        const MAX_FUNC_SPAN: u64 = 16 * 1024 * 1024; // 16 MiB
+        for (section_name, section_va_start, section_va_end) in bi.get_sections()? {
             if section_name != ".pdata" {
                 continue;
             }
             let mut va = section_va_start;
-            while va.checked_add(4).is_some_and(|e| e <= section_va_end) {
-                // bytes_at returns Err if the .pdata section is malformed
-                // or extends past the on-disk bytes — break in that case.
-                let Ok(packed) = disassembly.binary_info.bytes_at(va, 4) else {
+            while va.checked_add(12).is_some_and(|e| e <= section_va_end) {
+                let Ok(packed) = bi.bytes_at(va, 12) else {
                     break;
                 };
-                let packed_dword: [u8; 4] = packed.try_into()?;
-                let rva_function_candidate = u32::from_le_bytes(packed_dword) as u64;
-                if let Some(addr) = base_addr.checked_add(rva_function_candidate) {
-                    self.add_exception_candidate(addr, disassembly)?;
-                }
-                // RUNTIME_FUNCTION entries are 12 bytes; advance.
+                let begin_rva =
+                    u32::from_le_bytes(packed[0..4].try_into().unwrap_or([0; 4])) as u64;
+                let end_rva = u32::from_le_bytes(packed[4..8].try_into().unwrap_or([0; 4])) as u64;
+                let unwind_rva =
+                    u32::from_le_bytes(packed[8..12].try_into().unwrap_or([0; 4])) as u64;
+
+                // Advance for the next iteration before any continue so we
+                // make progress even when validation rejects this entry.
                 let Some(next) = va.checked_add(12) else {
                     break;
                 };
                 va = next;
+
+                if begin_rva == 0 {
+                    // All-zero terminator entries are common at the end of .pdata.
+                    continue;
+                }
+                if end_rva <= begin_rva || (end_rva - begin_rva) > MAX_FUNC_SPAN {
+                    continue;
+                }
+                let Some(unwind_va) = base_addr.checked_add(unwind_rva) else {
+                    continue;
+                };
+                let Ok(unwind_hdr) = bi.bytes_at(unwind_va, 4) else {
+                    continue;
+                };
+                let version = unwind_hdr[0] & 0x07;
+                if version != 1 && version != 2 {
+                    continue;
+                }
+                // CountOfCodes is a u8, so unwind_total fits in u32
+                // trivially: max 4 + 255 * 2 = 514 bytes.
+                let count_of_codes = unwind_hdr[2] as u32;
+                let unwind_total = 4u32.saturating_add(count_of_codes.saturating_mul(2));
+                if bi.bytes_at(unwind_va, unwind_total).is_err() {
+                    continue;
+                }
+                if let Some(addr) = base_addr.checked_add(begin_rva) {
+                    self.add_exception_candidate(addr, disassembly)?;
+                }
             }
         }
         Ok(())

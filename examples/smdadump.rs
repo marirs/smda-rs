@@ -78,5 +78,17 @@ fn main() -> ExitCode {
         );
     }
 
+    // Show how many functions got a name (Go pclntab, MinGW DWARF, ELF
+    // symbols, Delphi VMT) plus a few examples.
+    let named: Vec<(&u64, &smda::function::Function)> = sorted
+        .iter()
+        .filter(|(_, f)| !f.function_name().is_empty())
+        .map(|(a, f)| (*a, *f))
+        .collect();
+    println!("--- named functions: {} ---", named.len());
+    for (addr, func) in named.iter().take(10) {
+        println!("  0x{:08x}  {}", addr, func.function_name());
+    }
+
     ExitCode::SUCCESS
 }

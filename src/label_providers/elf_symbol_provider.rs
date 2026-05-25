@@ -1,4 +1,4 @@
-use crate::{BinaryInfo, Result};
+use crate::{BinaryInfo, Result, demangle};
 
 #[derive(Debug)]
 pub struct ElfSymbolProvider {
@@ -69,9 +69,11 @@ impl ElfSymbolProvider {
     ) -> Result<()> {
         for symbol in symbols {
             if symbol.is_function() && symbol.st_value != 0 {
-                let func_name = strtab.get_at(symbol.st_name).unwrap_or("");
-                self.func_symbols
-                    .insert(symbol.st_value, func_name.to_string());
+                let raw = strtab.get_at(symbol.st_name).unwrap_or("");
+                // 0.4.2 (N3): demangle Rust-mangled symbols in place. Non-Rust
+                // names pass through unchanged.
+                let func_name = demangle::maybe_demangle(raw);
+                self.func_symbols.insert(symbol.st_value, func_name);
             }
         }
         Ok(())

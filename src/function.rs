@@ -387,6 +387,15 @@ impl Function {
         Ok(self.outrefs.values().map(Vec::len).sum())
     }
 
+    /// (0.4.2) Symbolic function name — populated from Go pclntab, MinGW
+    /// DWARF, Rust-demangled ELF symbols, Delphi VMT, or any other
+    /// symbol source wired into `function_symbols`. Returns `""` when
+    /// no source recovered a name for this offset.
+    #[must_use]
+    pub fn function_name(&self) -> &str {
+        &self.function_name
+    }
+
     pub fn is_api_thunk(&self) -> Result<bool> {
         if self.get_num_instructions()? != 1 {
             return Ok(false);
@@ -399,6 +408,311 @@ impl Function {
             return Ok(false);
         }
         Ok(true)
+    }
+
+    // ---- 0.4.2 N15 — dominator tree + loop-nesting depth ------------------
+
+    /// (0.4.2 N15) Compute the immediate-dominator tree over this function's
+    /// CFG. Returns a map from each block VA to its immediate dominator VA.
+    /// The entry block (this function's `offset`) is omitted — it has no
+    /// dominator.
+    ///
+    /// Uses the iterative dataflow algorithm: O(N²·E) worst case, but
+    /// per-function CFGs are small (typically < 100 blocks) so it runs in
+    /// microseconds in practice. Mirrors `SmdaFunction.getBlockDominatorTree`
+    /// upstream.
+    ///
+    /// Unreachable blocks (those with no predecessors that aren't the entry)
+    /// are omitted from the returned map.
+    #[must_use]
+    pub fn dominator_tree(&self) -> HashMap<u64, u64> {
+        use std::collections::BTreeSet;
+        let entry = self.offset;
+        let all_blocks: Vec<u64> = self.blocks.keys().copied().collect();
+        if !self.blocks.contains_key(&entry) || all_blocks.len() <= 1 {
+            return HashMap::new();
+        }
+
+        // Predecessor map derived from blockrefs (block -> successors).
+        let mut preds: HashMap<u64, Vec<u64>> = HashMap::with_capacity(all_blocks.len());
+        for b in &all_blocks {
+            preds.insert(*b, Vec::new());
+        }
+        for (src, dsts) in &self.blockrefs {
+            for d in dsts {
+                if let Some(p) = preds.get_mut(d)
+                    && !p.contains(src)
+                {
+                    p.push(*src);
+                }
+            }
+        }
+
+        // dom(entry) = {entry}; dom(other) = all blocks.
+        let all_set: BTreeSet<u64> = all_blocks.iter().copied().collect();
+        let mut dom: HashMap<u64, BTreeSet<u64>> = HashMap::with_capacity(all_blocks.len());
+        let mut entry_only = BTreeSet::new();
+        entry_only.insert(entry);
+        dom.insert(entry, entry_only);
+        for b in &all_blocks {
+            if *b != entry {
+                dom.insert(*b, all_set.clone());
+            }
+        }
+
+        // Iterate to fixed point.
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for b in &all_blocks {
+                if *b == entry {
+                    continue;
+                }
+                let bp = match preds.get(b) {
+                    Some(p) if !p.is_empty() => p,
+                    _ => continue,
+                };
+                let mut new_dom: Option<BTreeSet<u64>> = None;
+                for p in bp {
+                    if let Some(dp) = dom.get(p) {
+                        match new_dom {
+                            None => new_dom = Some(dp.clone()),
+                            Some(ref mut nd) => {
+                                *nd = nd.intersection(dp).copied().collect();
+                            }
+                        }
+                    }
+                }
+                let mut nd = new_dom.unwrap_or_default();
+                nd.insert(*b);
+                if dom[b] != nd {
+                    dom.insert(*b, nd);
+                    changed = true;
+                }
+            }
+        }
+
+        // Extract immediate dominators: idom(B) is the dominator of B closest
+        // to B — equivalently the one with the largest dominator set.
+        let mut idom = HashMap::with_capacity(all_blocks.len().saturating_sub(1));
+        for b in &all_blocks {
+            if *b == entry {
+                continue;
+            }
+            // Skip blocks the iteration never reached (no predecessors).
+            if dom[b] == all_set {
+                continue;
+            }
+            let mut best: Option<(u64, usize)> = None;
+            for c in &dom[b] {
+                if c == b {
+                    continue;
+                }
+                let size = dom.get(c).map_or(0, |s| s.len());
+                if best.is_none_or(|(_, s)| size > s) {
+                    best = Some((*c, size));
+                }
+            }
+            if let Some((c, _)) = best {
+                idom.insert(*b, c);
+            }
+        }
+        idom
+    }
+
+    /// (0.4.2 N15) Compute the maximum loop-nesting depth for each block.
+    /// Returns a map from block VA to nesting depth. Blocks not in any loop
+    /// have depth 0; blocks in N nested loops have depth N. Mirrors
+    /// `SmdaFunction.getNestingDepth` upstream.
+    ///
+    /// A back-edge is an edge `(s, h)` where `h` dominates `s`. The natural
+    /// loop of a back-edge is `{h}` plus every block that can reach `s`
+    /// without going through `h`. Per-block depth is the count of natural
+    /// loops containing it.
+    #[must_use]
+    pub fn nesting_depth(&self) -> HashMap<u64, u32> {
+        use std::collections::HashSet;
+        let idom = self.dominator_tree();
+        let entry = self.offset;
+        let all_blocks: HashSet<u64> = self.blocks.keys().copied().collect();
+        let mut depth: HashMap<u64, u32> = all_blocks.iter().map(|b| (*b, 0u32)).collect();
+
+        // Does `dominator` dominate `block`?  Walk idom chain from `block`.
+        let dominates = |dominator: u64, block: u64| -> bool {
+            if dominator == block {
+                return true;
+            }
+            let mut cur = block;
+            // Bounded walk — idom forms a tree so this terminates at entry.
+            for _ in 0..self.blocks.len() {
+                let Some(&parent) = idom.get(&cur) else {
+                    // Reached the entry (no idom recorded) or an unreachable
+                    // block. dominator dominates iff dominator == entry.
+                    return dominator == entry && cur == entry;
+                };
+                if parent == dominator {
+                    return true;
+                }
+                if parent == cur {
+                    return false;
+                }
+                cur = parent;
+            }
+            false
+        };
+
+        // Collect back-edges.
+        let mut back_edges: Vec<(u64, u64)> = Vec::new();
+        for (src, dsts) in &self.blockrefs {
+            if !all_blocks.contains(src) {
+                continue;
+            }
+            for d in dsts {
+                if all_blocks.contains(d) && dominates(*d, *src) {
+                    back_edges.push((*src, *d));
+                }
+            }
+        }
+        if back_edges.is_empty() {
+            return depth;
+        }
+
+        // Predecessor map for reverse walks (loop discovery).
+        let mut preds: HashMap<u64, Vec<u64>> = HashMap::with_capacity(all_blocks.len());
+        for b in &all_blocks {
+            preds.insert(*b, Vec::new());
+        }
+        for (src, dsts) in &self.blockrefs {
+            for d in dsts {
+                if let Some(p) = preds.get_mut(d) {
+                    p.push(*src);
+                }
+            }
+        }
+
+        // For each back-edge, compute the natural loop and bump every member.
+        for (s, h) in back_edges {
+            let mut loop_blocks: HashSet<u64> = HashSet::new();
+            loop_blocks.insert(h);
+            if s != h {
+                let mut stack = vec![s];
+                loop_blocks.insert(s);
+                while let Some(b) = stack.pop() {
+                    if let Some(bp) = preds.get(&b) {
+                        for p in bp {
+                            if loop_blocks.insert(*p) {
+                                stack.push(*p);
+                            }
+                        }
+                    }
+                }
+            }
+            for b in loop_blocks {
+                if let Some(d) = depth.get_mut(&b) {
+                    *d += 1;
+                }
+            }
+        }
+        depth
+    }
+
+    // ---- 0.4.2 N16 — PIC hash + opcode hash -------------------------------
+
+    /// (0.4.2 N16) Position-independent hash of this function's instruction
+    /// stream — first 8 bytes of SHA-256 over a canonical structural
+    /// signature with displacements / branch targets zeroed. Stable across
+    /// relocation, useful for malware-clustering pipelines. Mirrors
+    /// `SmdaFunction.getPicHash` upstream.
+    ///
+    /// Per-instruction signature captures: iced `Code` (the precise
+    /// encoding variant), operand kinds, register operands, memory
+    /// base/index/scale. Memory displacements, RIP-relative offsets, and
+    /// near-branch targets are deliberately omitted (that's the "PIC"
+    /// part). Immediate values are kept — they often carry semantic
+    /// fingerprints (constants, syscall numbers, string lengths).
+    ///
+    /// Block iteration order is sorted by VA so the hash is deterministic
+    /// across HashMap iteration orders. Returns the first 8 bytes of the
+    /// SHA-256 digest interpreted as a little-endian `u64`.
+    #[must_use]
+    pub fn pic_hash(&self) -> u64 {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        let mut block_offsets: Vec<u64> = self.blocks.keys().copied().collect();
+        block_offsets.sort_unstable();
+        let mut buf = Vec::with_capacity(32);
+        for off in block_offsets {
+            let block = &self.blocks[&off];
+            for ins in block {
+                buf.clear();
+                Self::pic_signature_into(&ins.iced, &mut buf);
+                hasher.update(&buf);
+            }
+        }
+        let out = hasher.finalize();
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&out[..8]);
+        u64::from_le_bytes(bytes)
+    }
+
+    /// (0.4.2 N16) Mnemonic-only hash — broadest clustering granularity.
+    /// First 8 bytes of SHA-256 over the function's `Mnemonic` sequence.
+    /// Collides on any two instructions with the same mnemonic regardless
+    /// of operand kinds. Mirrors `SmdaFunction.getOpcHash` upstream.
+    #[must_use]
+    pub fn opcode_hash(&self) -> u64 {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        let mut block_offsets: Vec<u64> = self.blocks.keys().copied().collect();
+        block_offsets.sort_unstable();
+        for off in block_offsets {
+            let block = &self.blocks[&off];
+            for ins in block {
+                let m = ins.iced.mnemonic() as u32;
+                hasher.update(m.to_le_bytes());
+            }
+        }
+        let out = hasher.finalize();
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&out[..8]);
+        u64::from_le_bytes(bytes)
+    }
+
+    /// Internal — write the PIC signature of one decoded instruction into
+    /// `out`. See [`Function::pic_hash`] for the rationale.
+    fn pic_signature_into(iced: &iced_x86::Instruction, out: &mut Vec<u8>) {
+        out.extend_from_slice(&(iced.code() as u32).to_le_bytes());
+        let count = iced.op_count();
+        out.push(count as u8);
+        for i in 0..count {
+            let kind = iced.op_kind(i);
+            out.push(kind as u8);
+            match kind {
+                OpKind::Register => {
+                    out.extend_from_slice(&(iced.op_register(i) as u16).to_le_bytes());
+                }
+                OpKind::Memory => {
+                    out.extend_from_slice(&(iced.memory_base() as u16).to_le_bytes());
+                    out.extend_from_slice(&(iced.memory_index() as u16).to_le_bytes());
+                    out.push(iced.memory_index_scale() as u8);
+                    // Displacement intentionally omitted (PIC).
+                }
+                OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
+                    // Branch target intentionally omitted (PIC).
+                }
+                OpKind::Immediate8 => out.push(iced.immediate8()),
+                OpKind::Immediate16 => out.extend_from_slice(&iced.immediate16().to_le_bytes()),
+                OpKind::Immediate32 => out.extend_from_slice(&iced.immediate32().to_le_bytes()),
+                OpKind::Immediate64 => out.extend_from_slice(&iced.immediate64().to_le_bytes()),
+                OpKind::Immediate8to16
+                | OpKind::Immediate8to32
+                | OpKind::Immediate8to64
+                | OpKind::Immediate32to64 => {
+                    out.extend_from_slice(&iced.immediate(i).to_le_bytes());
+                }
+                _ => {}
+            }
+        }
     }
 }
 

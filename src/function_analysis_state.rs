@@ -305,9 +305,16 @@ impl FunctionAnalysisState {
                 fn_max = s.offset + s.length as u64;
             }
         }
-        disassembly
-            .function_symbols
-            .insert(self.start_addr, self.label.clone());
+        // 0.4.2 (N1): don't overwrite a pre-populated function symbol
+        // (e.g. a Go pclntab name) with an empty `label`. The label
+        // providers don't actually implement `get_symbol` yet, so
+        // `state.label` is almost always empty — a blind insert here
+        // would wipe out any name we'd seeded before analysis.
+        if !self.label.is_empty() || !disassembly.function_symbols.contains_key(&self.start_addr) {
+            disassembly
+                .function_symbols
+                .insert(self.start_addr, self.label.clone());
+        }
         disassembly
             .function_borders
             .insert(self.start_addr, (fn_min, fn_max));
