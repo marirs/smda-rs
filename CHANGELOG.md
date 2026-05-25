@@ -5,6 +5,101 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-05-24 — Upstream parity (additive)
+
+Closes the bulk of the Python-upstream feature gap that 0.4.0 left
+behind. All changes are additive — no breaking changes from 0.4.0, no
+new public types removed or renamed. Capa-rs and other downstream
+consumers can bump to `smda = "0.4"` and pick up everything below
+without any code changes.
+
+### Bug fix
+
+- **Tail-call analyser was a no-op.** `Disassembler::parse(..., resolve_tailcalls=true)`
+  did nothing in 0.3.x / 0.4.0 because `TailCallAnalyser::functions`
+  was never populated (see the historical `//TODO` in
+  `tail_call_analyser.rs:62`). `finalize_function` now correctly
+  inserts each completed `FunctionAnalysisState` into the intervals
+  table so `get_tailcalls` / `resolve_tailcalls` have data to work
+  with. `FunctionAnalysisState` gained a `#[derive(Clone)]` to support
+  this.
+
+### Added — analysis accuracy (Python upstream parity)
+
+- **GCC / clang `endbr64` prologues** (M1, mirrors Python upstream
+  v2.4.4). `DEFAULT_PROLOGUES` now includes `F3 0F 1E FA` (endbr64),
+  `F3 0F 1E FB` (endbr32), `48 89 5C 24 ??` (mov [rsp+disp8], rbx),
+  `48 83 EC ??` (sub rsp, imm8), and `41 57 41 56` (push r15; push r14).
+  Modern Linux ELFs compiled with `-fcf-protection` (default on
+  Ubuntu 22.04+, Fedora 36+, RHEL 9+, Debian 12+) are no longer
+  under-discovered. `common_start_bytes[64]` weights `0xF3` at 1200
+  so the new heuristic dominates only on CET-enabled samples.
+- **PE export-directory as candidate source** (M4). The PE export
+  RVAs collected on `BinaryInfo.exports` are now seeded into the
+  function-start candidate set. Trivial coverage win on stripped DLLs
+  that still export their public surface.
+- **Linux exit-syscall recognition** (M2, mirrors Python upstream
+  v2.4.4). The analyser now tracks the most recent `mov {al, ax, eax,
+  rax}, IMM` and treats a following `syscall` / `sysenter` / `int 0x80`
+  as a function end when IMM is one of the known exit syscall numbers
+  (60 / 231 on x86_64; 1 / 252 / 60 on x86 via int 0x80). Cleaner
+  function ends in ELFs that call `_exit` / `_Exit` directly.
+
+### Added — public surface (Python upstream parity)
+
+- **`DisassemblyReport.oep: u64`** (N8). Original entry point as a
+  virtual address. PE: `ImageBase + AddressOfEntryPoint`. ELF:
+  `e_entry`. Mirrors `SmdaReport.oep` upstream. `BinaryInfo::get_oep()`
+  now correctly returns the ELF entry too (was PE-only and forgot
+  `+ base_addr` for PE).
+- **`Function.is_exported: bool`** (N7). True if the function's offset
+  matches a PE export RVA. Always false for ELF in 0.4.1 (would need
+  `STB_GLOBAL` dynsym lookup — deferred to 0.5.0).
+- **`Function.stringrefs: Vec<u64>`** (N12). VAs of instructions that
+  store a printable ASCII / UTF-16LE immediate into a stack slot —
+  the classic "stack string" pattern (`mov [rsp+N], 0x6c6c6568`
+  "hell"). Populated by walking each function's blocks once via the
+  existing `Instruction::get_printable_len` (which was implemented in
+  0.3.0 but never invoked until now).
+- **`DisassemblyReport::find_function_by_offset(addr)`** and
+  **`find_block_by_offset(addr)`** (N10). Linear-scan lookups
+  mirroring `SmdaReport.findFunctionByOffset` / `findBlockByOffset`
+  upstream. For 100k-function binaries the scan is roughly 5 ms —
+  cache the result if you call it on every instruction.
+- **`Disassembler::parse_with_timeout(..., timeout)`** + new
+  `Error::AnalysisTimeout(Duration)` variant (N14). Optional
+  wall-clock budget for batch processors of untrusted samples.
+  Checked at the top of `analyse_function`; returns
+  `Err(AnalysisTimeout)` once exceeded, discarding partial state.
+
+### Unchanged
+
+- All `Disassembler::parse` signatures from 0.4.0.
+- `BinaryInfo<'a>`, `DisassemblyResult<'a>`, `Disassembler<'a>`,
+  `DisassemblyReport<'a>` shapes.
+- Memory profile (additive only; no new per-instruction allocations).
+- Section-map zero-copy model.
+
+### Deferred to 0.5.0
+
+For visibility — items considered for 0.4.1 but deferred because they
+would either break the API or require a new dependency:
+
+- M3 (exception-handler reliability — needs unwind-info parsing).
+- N1 (Go `pclntab` + Go strings — large addition).
+- N3 (Rust demangling — adds `rustc-demangle` dep).
+- N5 (MachO support — re-enables `goblin` mach feature; also adds a
+  new `FileFormat::MachO` variant which is technically breaking).
+- N9 (xmetadata block — debug directory walk).
+- N11 (raw memory-dump `disassembleBuffer` entry).
+- N13 (`SmdaConfig` builder — supersedes positional bool args, breaking).
+- N15 (DominatorTree / nesting depth).
+- N16 (PIC hash + opcode hash).
+
+Permanently out of scope: CIL backend (use `dnfile-rs`), DEX backend,
+IDA exporter, ApiScout integration (already covered by
+`win_api_resolver` using the embedded JSON DBs), LIEF / pdbparse.
+
 ## [0.4.0] — 2026-05-24 — Full zero-copy
 
 Supersedes 0.3.0. The 0.3.0 release was a partial increment — it shipped

@@ -59,6 +59,13 @@ pub enum Error {
     /// here is preferable to OOM-killing the host process.
     #[error("malformed input: {0} = {1} exceeds cap {2}")]
     MalformedInputError(&'static str, u64, u64),
+
+    /// Analysis exceeded the configured wall-clock budget. Returned only
+    /// when the caller used `parse_with_timeout` (or set
+    /// `analysis_timeout` on the `Disassembler` directly). Partial state
+    /// is discarded.
+    #[error("analysis timeout exceeded ({0:?})")]
+    AnalysisTimeout(std::time::Duration),
 }
 
 /// Cast a u64 from a parsed file field to usize, returning Err on truncation

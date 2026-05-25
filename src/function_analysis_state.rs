@@ -2,7 +2,7 @@ use crate::{DisassemblyResult, Result, error::Error, function::DecodedInsn};
 use iced_x86::{FlowControl, Mnemonic};
 use std::collections::{HashMap, HashSet, VecDeque};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FunctionAnalysisState {
     pub start_addr: u64,
     pub block_queue: VecDeque<u64>,

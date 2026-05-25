@@ -268,44 +268,81 @@ pub struct Function {
     confidence: f32,
     function_name: String,
     tfidf: f32,
+    /// True if this function's offset matches a PE export RVA (i.e. the
+    /// function is part of the binary's public surface). Always false for
+    /// ELF / raw memory dumps in 0.4.1 — we'd need to consult dynsym
+    /// `STB_GLOBAL` symbols there, which is a 0.5.0 item.
+    pub is_exported: bool,
+    /// (0.4.1 N12) Per-function stack-string references. Each entry is
+    /// the VA of an instruction that stores a printable ASCII or UTF-16LE
+    /// immediate into a stack slot (the classic `mov [rsp+N], 0x6c6c6568`
+    /// "hell" stack-string pattern). Consumers like capa-rs use these for
+    /// string-based behavioural rule matching.
+    pub stringrefs: Vec<u64>,
 }
 
 impl Function {
     pub fn new(disassembly: &DisassemblyResult, function_offset: &u64) -> Result<Function> {
-        let f = Function {
-            arch: disassembly.binary_info.file_architecture,
-            format: disassembly.binary_info.file_format,
-            bitness: disassembly.binary_info.bitness,
-            offset: *function_offset,
-            blocks: Function::parse_blocks(
-                disassembly,
-                &disassembly.get_blocks_as_decoded(function_offset)?,
-            )?,
-            apirefs: disassembly.get_api_refs(function_offset)?,
-            blockrefs: disassembly.get_block_refs(function_offset)?,
-            inrefs: disassembly.get_in_refs(function_offset)?,
-            outrefs: disassembly.get_out_refs(function_offset)?,
-            binweight: 0,
-            characteristics: if disassembly.candidates.contains_key(function_offset) {
-                disassembly.candidates[function_offset].get_characteristics()?
-            } else {
-                "-----------".to_string()
-            },
-            confidence: if disassembly.candidates.contains_key(function_offset) {
-                disassembly.candidates[function_offset].get_confidence()?
-            } else {
-                0.0
-            },
-            function_name: match disassembly.function_symbols.get(function_offset) {
-                Some(s) => s.clone(),
-                _ => String::new(),
-            },
-            tfidf: if disassembly.candidates.contains_key(function_offset) {
-                disassembly.candidates[function_offset].get_tfidf()?
-            } else {
-                0.0
-            },
-        };
+        let f =
+            Function {
+                arch: disassembly.binary_info.file_architecture,
+                format: disassembly.binary_info.file_format,
+                bitness: disassembly.binary_info.bitness,
+                offset: *function_offset,
+                blocks: Function::parse_blocks(
+                    disassembly,
+                    &disassembly.get_blocks_as_decoded(function_offset)?,
+                )?,
+                apirefs: disassembly.get_api_refs(function_offset)?,
+                blockrefs: disassembly.get_block_refs(function_offset)?,
+                inrefs: disassembly.get_in_refs(function_offset)?,
+                outrefs: disassembly.get_out_refs(function_offset)?,
+                binweight: 0,
+                characteristics: if disassembly.candidates.contains_key(function_offset) {
+                    disassembly.candidates[function_offset].get_characteristics()?
+                } else {
+                    "-----------".to_string()
+                },
+                confidence: if disassembly.candidates.contains_key(function_offset) {
+                    disassembly.candidates[function_offset].get_confidence()?
+                } else {
+                    0.0
+                },
+                function_name: match disassembly.function_symbols.get(function_offset) {
+                    Some(s) => s.clone(),
+                    _ => String::new(),
+                },
+                tfidf: if disassembly.candidates.contains_key(function_offset) {
+                    disassembly.candidates[function_offset].get_tfidf()?
+                } else {
+                    0.0
+                },
+                is_exported: {
+                    // PE: match against the export-RVA list with image-base
+                    // applied. The list is small (typically tens-to-hundreds
+                    // of exports per DLL); a linear scan is cheaper than
+                    // building a HashSet per Function construction.
+                    let base = disassembly.binary_info.base_addr;
+                    disassembly.binary_info.exports.iter().any(|(_n, rva, _f)| {
+                        base.checked_add(*rva as u64) == Some(*function_offset)
+                    })
+                },
+                stringrefs: Vec::new(),
+            };
+        // (0.4.1 N12) Walk every instruction in every block and record
+        // those whose immediate operand looks like a printable
+        // stack-string write. We can't fill this inside the struct
+        // initializer because we need to look at the already-constructed
+        // `blocks` field.
+        let mut f = f;
+        for block in f.blocks.values() {
+            for ins in block {
+                if ins.get_printable_len().unwrap_or(0) > 0 {
+                    f.stringrefs.push(ins.offset);
+                }
+            }
+        }
+        f.stringrefs.sort_unstable();
         Ok(f)
     }
 

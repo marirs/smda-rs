@@ -9,12 +9,40 @@ use regex::bytes::Regex as BytesRegex;
 use std::sync::LazyLock;
 use std::{collections::BTreeMap, collections::HashMap, convert::TryInto};
 
+/// Default function-prologue byte patterns scanned across each section.
+///
+/// Sources:
+/// - The first four are classic MSVC: `mov edi, edi; push ebp; mov ebp, esp`
+///   (the `8B FF` "hotpatch NOP"), plain `push ebp; mov ebp, esp`, and
+///   the AT&T-syntax variant `push ebp; mov ebp, esp` (`55 89 E5`).
+/// - 0.4.1 adds:
+///   - `F3 0F 1E FA` — `endbr64`, the Intel CET indirect-branch landing
+///     pad emitted by GCC / clang with `-fcf-protection` (default on
+///     modern Ubuntu, Fedora, RHEL, Debian). Almost every function in a
+///     modern dynamically-linked ELF starts with this.
+///   - `F3 0F 1E FB` — `endbr32`, the 32-bit equivalent.
+///   - `48 89 5C 24 ??` — `mov [rsp+disp8], rbx`, a very common GCC
+///     callee-saved-register save in the function preamble.
+///   - `48 83 EC ??` — `sub rsp, imm8`, the canonical Sys V AMD64 stack
+///     frame setup when no `rbp` chain is used.
+///   - `41 57 41 56` — `push r15; push r14`, the start of a typical
+///     GCC-emitted register save sequence for functions that touch the
+///     extended registers.
 static DEFAULT_PROLOGUES: LazyLock<Vec<BytesRegex>> = LazyLock::new(|| {
     vec![
+        // MSVC family (32 / 64 bit)
         BytesRegex::new(r"(?-u)\x8B\xFF\x55\x8B\xEC").unwrap(),
         BytesRegex::new(r"(?-u)\x89\xFF\x55\x8B\xEC").unwrap(),
         BytesRegex::new(r"(?-u)\x55\x8B\xEC").unwrap(),
         BytesRegex::new(r"(?-u)\x55\x89\xE5").unwrap(),
+        // Intel CET landing pads — used by GCC / clang with -fcf-protection
+        BytesRegex::new(r"(?-u)\xF3\x0F\x1E\xFA").unwrap(), // endbr64
+        BytesRegex::new(r"(?-u)\xF3\x0F\x1E\xFB").unwrap(), // endbr32
+        // GCC / clang Sys V AMD64 prologue families. The `[\S\s]` matches
+        // any single byte for the imm8 displacement.
+        BytesRegex::new(r"(?-u)\x48\x89\x5C\x24[\S\s]").unwrap(), // mov [rsp+disp8], rbx
+        BytesRegex::new(r"(?-u)\x48\x83\xEC[\S\s]").unwrap(),     // sub rsp, imm8
+        BytesRegex::new(r"(?-u)\x41\x57\x41\x56").unwrap(),       // push r15; push r14
     ]
 });
 static REF_CANDIDATE: LazyLock<BytesRegex> =

@@ -319,9 +319,15 @@ impl<'a> BinaryInfo<'a> {
         }
     }
 
+    /// Original entry-point virtual address.
+    ///
+    /// PE: `OptionalHeader.AddressOfEntryPoint + ImageBase`.
+    /// ELF: `e_entry`. Returns 0 if the format has no concept of an entry
+    /// point or none is set.
     pub fn get_oep(&self) -> Result<u64> {
         match Object::parse(self.raw_data)? {
-            Object::PE(pe) => Ok(pe.entry as u64),
+            Object::PE(pe) => Ok((pe.entry as u64).saturating_add(self.base_addr)),
+            Object::Elf(elf) => Ok(elf.header.e_entry),
             _ => Ok(0),
         }
     }
@@ -732,6 +738,13 @@ pub struct Disassembler<'a> {
     tfidf: MnemonicTfIdf,
     pub disassembly: DisassemblyResult<'a>,
     label_providers: Vec<LabelProvider>,
+    /// (0.4.1 N14) Optional per-disassembly wall-clock budget. `None`
+    /// means "no timeout, run to completion". When set, the analyse loop
+    /// checks `Instant::now()` periodically and returns an
+    /// `Error::AnalysisTimeout` once exceeded — letting batch processors
+    /// of untrusted samples bound their per-sample cost.
+    analysis_timeout: Option<std::time::Duration>,
+    analysis_started: Option<std::time::Instant>,
 }
 
 impl<'a> Disassembler<'a> {
@@ -752,6 +765,8 @@ impl<'a> Disassembler<'a> {
             tfidf: MnemonicTfIdf::new(),
             disassembly: DisassemblyResult::new(binary_info),
             label_providers: label_providers::init()?,
+            analysis_timeout: None,
+            analysis_started: None,
         };
         res.common_start_bytes.insert(
             32,
@@ -765,13 +780,20 @@ impl<'a> Disassembler<'a> {
         );
         res.common_start_bytes.insert(
             64,
+            // 0xF3 added in 0.4.1 — `endbr64` (`F3 0F 1E FA`) is now the
+            // first byte of practically every function in modern Linux
+            // ELFs built with `-fcf-protection`. The weight (1200) is
+            // sized so the new heuristic dominates only on samples that
+            // are actually CET-enabled; on older binaries the 0x48 / 0x40
+            // / 0x4c weights still drive the bitness vote.
             hashmap! {0x48 => 1341,
             0x40 => 349,
             0x4c => 59,
             0x33 => 56,
             0x44 => 18,
             0x45 => 17,
-            0xe9 => 16},
+            0xe9 => 16,
+            0xf3 => 1200},
         );
         Ok(res)
     }
@@ -857,6 +879,20 @@ impl<'a> Disassembler<'a> {
     // // `buf` must outlive `report`
     // ```
 
+    /// (0.4.1 N14) Like `parse` but bounds total analysis time. Returns
+    /// `Error::AnalysisTimeout` if `timeout` is exceeded mid-analysis.
+    /// Useful for batch processing of untrusted samples where you want
+    /// to skip pathological cases rather than block the queue.
+    pub fn parse_with_timeout<'b>(
+        raw: &'b [u8],
+        path: Option<&str>,
+        high_accuracy: bool,
+        resolve_tailcalls: bool,
+        timeout: std::time::Duration,
+    ) -> Result<DisassemblyReport<'b>> {
+        Self::parse_inner(raw, path, high_accuracy, resolve_tailcalls, Some(timeout))
+    }
+
     /// Zero-copy disassembly entry point. The returned `DisassemblyReport`
     /// borrows from `raw` for the lifetime `'a`; no copies of the input
     /// bytes are made.
@@ -865,6 +901,16 @@ impl<'a> Disassembler<'a> {
         path: Option<&str>,
         high_accuracy: bool,
         resolve_tailcalls: bool,
+    ) -> Result<DisassemblyReport<'b>> {
+        Self::parse_inner(raw, path, high_accuracy, resolve_tailcalls, None)
+    }
+
+    fn parse_inner<'b>(
+        raw: &'b [u8],
+        path: Option<&str>,
+        high_accuracy: bool,
+        resolve_tailcalls: bool,
+        timeout: Option<std::time::Duration>,
     ) -> Result<DisassemblyReport<'b>> {
         let mut binary_info = BinaryInfo::from_buffer(raw)?;
         if let Some(p) = path {
@@ -875,6 +921,7 @@ impl<'a> Disassembler<'a> {
                 binary_info.file_format = FileFormat::ELF;
                 binary_info.base_addr = elf::get_base_address(raw)?;
                 binary_info.bitness = elf::get_bitness(raw)?;
+                binary_info.entry_point = elf.header.e_entry;
                 binary_info.file_architecture = match binary_info.bitness {
                     64 => FileArchitecture::AMD64,
                     _ => FileArchitecture::I386,
@@ -904,6 +951,8 @@ impl<'a> Disassembler<'a> {
                     64 => FileArchitecture::AMD64,
                     _ => FileArchitecture::I386,
                 };
+                // PE entry is an RVA — add image base to get the VA.
+                binary_info.entry_point = binary_info.base_addr.saturating_add(pe.entry as u64);
                 binary_info.code_areas = pe::get_code_areas(raw, &pe)?;
                 binary_info.sections = pe
                     .sections
@@ -943,6 +992,8 @@ impl<'a> Disassembler<'a> {
         }
         binary_info.binary_size = binary_info.compute_binary_size();
         let mut disassembler = Disassembler::with_binary(binary_info)?;
+        disassembler.analysis_timeout = timeout;
+        disassembler.analysis_started = Some(std::time::Instant::now());
         disassembler.analyse_buffer(high_accuracy, resolve_tailcalls)?;
         DisassemblyReport::new(&mut disassembler.disassembly)
     }
@@ -955,6 +1006,22 @@ impl<'a> Disassembler<'a> {
             }
             for s in (provider.get_functions_symbols()?).keys() {
                 symbol_offsets.insert(*s);
+            }
+        }
+        // 0.4.1 (M4): seed candidates from the PE export directory. The
+        // export RVAs sit on BinaryInfo.exports — they were collected at
+        // load time but pre-0.4.1 only surfaced in the public report.
+        // For PE samples (especially stripped DLLs) the export table is
+        // often the only reliable list of public-facing function entries.
+        let base_addr = self.disassembly.binary_info.base_addr;
+        if self.disassembly.binary_info.file_format == FileFormat::PE {
+            for (_name, rva, _forward) in &self.disassembly.binary_info.exports {
+                if *rva == 0 {
+                    continue;
+                }
+                if let Some(va) = base_addr.checked_add(*rva as u64) {
+                    symbol_offsets.insert(va);
+                }
             }
         }
         Ok(symbol_offsets.iter().copied().collect())
@@ -1398,12 +1465,26 @@ impl<'a> Disassembler<'a> {
         out
     }
 
+    /// (0.4.1 N14) Check the per-disassembly wall-clock budget. Returns
+    /// `Err(AnalysisTimeout)` if the budget is exceeded, `Ok(())` if the
+    /// timeout is unset or not yet hit.
+    #[inline]
+    fn check_timeout(&self) -> Result<()> {
+        if let (Some(budget), Some(start)) = (self.analysis_timeout, self.analysis_started)
+            && start.elapsed() > budget
+        {
+            return Err(Error::AnalysisTimeout(budget));
+        }
+        Ok(())
+    }
+
     fn analyse_function(
         &mut self,
         start_addr: u64,
         as_gap: bool,
         high_accuracy: bool,
     ) -> Result<FunctionAnalysisState> {
+        self.check_timeout()?;
         self.tailcall_analyzer.init()?;
         let mut state = FunctionAnalysisState::new(start_addr)?;
         if state.is_processed_function(&self.disassembly) {
@@ -1426,6 +1507,12 @@ impl<'a> Disassembler<'a> {
             let mut previous_address: Option<u64> = None;
             let mut previous_mnemonic_str: Option<String> = None;
             let mut previous_op_str: Option<String> = None;
+            // (0.4.1 M2) Track the most recent `mov eax/rax, IMM` value so
+            // we can recognise the Linux exit-syscall convention
+            // (`mov eax, 60; syscall` and `mov eax, 0xfc; int 0x80`) as a
+            // genuine function end, not a mid-function syscall that
+            // returns.
+            let mut last_exit_reg_imm: Option<u64> = None;
 
             loop {
                 let mut exit_flag = false;
@@ -1506,6 +1593,15 @@ impl<'a> Disassembler<'a> {
                         }
                     } else if matches!(mnemonic_enum, Mnemonic::Int3 | Mnemonic::Hlt) {
                         self.analyze_end_instruction(&mut state)?;
+                    } else if Self::is_exit_syscall(ins, last_exit_reg_imm) {
+                        // Linux exit syscall conventions:
+                        //   x86_64: mov eax, 60 ; syscall          (exit)
+                        //   x86_64: mov eax, 231; syscall          (exit_group)
+                        //   x86:    mov eax, 1  ; int 0x80         (exit)
+                        //   x86:    mov eax, 252; int 0x80         (exit_group)
+                        // Treat the syscall site as a function end so the
+                        // analyser stops following past it.
+                        self.analyze_end_instruction(&mut state)?;
                     } else if let Some(prev) = previous_address
                         && prev != 0
                         && i_address != start_addr
@@ -1537,6 +1633,8 @@ impl<'a> Disassembler<'a> {
                     previous_address = Some(i_address);
                     previous_mnemonic_str = Some(mnemonic_str.clone());
                     previous_op_str = Some(op_str.clone());
+                    // (0.4.1 M2) Update the exit-syscall register tracker.
+                    last_exit_reg_imm = Self::extract_exit_reg_imm(ins, last_exit_reg_imm);
                     if !self.disassembly.code_map.contains_key(&i_address)
                         && !self.disassembly.data_map.contains(&i_address)
                         && !state.is_processed(&i_address)?
@@ -1625,6 +1723,68 @@ impl<'a> Disassembler<'a> {
             }
         }
         Ok(String::new())
+    }
+
+    /// (0.4.1 M2) Track `mov eax, IMM` / `mov rax, IMM` to feed the
+    /// exit-syscall recogniser. Returns the new "last exit reg imm"
+    /// state. Any non-mov-to-{e,r,a}ax instruction clears the tracker
+    /// (because the exit number must be set *immediately* before the
+    /// syscall to be the actual call number).
+    fn extract_exit_reg_imm(ins: &DecodedInsn, current: Option<u64>) -> Option<u64> {
+        use iced_x86::Register;
+        if ins.iced.mnemonic() != Mnemonic::Mov
+            || ins.iced.op_count() != 2
+            || ins.iced.op_kind(0) != iced_x86::OpKind::Register
+        {
+            // Conservative: any non-matching instruction resets the
+            // tracker so we don't carry a stale value across a basic
+            // block boundary.
+            return None;
+        }
+        let dst = ins.iced.op_register(0);
+        if !matches!(
+            dst,
+            Register::EAX | Register::RAX | Register::AX | Register::AL
+        ) {
+            return None;
+        }
+        match ins.iced.op_kind(1) {
+            iced_x86::OpKind::Immediate8 => Some(ins.iced.immediate8() as u64),
+            iced_x86::OpKind::Immediate16 => Some(ins.iced.immediate16() as u64),
+            iced_x86::OpKind::Immediate32 => Some(ins.iced.immediate32() as u64),
+            iced_x86::OpKind::Immediate64 => Some(ins.iced.immediate64()),
+            iced_x86::OpKind::Immediate8to32 => Some(ins.iced.immediate8to32() as u64),
+            iced_x86::OpKind::Immediate8to64 => Some(ins.iced.immediate8to64() as u64),
+            iced_x86::OpKind::Immediate32to64 => Some(ins.iced.immediate32to64() as u64),
+            _ => current, // keep prior value if dst was overwritten with non-immediate
+        }
+    }
+
+    /// (0.4.1 M2) Recognise the Linux exit-syscall convention. Linux
+    /// `exit` is 60 / `exit_group` is 231 on x86_64 (via `syscall`); 1 /
+    /// 252 respectively on x86 (via `int 0x80`).
+    fn is_exit_syscall(ins: &DecodedInsn, last_eax_imm: Option<u64>) -> bool {
+        let mnem = ins.iced.mnemonic();
+        let imm = match last_eax_imm {
+            Some(v) => v,
+            None => return false,
+        };
+        if matches!(mnem, Mnemonic::Syscall | Mnemonic::Sysenter) {
+            // x86_64: exit=60, exit_group=231; x86 syscall variants
+            // (rare): exit=252.
+            return matches!(imm, 60 | 231 | 252);
+        }
+        if mnem == Mnemonic::Int
+            && ins.iced.op_count() == 1
+            && let iced_x86::OpKind::Immediate8 = ins.iced.op_kind(0)
+            && ins.iced.immediate8() == 0x80
+        {
+            // x86: exit=1, exit_group=252; also accept 0x3c
+            // (some compilers emit the 64-bit number in 32-bit code
+            // by mistake / via intrinsics).
+            return matches!(imm, 1 | 252 | 60);
+        }
+        false
     }
 
     fn update_label_providers_from_disassembly(&mut self) -> Result<()> {

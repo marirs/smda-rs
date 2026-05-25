@@ -40,7 +40,7 @@ impl TailCallAnalyser {
 
     pub fn finalize_function(
         disassembler: &mut Disassembler,
-        _function_state: &FunctionAnalysisState,
+        function_state: &FunctionAnalysisState,
     ) -> Result<()> {
         for (source, destinations) in &disassembler.tailcall_analyzer.tmp_jumps {
             disassembler
@@ -54,12 +54,18 @@ impl TailCallAnalyser {
                     *source,
                     &disassembler.disassembly,
                 );
-                //let state = FunctionAnalysisState::new(*d)?;
-                //disassembler.tailcall_analyzer.functions.insert(*source, state);
             }
         }
         disassembler.tailcall_analyzer.tmp_jumps.clear();
-        //TODO        self.functions.push(function_state);
+        // Stash the just-finalized function in our intervals table so
+        // `get_tailcalls` can later spot jumps from outside-the-function
+        // into this function's body. Pre-0.4.1 this insert was missing
+        // (TODO in the source), which silently turned `resolve_tailcalls`
+        // into a no-op for the entire 0.3.x / 0.4.0 lifetime.
+        disassembler
+            .tailcall_analyzer
+            .functions
+            .insert(function_state.start_addr, function_state.clone());
         Ok(())
     }
 
