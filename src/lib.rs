@@ -15,12 +15,14 @@ mod indirect_call_analyser;
 mod jump_table_analyser;
 mod label_provider;
 mod label_providers;
+pub mod macho;
 mod mnemonic_tf_idf;
 mod pclntab;
 mod pe;
 pub mod report;
 mod statistics;
 mod tail_call_analyser;
+pub mod xmetadata;
 
 use function::{DecodedInsn, capstone_compat_formatter};
 use function_analysis_state::FunctionAnalysisState;
@@ -62,10 +64,96 @@ static REGS_64BIT: &[&str] = &[
     "r13", "r14", "r15",
 ];
 
+/// (0.5.0) Disassembler configuration — replaces the positional
+/// `(path, high_accuracy, resolve_tailcalls)` + `parse_with_timeout`
+/// sibling that 0.4.x used. Construct via [`SmdaConfig::new`] +
+/// chained builder methods.
+///
+/// `#[non_exhaustive]` — future knobs add as new builder methods
+/// without forcing a major bump.
+///
+/// ```
+/// use smda::SmdaConfig;
+/// use std::time::Duration;
+///
+/// let cfg = SmdaConfig::new()
+///     .path("/tmp/sample.bin")
+///     .high_accuracy(true)
+///     .resolve_tailcalls(true)
+///     .timeout(Duration::from_secs(30));
+/// ```
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct SmdaConfig {
+    /// Optional path label embedded in `BinaryInfo.file_path` — purely
+    /// cosmetic, no I/O is performed against it.
+    pub path: Option<String>,
+    /// Run the slower, higher-accuracy heuristics. Trades analysis
+    /// time for fewer missed function starts. Defaults to `false`.
+    pub high_accuracy: bool,
+    /// Promote unresolved tail-call targets to full functions in a
+    /// post-pass. Defaults to `false`.
+    pub resolve_tailcalls: bool,
+    /// Optional wall-clock budget for the whole analysis. Returns
+    /// `Error::AnalysisTimeout` if exceeded mid-flight. `None` =
+    /// unbounded. Useful for batch-processing untrusted samples.
+    pub timeout: Option<std::time::Duration>,
+}
+
+impl SmdaConfig {
+    /// Empty config — equivalent to the 0.4.x defaults
+    /// (`high_accuracy=false`, `resolve_tailcalls=false`, no timeout).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the cosmetic file-path label.
+    #[must_use]
+    pub fn path(mut self, p: impl Into<String>) -> Self {
+        self.path = Some(p.into());
+        self
+    }
+
+    /// Enable / disable the slower high-accuracy heuristics.
+    #[must_use]
+    pub fn high_accuracy(mut self, b: bool) -> Self {
+        self.high_accuracy = b;
+        self
+    }
+
+    /// Enable / disable tail-call resolution post-pass.
+    #[must_use]
+    pub fn resolve_tailcalls(mut self, b: bool) -> Self {
+        self.resolve_tailcalls = b;
+        self
+    }
+
+    /// Set a wall-clock analysis budget. Pass `None` (or omit) for
+    /// unbounded.
+    #[must_use]
+    pub fn timeout(mut self, t: std::time::Duration) -> Self {
+        self.timeout = Some(t);
+        self
+    }
+}
+
+/// Recognised executable file formats.
+///
+/// Marked `#[non_exhaustive]` in 0.5.0 — future variants land without
+/// a major bump. Downstream `match` statements must include a wildcard
+/// arm.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FileFormat {
     ELF,
     PE,
+    /// 0.5.0 — Mach-O (Intel x86 / x86_64).
+    MachO,
+    /// 0.5.0 — raw memory dump / shellcode (no file-format wrapper).
+    /// Set by `Disassembler::parse_buffer`; pre-0.5.0 this surfaced as
+    /// `FileFormat::ELF` with `is_buffer = true`.
+    Buffer,
 }
 
 impl std::fmt::Display for FileFormat {
@@ -73,11 +161,18 @@ impl std::fmt::Display for FileFormat {
         match self {
             FileFormat::ELF => write!(f, "Elf file"),
             FileFormat::PE => write!(f, "PE file"),
+            FileFormat::MachO => write!(f, "Mach-O file"),
+            FileFormat::Buffer => write!(f, "Raw buffer"),
         }
     }
 }
 
+/// CPU architectures recognised by the disassembler.
+///
+/// Marked `#[non_exhaustive]` in 0.5.0 — future variants land without
+/// a major bump.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FileArchitecture {
     I386,
     AMD64,
@@ -112,7 +207,15 @@ pub struct SectionMap {
     pub file_size: usize,
 }
 
+/// All binary-level metadata threaded through the analyser. Borrowed
+/// against the input bytes for `'a`.
+///
+/// Marked `#[non_exhaustive]` in 0.5.0 — adding fields is no longer
+/// breaking. Construct via `BinaryInfo::from_buffer` or
+/// `BinaryInfo::empty`; struct-literal construction is no longer
+/// supported by downstream crates.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct BinaryInfo<'a> {
     pub file_format: FileFormat,
     pub file_architecture: FileArchitecture,
@@ -883,42 +986,39 @@ impl<'a> Disassembler<'a> {
     // // `buf` must outlive `report`
     // ```
 
-    /// (0.4.1 N14) Like `parse` but bounds total analysis time. Returns
-    /// `Error::AnalysisTimeout` if `timeout` is exceeded mid-analysis.
-    /// Useful for batch processing of untrusted samples where you want
-    /// to skip pathological cases rather than block the queue.
-    pub fn parse_with_timeout<'b>(
-        raw: &'b [u8],
-        path: Option<&str>,
-        high_accuracy: bool,
-        resolve_tailcalls: bool,
-        timeout: std::time::Duration,
-    ) -> Result<DisassemblyReport<'b>> {
-        Self::parse_inner(raw, path, high_accuracy, resolve_tailcalls, Some(timeout))
+    /// (0.5.0) Zero-copy disassembly entry point. The returned
+    /// `DisassemblyReport` borrows from `raw` for the lifetime `'b`;
+    /// no copies of the input bytes are made.
+    ///
+    /// Pre-0.5.0 this took positional `(path, high_accuracy,
+    /// resolve_tailcalls)` and an optional `parse_with_timeout` sibling.
+    /// 0.5.0 collapses all knobs into [`SmdaConfig`] so future analysis
+    /// options land without API breaks.
+    ///
+    /// ```no_run
+    /// use smda::{Disassembler, SmdaConfig};
+    /// let buf = std::fs::read("Sample.exe").unwrap();
+    /// let cfg = SmdaConfig::new().path("Sample.exe");
+    /// let report = Disassembler::parse(&buf, &cfg).unwrap();
+    /// ```
+    pub fn parse<'b>(raw: &'b [u8], config: &SmdaConfig) -> Result<DisassemblyReport<'b>> {
+        Self::parse_inner(
+            raw,
+            config.path.as_deref(),
+            config.high_accuracy,
+            config.resolve_tailcalls,
+            config.timeout,
+        )
     }
 
-    /// Zero-copy disassembly entry point. The returned `DisassemblyReport`
-    /// borrows from `raw` for the lifetime `'a`; no copies of the input
-    /// bytes are made.
-    pub fn parse<'b>(
-        raw: &'b [u8],
-        path: Option<&str>,
-        high_accuracy: bool,
-        resolve_tailcalls: bool,
-    ) -> Result<DisassemblyReport<'b>> {
-        Self::parse_inner(raw, path, high_accuracy, resolve_tailcalls, None)
-    }
-
-    /// (0.4.2 N11) Raw-buffer entry point — bypass PE / ELF header parsing.
-    /// Use this for shellcode, unpacked modules, memory dumps, or any byte
-    /// blob without a recognised executable header.
+    /// (0.4.2 N11; 0.5.0) Raw-buffer entry point — bypass PE / ELF / MachO
+    /// header parsing. Use this for shellcode, unpacked modules, memory
+    /// dumps, or any byte blob without a recognised executable header.
     ///
     /// The whole buffer is treated as one section mapped at `base_addr`,
     /// with no imports / exports / code-area subdivision. The returned
-    /// report has `binary_info.is_buffer = true` and `file_format = ELF`
-    /// as a least-surprise default (a dedicated `FileFormat::Buffer`
-    /// variant would be a breaking change reserved for 0.5.0). Consumers
-    /// should check `is_buffer` rather than relying on the format tag.
+    /// report has `binary_info.is_buffer = true` and
+    /// `file_format = FileFormat::Buffer`.
     ///
     /// `bitness` must be 32 or 64. `base_addr` is the virtual address the
     /// buffer maps to — defaults are sensible at 0 if the caller has no
@@ -927,35 +1027,15 @@ impl<'a> Disassembler<'a> {
         raw: &'b [u8],
         base_addr: u64,
         bitness: u32,
-        high_accuracy: bool,
-        resolve_tailcalls: bool,
+        config: &SmdaConfig,
     ) -> Result<DisassemblyReport<'b>> {
         Self::parse_buffer_inner(
             raw,
             base_addr,
             bitness,
-            high_accuracy,
-            resolve_tailcalls,
-            None,
-        )
-    }
-
-    /// (0.4.2 N11) `parse_buffer` with a wall-clock analysis timeout.
-    pub fn parse_buffer_with_timeout<'b>(
-        raw: &'b [u8],
-        base_addr: u64,
-        bitness: u32,
-        high_accuracy: bool,
-        resolve_tailcalls: bool,
-        timeout: std::time::Duration,
-    ) -> Result<DisassemblyReport<'b>> {
-        Self::parse_buffer_inner(
-            raw,
-            base_addr,
-            bitness,
-            high_accuracy,
-            resolve_tailcalls,
-            Some(timeout),
+            config.high_accuracy,
+            config.resolve_tailcalls,
+            config.timeout,
         )
     }
 
@@ -984,7 +1064,7 @@ impl<'a> Disassembler<'a> {
             ))?;
         let mut binary_info = BinaryInfo::from_buffer(raw)?;
         binary_info.is_buffer = true;
-        binary_info.file_format = FileFormat::ELF; // see doc-comment caveat
+        binary_info.file_format = FileFormat::Buffer;
         binary_info.base_addr = base_addr;
         binary_info.bitness = bitness;
         binary_info.entry_point = base_addr;
@@ -1090,6 +1170,26 @@ impl<'a> Disassembler<'a> {
                     })
                     .collect();
                 binary_info.section_maps = pe::map_binary(raw, binary_info.base_addr)?;
+            }
+            Object::Mach(_) => {
+                // 0.5.0: Mach-O loader (Intel only). Re-extract via
+                // macho::extract_intel to get the right slice from fat
+                // binaries; goblin's Object::Mach gives us the wrapper but
+                // we want the parsed Intel MachO directly.
+                let mach = macho::extract_intel(raw)?;
+                binary_info.file_format = FileFormat::MachO;
+                binary_info.base_addr = macho::get_base_address(&mach);
+                binary_info.bitness = macho::get_bitness(&mach);
+                binary_info.file_architecture = match binary_info.bitness {
+                    64 => FileArchitecture::AMD64,
+                    _ => FileArchitecture::I386,
+                };
+                binary_info.entry_point = macho::get_entry_point(&mach, binary_info.base_addr);
+                binary_info.code_areas = macho::get_code_areas(&mach);
+                binary_info.sections = macho::get_sections(&mach);
+                binary_info.imports = macho::get_imports(&mach);
+                binary_info.exports = macho::get_exports(&mach);
+                binary_info.section_maps = macho::map_binary(raw, binary_info.base_addr)?;
             }
             _ => return Err(Error::UnsupportedFormatError),
         }

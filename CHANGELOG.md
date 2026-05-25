@@ -5,6 +5,81 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-05-25 — Breaking-change batch
+
+Four interlocking API breaks shipped as one coherent major bump so
+downstream consumers migrate once and unlock everything below. After
+this release, `FileFormat`, `FileArchitecture`, and `BinaryInfo` /
+`DisassemblyReport` carry `#[non_exhaustive]` so future additions stop
+costing a major.
+
+### Breaking changes
+
+- **`SmdaConfig` builder replaces positional `bool` args.** The old
+  `Disassembler::parse(raw, path, high_accuracy, resolve_tailcalls)`
+  and `parse_with_timeout(...)` signatures are removed in favour of a
+  single `parse(raw, &SmdaConfig)`. `parse_buffer` likewise takes a
+  config now. Future analysis knobs land as new builder methods
+  without further breaks.
+
+  Before (0.4.2):
+  ```rust
+  let report = Disassembler::parse(&buf, Some(path), false, false)?;
+  ```
+
+  After (0.5.0):
+  ```rust
+  let cfg = SmdaConfig::new().path(path);
+  let report = Disassembler::parse(&buf, &cfg)?;
+  ```
+- **`FileFormat::MachO` + `FileFormat::Buffer` variants added.** The
+  enum is now `#[non_exhaustive]`. Downstream `match` statements need
+  a wildcard arm. `parse_buffer` now sets `file_format = Buffer`
+  instead of the 0.4.x `ELF` cosplay.
+- **`DisassemblyReport::xmetadata: Option<XMetadata>`** is a new pub
+  field; `DisassemblyReport` is now `#[non_exhaustive]`. Struct-literal
+  construction by downstreams is no longer supported (use the
+  constructor / `..Default::default()` if you were doing this).
+
+### Added — formats
+
+- **MachO loader (Intel: x86_64, i386).** New `macho` module mirrors
+  the `pe` / `elf` surface: `map_binary`, `get_base_address`,
+  `get_bitness`, `get_code_areas`. Uses goblin's Mach-O parser. Fat
+  binaries are sliced to the x86 architecture; ARM slices are
+  ignored. Imports populated from the lazy bind opcodes; exports
+  from the export trie.
+- **Raw-buffer format tag.** `parse_buffer(...)` reports
+  `FileFormat::Buffer` instead of `FileFormat::ELF`. Consumers can
+  switch on `file_format` rather than `is_buffer` (both still work).
+
+### Added — metadata
+
+- **PE debug directory → `report.xmetadata: Option<XMetadata>`.**
+  Captures CodeView/PDB GUID + age + path, debug timestamp, debug
+  entry type. Useful for symbol-server (SymSrv) lookups. `None` on
+  ELF / MachO / Buffer or PE without `IMAGE_DIRECTORY_ENTRY_DEBUG`.
+
+### Internal — SemVer hardening
+
+- `FileFormat`, `FileArchitecture` are now `#[non_exhaustive]` —
+  adding variants in future minor releases is no longer breaking.
+- `BinaryInfo`, `DisassemblyReport` are now `#[non_exhaustive]` —
+  adding pub fields in future minor releases is no longer breaking.
+
+### Migration guide
+
+1. Replace `parse(&buf, Some(path), hf, rt)` with
+   `parse(&buf, &SmdaConfig::new().path(path).high_accuracy(hf).resolve_tailcalls(rt))`.
+2. Replace `parse_with_timeout(&buf, …, timeout)` with the same plus
+   `.timeout(duration)` on the config.
+3. Add a wildcard arm to any `match report.format { … }` you have
+   downstream — at minimum
+   `FileFormat::MachO | FileFormat::Buffer => …`.
+4. If you constructed `BinaryInfo` or `DisassemblyReport` by struct
+   literal, switch to the provided constructors (rare — these were
+   internal in practice).
+
 ## [0.4.2] — 2026-05-25 — Analysis helpers + raw-buffer entry (additive)
 
 Additive-only release. No breaking changes from 0.4.1; consumers can

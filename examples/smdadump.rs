@@ -29,7 +29,9 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let report = match smda::Disassembler::parse(&buf, Some(&path), false, false) {
+    // 0.5.0: positional bool args → SmdaConfig builder.
+    let cfg = smda::SmdaConfig::new().path(&path);
+    let report = match smda::Disassembler::parse(&buf, &cfg) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("parse failed: {e}");

@@ -3,10 +3,19 @@ use crate::{
     error::Error,
     function::{Function, Instruction},
     statistics::DisassemblyStatistics,
+    xmetadata::{self, XMetadata},
 };
 use std::collections::HashMap;
 
+/// Public-facing disassembly result. Borrows the original input bytes
+/// via the embedded `BinaryInfo<'a>`.
+///
+/// Marked `#[non_exhaustive]` in 0.5.0 — adding pub fields is no longer
+/// breaking. Construct via `DisassemblyReport::new`; downstream crates
+/// should treat it as opaque-for-construction and read fields
+/// individually.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DisassemblyReport<'a> {
     pub format: FileFormat,
     pub architecture: FileArchitecture,
@@ -41,6 +50,12 @@ pub struct DisassemblyReport<'a> {
     pub imports: Vec<(String, String, usize)>,
     pub exports: Vec<(String, usize, Option<String>)>,
     pub addr_to_api: HashMap<u64, (Option<String>, Option<String>)>,
+    /// (0.5.0) PE debug-directory metadata — PDB GUID + age + filename,
+    /// debug timestamp, observed debug-entry types. `None` on non-PE
+    /// inputs, on PE without a debug directory, or when goblin failed
+    /// to parse it. Useful for symbol-server (SymSrv / Mozilla /
+    /// Chromium symbol stores) keying.
+    pub xmetadata: Option<XMetadata>,
 }
 
 impl<'a> DisassemblyReport<'a> {
@@ -72,6 +87,12 @@ impl<'a> DisassemblyReport<'a> {
             imports: disassembly.binary_info.imports.clone(),
             exports: disassembly.binary_info.exports.clone(),
             addr_to_api: HashMap::new(),
+            // 0.5.0 — PE debug directory; None on non-PE.
+            xmetadata: if disassembly.binary_info.file_format == FileFormat::PE {
+                xmetadata::parse_pe(disassembly.binary_info.raw_data)
+            } else {
+                None
+            },
         };
         for function_offset in disassembly.functions.keys() {
             if res.confidence_threshold > 0.0

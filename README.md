@@ -32,8 +32,6 @@ The output is a collection of functions, basic blocks, and instructions with the
 - **`Instruction` slimmed down.** The 0.3.x per-instruction `mnemonic: String`, `operands: Option<String>`, and `bytes: String` (hex) fields are gone. Use the typed iced accessors (`mnemonic_enum()`, `op_kind()`, `flow_control()`, …) for hot paths, or `format_mnemonic()` / `format_operands()` / `bytes_in(&binary_info)` for on-demand formatting.
 - **Decoder still iced-x86** (no C/C++ build dep, ~2–3× faster than capstone).
 - **Same security guards.** All the checked-arithmetic, allocation caps, and bounds checks added in 0.3.0 are preserved — the `pe::map_binary` and `elf::map_binary` rewrites kept every defensive check, just changed the return type from `Vec<u8>` to `Vec<SectionMap>`.
-- **Rust 2024 edition, MSRV 1.95.**
-- **Same dependencies** (`iced-x86 1`, `goblin 0.10`, `thiserror 2`, `itertools 0.14`, `hex 0.4`, `regex 1`, `sha2 0.10`, `serde 1`, `maplit 1`).
 
 ## Quick start
 
@@ -41,24 +39,28 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-smda = "0.4"
+smda = "0.5"
 ```
 
 Then disassemble a file:
 
 ```rust
-use smda::Disassembler;
+use smda::{Disassembler, SmdaConfig};
 
 fn main() -> smda::Result<()> {
     // Load the file yourself — the report borrows from this buffer
     // for the lifetime `'a`, so it must outlive the report.
     let buf = std::fs::read("Sample.exe")?;
-    let report = Disassembler::parse(
-        &buf,
-        Some("Sample.exe"),
-        false,  // high-accuracy heuristics (slower)
-        false,  // tail-call resolution
-    )?;
+
+    // 0.5.0: positional bool args were replaced by SmdaConfig so new
+    // analysis knobs land without further API breaks. Every field has
+    // a sensible default; chain only what you need.
+    let cfg = SmdaConfig::new()
+        .path("Sample.exe")
+        .high_accuracy(false)        // slower, finds more functions
+        .resolve_tailcalls(false);   // promote tail-call targets to functions
+
+    let report = Disassembler::parse(&buf, &cfg)?;
 
     println!("format       : {:?}", report.format);
     println!("architecture : {:?}", report.architecture);
@@ -73,6 +75,22 @@ fn main() -> smda::Result<()> {
     }
     Ok(())
 }
+```
+
+For raw memory dumps (shellcode, unpacked modules):
+
+```rust
+use smda::{Disassembler, SmdaConfig};
+use std::time::Duration;
+
+let shellcode: &[u8] = &[/* … */];
+let cfg = SmdaConfig::new().timeout(Duration::from_secs(10));
+let report = Disassembler::parse_buffer(
+    shellcode,
+    0x1000,     // virtual base address
+    64,         // bitness (32 or 64)
+    &cfg,
+)?;
 ```
 
 ## Typed iced accessors
