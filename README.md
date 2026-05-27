@@ -7,7 +7,7 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.95-blue.svg)](#requirements)
 [![Zero-copy](https://img.shields.io/badge/zero--copy-yes-brightgreen.svg)](#zero-copy)
 
-A minimalist recursive x86 / x64 disassembler library, optimized for accurate Control Flow Graph (CFG) recovery from PE / ELF binaries and arbitrary memory dumps.
+A minimalist recursive x86 / x64 / AArch64 disassembler library, optimized for accurate Control Flow Graph (CFG) recovery from PE, ELF, and Mach-O binaries and arbitrary memory dumps.
 
 The output is a collection of functions, basic blocks, and instructions with their respective edges (block-to-block, function-to-function). Optionally, references to the Windows API can be inferred via the ApiScout method.
 
@@ -15,13 +15,32 @@ The output is a collection of functions, basic blocks, and instructions with the
 
 ## Features
 
-- **Input formats**: PE (32 / 64-bit), ELF (32 / 64-bit).
-- **Function discovery**: prologue scan (MSVC + GCC / clang `endbr64` family, 0.4.1+), call-target propagation, PE exception-handler (`.pdata`) seeding, PE export-table $
-- **Per-function output**: basic blocks, in / out references, API calls (ApiScout — embedded Win7 + WinXP DBs), stack-string refs (0.4.1+), block-to-block edges, `is_exp$
-- **Report-level**: `oep` (0.4.1+), `find_function_by_offset` / `find_block_by_offset` lookups (0.4.1+), per-disassembly timeout via `parse_with_timeout` (0.4.1+).
-- **Architecture**: x86 / x86_64.
+- **Input formats**: PE (32 / 64-bit), ELF (32 / 64-bit), Mach-O (Intel + ARM64, thin and fat).
+- **Architectures**: x86, x86_64, AArch64 (0.6.0+).
+- **Function discovery**: prologue scan (MSVC + GCC / clang `endbr64` family + ARM64 `stp x29, x30, [sp, #-N]!`), call-target propagation, PE exception-handler (`.pdata`) seeding, PE export-table seeding.
+- **Per-function output**: basic blocks, in / out references, API calls (ApiScout — embedded Win7 + WinXP DBs), stack-string refs, block-to-block edges, `is_exported`, PIC + opcode hashes, dominator tree + nesting depth.
+- **Report-level**: `oep`, `find_function_by_offset` / `find_block_by_offset` lookups, per-disassembly timeout via `parse_with_timeout`.
 
-- **Zero-copy disassembly.** `BinaryInfo<'a>` borrows the input bytes directly. No mapped-image allocation, no per-instruction byte clone, no `DisassemblyReport.buffer` $
+### Architecture-aware decoding (0.6.0)
+
+The decoder lives behind a small `Decoder` trait with two backends:
+
+- **`X86Decoder`** — wraps `iced_x86`. Variable-width, 32 / 64-bit modes. Same x86 path as 0.5.x; zero behavioural change.
+- **`Aarch64Decoder`** — wraps [`disarm64`](https://crates.io/crates/disarm64). Fixed 4-byte instructions, 64-bit only. Validated at 98%+ clean memory-operand extraction on real Apple-silicon ARM64 binaries (Rust release builds, `/bin/ls`) before integration.
+
+**Smda decides which decoder to use.** The caller passes `&[u8]`; smda inspects the header and routes:
+- ELF `e_machine == EM_AARCH64` (183) → AArch64.
+- PE `coff_header.machine == 0xAA64` → AArch64.
+- Mach-O `cputype == CPU_TYPE_ARM64` (0x100000C) → AArch64. For fat (universal) binaries, the slice preference is configurable via `SmdaConfig::macho_arch_preference`: default is `HostNative` (picks the slice matching the host machine — ARM64 on Apple-silicon, x86_64 on Intel/AMD Linux/Windows), with explicit `Aarch64First` / `X86_64First` / `X86First` overrides for analysts who want consistent slice selection regardless of host.
+- Everything else falls through to the existing x86 32/64-bit detection.
+
+`DecodedInsn` is an enum (`X86(IcedInsn)` / `Aarch64(ArmInsn)`); the typed accessors on `function::Instruction` (`mnemonic_enum`, `op_kind`, `memory_base`, `flow_control`, `is_call`, `is_jmp`, `is_ret`, `format_mnemonic`, `format_operands`, `length`, `bytes_in`, `get_printable_len`) keep their 0.5.x signatures and dispatch internally.
+
+**ARM64 function-discovery depth in 0.6.0 is minimum-viable** — exports + entry point as candidate seeds, then the recursive call-target propagation does the rest. A typical ARM64 *executable* with no exports will surface 1 function (the entry point) and everything it calls; an ARM64 *dylib* with N exports surfaces N + transitively-reachable functions. The x86 prologue-scan analysers don't have ARM64 equivalents in this release — that, plus the deeper passes (jump-table walking, indirect-call register tracking, tail-call detection past `b`/`bl`, ARM64 PE `.pdata` packed unwind, typed AArch64 operand extraction for downstream `offset:` rules in capa-rs, AArch64 mnemonic IDF), is the 0.6.1 work. x86/x64 binaries are unaffected — same code, same output as 0.5.2.
+
+### Carried over from 0.5.x
+
+- **Zero-copy disassembly.** `BinaryInfo<'a>` borrows the input bytes directly. No mapped-image allocation, no per-instruction byte clone, no `DisassemblyReport.buffer`.
 - **Modern Linux ELF coverage:** added GCC / clang `endbr64` (`F3 0F 1E FA`) plus the extended GCC AMD64 prologue family (`48 89 5C 24 ??`, `48 83 EC ??`, `41 57 41 56`). On CET-enabled binaries (most modern distros) function discovery improves dramatically — one test ELF went from 3280 → 10106 functions. MSVC samples unchanged.
 - **Linux exit-syscall recognition:** `mov eax, 60; syscall` (and `exit_group` / `int 0x80` equivalents) now end the containing function correctly.
 - **PE exports as candidate seeds:** the export RVA list, previously only surfaced in the public report, now seeds the function-candidate scanner. Free coverage win on stripped DLLs.
@@ -30,7 +49,7 @@ The output is a collection of functions, basic blocks, and instructions with the
 - **Timeout support:** `Disassembler::parse_with_timeout(..., Duration)` + new `Error::AnalysisTimeout` for batch processors of untrusted samples.
 - **Section-table abstraction.** Byte access goes through `binary_info.bytes_at(va, len) -> Result<&[u8]>`, which looks up the VA in a small per-binary `SectionMap` table and returns a borrowed slice into the input. Replaces the old contiguous mapped image.
 - **`Instruction` slimmed down.** The 0.3.x per-instruction `mnemonic: String`, `operands: Option<String>`, and `bytes: String` (hex) fields are gone. Use the typed iced accessors (`mnemonic_enum()`, `op_kind()`, `flow_control()`, …) for hot paths, or `format_mnemonic()` / `format_operands()` / `bytes_in(&binary_info)` for on-demand formatting.
-- **Decoder still iced-x86** (no C/C++ build dep, ~2–3× faster than capstone).
+- **Decoders are pure-Rust** — `iced-x86` for x86 (no C/C++ build dep, ~2–3× faster than capstone) and `disarm64` for AArch64 (table-generated from the ARM ISA JSON, MIT-licensed, also no C dep).
 - **Same security guards.** All the checked-arithmetic, allocation caps, and bounds checks added in 0.3.0 are preserved — the `pe::map_binary` and `elf::map_binary` rewrites kept every defensive check, just changed the return type from `Vec<u8>` to `Vec<SectionMap>`.
 
 ## Quick start
@@ -39,7 +58,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-smda = "0.5"
+smda = "0.6"
 ```
 
 Then disassemble a file:
@@ -77,7 +96,7 @@ fn main() -> smda::Result<()> {
 }
 ```
 
-For raw memory dumps (shellcode, unpacked modules):
+For raw memory dumps (shellcode, unpacked modules — **x86 / x64 only in 0.6.0**; ARM64 shellcode needs file-format wrapping until 0.6.1 ships an arch arg here):
 
 ```rust
 use smda::{Disassembler, SmdaConfig};

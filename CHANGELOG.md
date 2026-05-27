@@ -5,6 +5,94 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-05-27 — AArch64 + Decoder-trait refactor
+
+The 0.6.0 cycle replaces the implicit "everything is iced-x86" decoder
+with an explicit `Decoder` trait + `DecodedInsn` enum so a second ISA
+fits without rewriting every analyser. AArch64 (Apple-silicon Mach-O,
+Linux EM_AARCH64, Windows ARM64 PE) decodes through `disarm64` and
+populates the public `Function` / `Instruction` surface — capa-rs and
+other downstreams can already enumerate ARM64 function CFGs after a
+simple `FileArchitecture::Aarch64` thread-through.
+
+The x86 path is functionally unchanged from 0.5.2 (same instruction
+stream, same heuristics, same output for the smdadump smoke).
+
+### Breaking changes
+
+- **`function::DecodedInsn` was a struct; now it's an enum.** The
+  carrier moved to `smda::disassembler::DecodedInsn`, an enum over
+  `X86(IcedInsn)` and `Aarch64(ArmInsn)`. Pre-0.6.0 reach-through
+  via the `.iced` field is no longer possible — call the typed
+  accessors on the enum (`offset()`, `length()`, `op_count()`,
+  `mnemonic_enum_x86()`, `flow_control_x86()`, `is_call()`,
+  `is_jump()`, `is_return()`, `is_branch()`, …).
+- **`function::Instruction` drops the public `iced` field.** Use
+  `Instruction::iced()` (returns `Option<&iced_x86::Instruction>`)
+  or pattern-match on `Instruction::decoded` (the wrapped
+  `DecodedInsn` enum). The typed accessor methods
+  (`mnemonic_enum()`, `op_kind(i)`, `op_register(i)`, …) keep their
+  0.5.x signatures and dispatch internally — most downstreams only
+  need to drop direct `.iced.` accesses.
+- **`FileArchitecture::Aarch64` variant added.** Downstream `match`
+  statements over `FileArchitecture` need a wildcard arm (the enum
+  is `#[non_exhaustive]` so this is non-breaking at the type level,
+  but any non-wildcard `match` will fail to compile).
+- **`function::DecodedInsn` re-export removed.** The old path
+  `smda::function::DecodedInsn` no longer resolves; consumers
+  should import from `smda::disassembler::DecodedInsn`.
+
+### Added — AArch64 backend
+
+- **`smda::disassembler` module.** New `Decoder` trait + `X86Decoder`
+  / `Aarch64Decoder` impls + `DecodedInsn` enum + per-variant typed
+  accessors. The `Disassembler` carries a `Box<dyn Decoder>` (Send +
+  Sync) picked from `binary_info.file_architecture`.
+- **AArch64 routing in all loaders.** ELF `EM_AARCH64` (e_machine =
+  183), PE `IMAGE_FILE_MACHINE_ARM64` (0xAA64), Mach-O
+  `CPU_TYPE_ARM64` (0x0100_000C) now all map to
+  `FileArchitecture::Aarch64` and dispatch through the disarm64
+  backend.
+- **Mach-O fat-binary ARM64 slice support.** New
+  `macho::extract_macho` accepts ARM64 + Intel slices; fat binaries
+  with both prefer ARM64 on the assumption the host is Apple-silicon.
+  `macho::extract_intel` retained for source-compat.
+- **AArch64 prologue start-byte seed** in the bitness vote table —
+  `0xfd` (low byte of `stp x29, x30, [sp, #-N]!`) weighted so it
+  doesn't perturb x86 detection.
+- **`disarm64` promoted from `[dev-dependencies]` to a regular
+  dependency.** The aarch64_probe example continues to pass (>95%
+  clean base+disp on /bin/ls and Rust release binaries).
+- **AArch64 function analyser (`analyse_function_aarch64`).** A
+  parallel arm of `analyse_function` that walks the disarm64 mnemonic
+  stream instead of iced `FlowControl`: direct `bl` propagates targets
+  into the function-candidate queue, direct `b`/`b.cond`/`cbz`/`tbz`
+  follow PC-relative imm26/imm19/imm14 targets, `ret`/`br` end blocks,
+  `blr` records on `call_register_ins` for the (still x86-only)
+  indirect-call analyser. With seeds from Mach-O exports + entry
+  point, `/bin/ls` on Apple-silicon now produces a non-zero function
+  count (vs zero before).
+- **`disassembler::aarch64_branch_target_raw`** + companion
+  `aarch64_is_direct_call` / `aarch64_is_unconditional_branch` /
+  `aarch64_is_conditional_branch` / `aarch64_is_return` helpers.
+  Encodings per ARM ARM §C6.2 (B/BL imm26, B.cond/CBZ imm19, TBZ
+  imm14). Reuses the raw `u32` already retained on `ArmInsn` so we
+  don't pay the trait-dispatch tax on the hot path.
+- **`disarm64_defn` listed as a direct dep.** Already a transitive
+  pull-in from disarm64; pinned here for the `InsnOpcode::bits()`
+  trait used by the standalone (non-`ArmInsn`) target resolver.
+
+### Migration
+
+The most common 0.5.x callsite — `ins.iced.X` for some iced
+accessor — turns into `ins.X_x86()` (returns `Option`) or stays
+`ins.X()` on `function::Instruction` (where the typed wrappers
+remain). A capa-rs-style consumer iterating
+`Function::get_blocks()` and reading `Instruction::mnemonic_enum()`
+needs no source change; consumers reading `Instruction::iced.X`
+need to swap to `Instruction::iced().unwrap().X` (x86) or branch
+on `Instruction::arch` (cross-arch).
+
 ## [0.5.1] — 2026-05-25 — Hardening + Mach-O polish (additive)
 
 Patch release. No API changes from 0.5.0. Bundles the post-0.5.0
@@ -25,6 +113,42 @@ security audit fixes with two Mach-O quality-of-life improvements.
   `export.offset` would silently truncate to wrong values on 32-bit
   targets. Replaced with `usize::try_from`; oversized values skip the
   entry rather than corrupt.
+
+### Security (AArch64 walker hardening)
+
+Four MEDIUM findings from the post-0.6.0 audit that flagged ways the
+new disarm64-backed `analyse_function_aarch64` walker could mis-classify
+hostile or compiler-pathological code. All four are fixed below; the
+x86 path is unaffected.
+
+- **PAC indirect-branch variants now end the block.** `BRAA`, `BRAAZ`,
+  `BRAB`, `BRABZ` (pointer-auth indirect branches) and `BLRAA`,
+  `BLRAAZ`, `BLRAB`, `BLRABZ` (pointer-auth indirect calls) used to
+  fall through the walker's match cascade and be treated as regular
+  data-processing instructions, so the walker would keep decoding the
+  following constant-pool words as code. They now route through the
+  new `disassembler::aarch64_is_indirect_branch` /
+  `aarch64_is_indirect_call` helpers and end the basic block correctly
+  (with sane-ending set, matching `BR` / `BLR`).
+- **`UDF` / `BRK` / `HLT` traps now end the block.** Compilers emit
+  these after `noreturn` calls (`abort`, `__stack_chk_fail`) or as
+  bounds-check poison; the bytes immediately following are typically
+  a constant-pool literal, not code. New
+  `disassembler::aarch64_is_trap` helper plus a dedicated walker arm
+  set `sanely_ending` and stop the walk.
+- **Out-of-image branch targets no longer pollute `code_refs` /
+  `ins2fn`.** `add_code_ref` for the unconditional `b <imm26>` and
+  the conditional-branch family (`b.cond`, `cbz`, `cbnz`, `tbz`,
+  `tbnz`) was unconditional — corrupted `imm19` / `imm14` values
+  from data-in-code or partial decode would seed phantom edges to
+  unmapped addresses. Both arms are now gated by
+  `is_addr_within_memory_image`, matching the existing `bl` gate.
+- **`b .` self-jump no longer re-seeds the current function as a
+  candidate.** The single-instruction stub-thunk path called
+  `add_reference_candidate(target, i_address, …)` even when
+  `target == i_address` (the classic debugger-trap / never-returns
+  sentinel), creating a self-loop in the candidate queue. Now
+  guarded with `if target != i_address`.
 
 ### Fixed — Mach-O discovery
 

@@ -1,72 +1,47 @@
 //! Decoded function and instruction types.
 //!
-//! As of 0.4.0 `Instruction` is *fully zero-copy*: only the fully-decoded
-//! `iced_x86::Instruction` (16 bytes, `Copy`) is stored per instruction,
-//! plus offset + length. The mnemonic / operands strings are formatted on
-//! demand via [`Instruction::format_mnemonic`] / [`Instruction::format_operands`],
-//! and the raw bytes are looked up via [`Instruction::bytes_in`] against a
-//! `&BinaryInfo`. Pre-0.4.0 each `Instruction` carried owned `String`
-//! mnemonic + operands + hex-encoded bytes — a 6–15 MB allocation cost on
-//! a 100k-instruction binary that this refactor eliminates.
+//! 0.6.0: `Instruction` now wraps a [`crate::disassembler::DecodedInsn`]
+//! enum (x86 or AArch64). The 0.5.x `pub iced: iced_x86::Instruction`
+//! reach-through field is gone — callers that previously did
+//! `ins.iced.mnemonic()` use one of the typed accessors below
+//! (`ins.mnemonic_enum()` / `ins.op_kind(i)` / …). The accessors that
+//! make sense only on x86 carry an `Option<…>` return; arch-agnostic
+//! helpers (`is_call`, `is_jmp`, `is_ret`) dispatch internally.
 //!
-//! The formatter used by `format_mnemonic` / `format_operands` is
-//! configured by [`capstone_compat_formatter`] to byte-match capstone's
-//! output, so downstream consumers that pattern-match on the strings
-//! (e.g. capa-rs rules) get the same characters they did under capstone.
+//! As of 0.4.0 `Instruction` is *fully zero-copy*: only the fully-decoded
+//! per-arch carrier is stored per instruction, plus offset + length. The
+//! mnemonic / operands strings are formatted on demand via
+//! [`Instruction::format_mnemonic`] / [`Instruction::format_operands`],
+//! and the raw bytes are looked up via [`Instruction::bytes_in`] against
+//! a `&BinaryInfo`.
+//!
+//! The capstone-compatible IntelFormatter lives in
+//! [`crate::disassembler::capstone_compat_formatter`] — re-exported here
+//! for downstream API compatibility.
 
+use crate::disassembler::DecodedInsn;
 use crate::{BinaryInfo, DisassemblyReport, DisassemblyResult, FileArchitecture, Result};
-use iced_x86::{FlowControl, Formatter, IntelFormatter, Mnemonic, OpKind, Register};
+use iced_x86::{FlowControl, Mnemonic, OpKind, Register};
 use std::collections::HashMap;
 
-/// Configure an `IntelFormatter` to emit capstone-compatible output:
-/// lowercase hex with `0x` prefix, `dword ptr` / `qword ptr` size prefixes,
-/// space around `+` / `-` in memory operands, and `, ` between operands.
-/// Used internally so the existing string-based heuristics in the analyzer
-/// continue to match.
-#[must_use]
-pub fn capstone_compat_formatter() -> IntelFormatter {
-    let mut fmt = IntelFormatter::new();
-    let opts = fmt.options_mut();
-    // Numeric formatting
-    opts.set_hex_prefix("0x");
-    opts.set_hex_suffix("");
-    opts.set_uppercase_hex(false);
-    opts.set_small_hex_numbers_in_decimal(false);
-    opts.set_add_leading_zero_to_hex_numbers(false);
-    // Spacing
-    opts.set_space_after_operand_separator(true);
-    opts.set_space_between_memory_add_operators(true);
-    opts.set_space_between_memory_mul_operators(false);
-    // Registers / mnemonics lowercase
-    opts.set_uppercase_mnemonics(false);
-    opts.set_uppercase_registers(false);
-    opts.set_uppercase_keywords(false);
-    opts.set_uppercase_decorators(false);
-    opts.set_uppercase_prefixes(false);
-    // Memory size prefix ("dword ptr" / "qword ptr")
-    opts.set_memory_size_options(iced_x86::MemorySizeOptions::Always);
-    fmt
-}
+pub use crate::disassembler::capstone_compat_formatter;
 
-/// A single decoded x86/x64 instruction.
+/// A single decoded instruction. Wraps a [`DecodedInsn`] enum so the
+/// per-instruction surface is identical for x86 and AArch64.
 ///
-/// 0.4.0 dropped the per-instruction `bytes` / `mnemonic` / `operands`
-/// String fields. Formatted strings are produced on demand via
-/// [`Instruction::format_mnemonic`] / [`Instruction::format_operands`];
-/// raw bytes are looked up via [`Instruction::bytes_in`] against the
-/// owning `BinaryInfo`.
-#[derive(Debug, Clone)]
+/// 0.6.0 dropped the public `iced: iced_x86::Instruction` field;
+/// downstream consumers that need typed iced access should call
+/// [`Instruction::iced`] (returns `Option`) or pattern-match on
+/// [`Instruction::decoded`].
+#[derive(Debug, Clone, Copy)]
 pub struct Instruction {
     pub arch: FileArchitecture,
     pub bitness: u32,
     pub offset: u64,
-    /// Byte length (1–15).
+    /// Byte length. 1–15 for x86; always 4 for AArch64.
     pub length: u32,
-    /// Fully-decoded iced instruction (16 bytes, `Copy`). The single
-    /// source of truth for mnemonic / operand / flow-control queries —
-    /// prefer the typed accessors (`mnemonic_enum()`, `op_kind()`, …)
-    /// over re-formatting via `format_mnemonic()`.
-    pub iced: iced_x86::Instruction,
+    /// The decoded per-arch carrier. Variant matches `arch`.
+    pub decoded: DecodedInsn,
 }
 
 impl Instruction {
@@ -77,34 +52,35 @@ impl Instruction {
         Self {
             arch,
             bitness,
-            offset: ins.offset,
-            length: ins.length,
-            iced: ins.iced,
+            offset: ins.offset(),
+            length: ins.length() as u32,
+            decoded: *ins,
         }
+    }
+
+    /// The underlying iced instruction for x86 decodes. Returns `None`
+    /// on AArch64 — callers walking operands should branch on
+    /// `arch` / `decoded` to pick the right path.
+    #[inline]
+    #[must_use]
+    pub fn iced(&self) -> Option<&iced_x86::Instruction> {
+        self.decoded.as_iced()
     }
 
     /// Format the mnemonic on demand. Allocates a fresh `String` per call —
     /// hot-path consumers that read the mnemonic repeatedly should cache
-    /// the result locally or use `mnemonic_enum()` for typed comparisons.
+    /// the result locally or use `mnemonic_enum()` for typed comparisons
+    /// (x86) / `mnemonic_aarch64()` (AArch64).
     #[must_use]
     pub fn format_mnemonic(&self) -> String {
-        let mut fmt = capstone_compat_formatter();
-        let mut out = String::new();
-        fmt.format_mnemonic(&self.iced, &mut out);
-        out
+        self.decoded.format_mnemonic()
     }
 
     /// Format the operands on demand. Returns `None` for zero-operand
     /// instructions (e.g. `ret`). Allocates a fresh `String` per call.
     #[must_use]
     pub fn format_operands(&self) -> Option<String> {
-        if self.iced.op_count() == 0 {
-            return None;
-        }
-        let mut fmt = capstone_compat_formatter();
-        let mut out = String::new();
-        fmt.format_all_operands(&self.iced, &mut out);
-        Some(out)
+        self.decoded.format_operands()
     }
 
     /// Look up the raw instruction bytes in the given `BinaryInfo`.
@@ -119,88 +95,135 @@ impl Instruction {
         Ok(hex::encode(self.bytes_in(binary_info)?))
     }
 
-    // ---- typed accessors (new in 0.3.0; preferred over string parsing) ----
+    // ---- typed accessors -------------------------------------------------
+    //
+    // Surface kept signature-compatible with 0.5.x where possible: the
+    // x86-only accessors return their iced types directly when called on
+    // an x86 instruction (panicking on AArch64 would be wrong; we return
+    // a sentinel — see method docs). Use the `_opt` siblings when the
+    // analyser wants to gracefully degrade on AArch64.
 
+    /// iced `Mnemonic` for x86 instructions. Returns `Mnemonic::INVALID`
+    /// on AArch64 (use [`Instruction::mnemonic_aarch64`] there).
     #[must_use]
     pub fn mnemonic_enum(&self) -> Mnemonic {
-        self.iced.mnemonic()
+        self.decoded
+            .mnemonic_enum_x86()
+            .unwrap_or(Mnemonic::INVALID)
     }
+
+    /// AArch64 mnemonic string (e.g. `"ldr"`, `"stp"`, `"bl"`) or
+    /// `None` on x86. Allocates per call — Debug-derived from
+    /// `disarm64::decoder::Mnemonic`.
+    #[must_use]
+    pub fn mnemonic_aarch64(&self) -> Option<String> {
+        self.decoded.mnemonic_aarch64()
+    }
+
+    /// iced `Code` for x86 instructions. Returns `Code::INVALID` on
+    /// AArch64.
     #[must_use]
     pub fn code(&self) -> iced_x86::Code {
-        self.iced.code()
+        self.decoded.code_x86().unwrap_or(iced_x86::Code::INVALID)
     }
+
     #[must_use]
     pub fn op_count(&self) -> u32 {
-        self.iced.op_count()
+        self.decoded.op_count()
     }
+
+    /// iced `OpKind` for the i-th operand. Returns `OpKind::Register`
+    /// on AArch64 (no-op sentinel — AArch64 operand walking is a 0.6.1
+    /// feature; analysers should gate on `arch` before calling this).
     #[must_use]
     pub fn op_kind(&self, i: u32) -> OpKind {
-        self.iced.op_kind(i)
+        self.decoded.op_kind_x86(i).unwrap_or(OpKind::Register)
     }
+
     #[must_use]
     pub fn op_register(&self, i: u32) -> Register {
-        self.iced.op_register(i)
+        self.decoded.op_register_x86(i).unwrap_or(Register::None)
     }
+
     #[must_use]
     pub fn memory_base(&self) -> Register {
-        self.iced.memory_base()
+        self.decoded.memory_base_x86().unwrap_or(Register::None)
     }
+
     #[must_use]
     pub fn memory_index(&self) -> Register {
-        self.iced.memory_index()
+        self.decoded.memory_index_x86().unwrap_or(Register::None)
     }
+
     #[must_use]
     pub fn memory_displacement64(&self) -> u64 {
-        self.iced.memory_displacement64()
+        self.decoded.memory_displacement64_x86().unwrap_or(0)
     }
+
     #[must_use]
     pub fn memory_segment(&self) -> Register {
-        self.iced.memory_segment()
+        self.decoded.memory_segment_x86().unwrap_or(Register::None)
     }
+
     #[must_use]
     pub fn near_branch_target(&self) -> u64 {
-        self.iced.near_branch_target()
+        self.decoded.near_branch_target_x86().unwrap_or(0)
     }
+
     #[must_use]
     pub fn flow_control(&self) -> FlowControl {
-        self.iced.flow_control()
+        self.decoded.flow_control_x86().unwrap_or(FlowControl::Next)
     }
+
     #[must_use]
     pub fn is_call(&self) -> bool {
-        matches!(
-            self.iced.flow_control(),
-            FlowControl::Call | FlowControl::IndirectCall
-        )
+        self.decoded.is_call()
     }
+
     #[must_use]
     pub fn is_jmp(&self) -> bool {
-        matches!(
-            self.iced.flow_control(),
-            FlowControl::UnconditionalBranch | FlowControl::IndirectBranch
-        )
+        self.decoded.is_jump()
     }
+
     #[must_use]
     pub fn is_conditional_jmp(&self) -> bool {
-        matches!(self.iced.flow_control(), FlowControl::ConditionalBranch)
+        match &self.decoded {
+            DecodedInsn::X86(x) => matches!(x.iced.flow_control(), FlowControl::ConditionalBranch),
+            DecodedInsn::Aarch64(a) => matches!(
+                a.decoded.mnemonic,
+                disarm64::decoder::Mnemonic::b_
+                    | disarm64::decoder::Mnemonic::cbz
+                    | disarm64::decoder::Mnemonic::cbnz
+                    | disarm64::decoder::Mnemonic::tbz
+                    | disarm64::decoder::Mnemonic::tbnz
+            ),
+        }
     }
+
     #[must_use]
     pub fn is_ret(&self) -> bool {
-        matches!(self.iced.flow_control(), FlowControl::Return)
+        self.decoded.is_return()
     }
 
     // ---- algorithms (migrated from capstone-string-parsing to typed) ------
 
     /// Detects "`mov [stack], <imm>`"-style stack strings. Returns the
     /// printable length of the immediate if it is ASCII / UTF-16 LE, else 0.
+    ///
+    /// x86 only — returns Ok(0) on AArch64 (the equivalent stack-string
+    /// pattern uses `mov` + `str` and lands in 0.6.1).
     pub fn get_printable_len(&self) -> Result<u64> {
-        if self.iced.op_count() != 2 {
+        let Some(iced) = self.iced() else {
+            return Ok(0);
+        };
+        if iced.op_count() != 2 {
             return Ok(0);
         }
-        let (chars, ascii_len, utf16_len): (Vec<u8>, u64, u64) = match self.iced.op_kind(1) {
-            OpKind::Immediate8 => (vec![self.iced.immediate8()], 1, 0),
-            OpKind::Immediate16 => (self.iced.immediate16().to_le_bytes().to_vec(), 2, 1),
-            OpKind::Immediate32 => (self.iced.immediate32().to_le_bytes().to_vec(), 4, 2),
-            OpKind::Immediate64 => (self.iced.immediate64().to_le_bytes().to_vec(), 8, 4),
+        let (chars, ascii_len, utf16_len): (Vec<u8>, u64, u64) = match iced.op_kind(1) {
+            OpKind::Immediate8 => (vec![iced.immediate8()], 1, 0),
+            OpKind::Immediate16 => (iced.immediate16().to_le_bytes().to_vec(), 2, 1),
+            OpKind::Immediate32 => (iced.immediate32().to_le_bytes().to_vec(), 4, 2),
+            OpKind::Immediate64 => (iced.immediate64().to_le_bytes().to_vec(), 8, 4),
             _ => return Ok(0),
         };
         if is_printable_ascii(&chars)? {
@@ -215,15 +238,22 @@ impl Instruction {
     /// Returns the absolute addresses referenced by immediate or memory
     /// operands, filtered to addresses inside the mapped image. Skips
     /// control-flow / compare / test instructions.
+    ///
+    /// x86 only in 0.6.0 — returns an empty Vec on AArch64. The
+    /// AArch64 equivalent walks `ldr literal` + `adrp/add` pairs and
+    /// lands in 0.6.1.
     pub fn get_data_refs(&self, report: &DisassemblyReport) -> Result<Vec<u64>> {
+        let Some(iced) = self.iced() else {
+            return Ok(vec![]);
+        };
         if !matches!(
-            self.iced.flow_control(),
+            iced.flow_control(),
             FlowControl::Next | FlowControl::Exception
         ) {
             return Ok(vec![]);
         }
         if matches!(
-            self.iced.mnemonic(),
+            iced.mnemonic(),
             Mnemonic::Cmp
                 | Mnemonic::Cmpsb
                 | Mnemonic::Cmpsw
@@ -234,14 +264,13 @@ impl Instruction {
             return Ok(vec![]);
         }
         let mut res = Vec::new();
-        for i in 0..self.iced.op_count() {
-            let value: u64 = match self.iced.op_kind(i) {
-                OpKind::Immediate8 => self.iced.immediate8() as u64,
-                OpKind::Immediate16 => self.iced.immediate16() as u64,
-                OpKind::Immediate32 => self.iced.immediate32() as u64,
-                OpKind::Immediate64 => self.iced.immediate64(),
-                // iced returns the RIP-resolved displacement directly.
-                OpKind::Memory => self.iced.memory_displacement64(),
+        for i in 0..iced.op_count() {
+            let value: u64 = match iced.op_kind(i) {
+                OpKind::Immediate8 => iced.immediate8() as u64,
+                OpKind::Immediate16 => iced.immediate16() as u64,
+                OpKind::Immediate32 => iced.immediate32() as u64,
+                OpKind::Immediate64 => iced.immediate64(),
+                OpKind::Memory => iced.memory_displacement64(),
                 _ => 0,
             };
             if value != 0 && report.is_addr_within_memory_image(&value)? {
@@ -318,10 +347,6 @@ impl Function {
                     0.0
                 },
                 is_exported: {
-                    // PE: match against the export-RVA list with image-base
-                    // applied. The list is small (typically tens-to-hundreds
-                    // of exports per DLL); a linear scan is cheaper than
-                    // building a HashSet per Function construction.
                     let base = disassembly.binary_info.base_addr;
                     disassembly.binary_info.exports.iter().any(|(_n, rva, _f)| {
                         base.checked_add(*rva as u64) == Some(*function_offset)
@@ -329,11 +354,6 @@ impl Function {
                 },
                 stringrefs: Vec::new(),
             };
-        // (0.4.1 N12) Walk every instruction in every block and record
-        // those whose immediate operand looks like a printable
-        // stack-string write. We can't fill this inside the struct
-        // initializer because we need to look at the already-constructed
-        // `blocks` field.
         let mut f = f;
         for block in f.blocks.values() {
             for ins in block {
@@ -401,8 +421,15 @@ impl Function {
             return Ok(false);
         }
         let first_ins = &self.blocks[&self.offset][0];
-        if !matches!(first_ins.mnemonic_enum(), Mnemonic::Jmp | Mnemonic::Call) {
-            return Ok(false);
+        // x86 only: a single `jmp`/`call` with an API ref. AArch64 thunks
+        // (a `br` to a got slot) land in 0.6.1.
+        match first_ins.decoded {
+            DecodedInsn::X86(_) => {
+                if !matches!(first_ins.mnemonic_enum(), Mnemonic::Jmp | Mnemonic::Call) {
+                    return Ok(false);
+                }
+            }
+            DecodedInsn::Aarch64(_) => return Ok(false),
         }
         if self.apirefs.is_empty() {
             return Ok(false);
@@ -416,14 +443,6 @@ impl Function {
     /// CFG. Returns a map from each block VA to its immediate dominator VA.
     /// The entry block (this function's `offset`) is omitted — it has no
     /// dominator.
-    ///
-    /// Uses the iterative dataflow algorithm: O(N²·E) worst case, but
-    /// per-function CFGs are small (typically < 100 blocks) so it runs in
-    /// microseconds in practice. Mirrors `SmdaFunction.getBlockDominatorTree`
-    /// upstream.
-    ///
-    /// Unreachable blocks (those with no predecessors that aren't the entry)
-    /// are omitted from the returned map.
     #[must_use]
     pub fn dominator_tree(&self) -> HashMap<u64, u64> {
         use std::collections::BTreeSet;
@@ -433,7 +452,6 @@ impl Function {
             return HashMap::new();
         }
 
-        // Predecessor map derived from blockrefs (block -> successors).
         let mut preds: HashMap<u64, Vec<u64>> = HashMap::with_capacity(all_blocks.len());
         for b in &all_blocks {
             preds.insert(*b, Vec::new());
@@ -448,7 +466,6 @@ impl Function {
             }
         }
 
-        // dom(entry) = {entry}; dom(other) = all blocks.
         let all_set: BTreeSet<u64> = all_blocks.iter().copied().collect();
         let mut dom: HashMap<u64, BTreeSet<u64>> = HashMap::with_capacity(all_blocks.len());
         let mut entry_only = BTreeSet::new();
@@ -460,7 +477,6 @@ impl Function {
             }
         }
 
-        // Iterate to fixed point.
         let mut changed = true;
         while changed {
             changed = false;
@@ -492,14 +508,11 @@ impl Function {
             }
         }
 
-        // Extract immediate dominators: idom(B) is the dominator of B closest
-        // to B — equivalently the one with the largest dominator set.
         let mut idom = HashMap::with_capacity(all_blocks.len().saturating_sub(1));
         for b in &all_blocks {
             if *b == entry {
                 continue;
             }
-            // Skip blocks the iteration never reached (no predecessors).
             if dom[b] == all_set {
                 continue;
             }
@@ -521,14 +534,6 @@ impl Function {
     }
 
     /// (0.4.2 N15) Compute the maximum loop-nesting depth for each block.
-    /// Returns a map from block VA to nesting depth. Blocks not in any loop
-    /// have depth 0; blocks in N nested loops have depth N. Mirrors
-    /// `SmdaFunction.getNestingDepth` upstream.
-    ///
-    /// A back-edge is an edge `(s, h)` where `h` dominates `s`. The natural
-    /// loop of a back-edge is `{h}` plus every block that can reach `s`
-    /// without going through `h`. Per-block depth is the count of natural
-    /// loops containing it.
     #[must_use]
     pub fn nesting_depth(&self) -> HashMap<u64, u32> {
         use std::collections::HashSet;
@@ -537,17 +542,13 @@ impl Function {
         let all_blocks: HashSet<u64> = self.blocks.keys().copied().collect();
         let mut depth: HashMap<u64, u32> = all_blocks.iter().map(|b| (*b, 0u32)).collect();
 
-        // Does `dominator` dominate `block`?  Walk idom chain from `block`.
         let dominates = |dominator: u64, block: u64| -> bool {
             if dominator == block {
                 return true;
             }
             let mut cur = block;
-            // Bounded walk — idom forms a tree so this terminates at entry.
             for _ in 0..self.blocks.len() {
                 let Some(&parent) = idom.get(&cur) else {
-                    // Reached the entry (no idom recorded) or an unreachable
-                    // block. dominator dominates iff dominator == entry.
                     return dominator == entry && cur == entry;
                 };
                 if parent == dominator {
@@ -561,7 +562,6 @@ impl Function {
             false
         };
 
-        // Collect back-edges.
         let mut back_edges: Vec<(u64, u64)> = Vec::new();
         for (src, dsts) in &self.blockrefs {
             if !all_blocks.contains(src) {
@@ -577,7 +577,6 @@ impl Function {
             return depth;
         }
 
-        // Predecessor map for reverse walks (loop discovery).
         let mut preds: HashMap<u64, Vec<u64>> = HashMap::with_capacity(all_blocks.len());
         for b in &all_blocks {
             preds.insert(*b, Vec::new());
@@ -590,7 +589,6 @@ impl Function {
             }
         }
 
-        // For each back-edge, compute the natural loop and bump every member.
         for (s, h) in back_edges {
             let mut loop_blocks: HashSet<u64> = HashSet::new();
             loop_blocks.insert(h);
@@ -620,20 +618,16 @@ impl Function {
 
     /// (0.4.2 N16) Position-independent hash of this function's instruction
     /// stream — first 8 bytes of SHA-256 over a canonical structural
-    /// signature with displacements / branch targets zeroed. Stable across
-    /// relocation, useful for malware-clustering pipelines. Mirrors
-    /// `SmdaFunction.getPicHash` upstream.
+    /// signature with displacements / branch targets zeroed.
     ///
-    /// Per-instruction signature captures: iced `Code` (the precise
-    /// encoding variant), operand kinds, register operands, memory
-    /// base/index/scale. Memory displacements, RIP-relative offsets, and
-    /// near-branch targets are deliberately omitted (that's the "PIC"
-    /// part). Immediate values are kept — they often carry semantic
-    /// fingerprints (constants, syscall numbers, string lengths).
-    ///
-    /// Block iteration order is sorted by VA so the hash is deterministic
-    /// across HashMap iteration orders. Returns the first 8 bytes of the
-    /// SHA-256 digest interpreted as a little-endian `u64`.
+    /// Two signatures depending on the variant: x86 uses the iced
+    /// structural surface (operand kinds, registers); AArch64 uses
+    /// `(opcode_word & 0xFFC003FF)` — the bits with the PC-relative
+    /// displacement masked out (12-bit imm12 in bits [21:10] for
+    /// LDR/STR; 19-bit imm19 for b.cond / cbz / ldr literal; 26-bit
+    /// imm26 for unconditional b/bl). The mask we use here zeroes the
+    /// largest of those slots without touching the register / opcode
+    /// fields — adequate for clustering across relocation.
     #[must_use]
     pub fn pic_hash(&self) -> u64 {
         use sha2::{Digest, Sha256};
@@ -644,9 +638,19 @@ impl Function {
         for off in block_offsets {
             let block = &self.blocks[&off];
             for ins in block {
-                buf.clear();
-                Self::pic_signature_into(&ins.iced, &mut buf);
-                hasher.update(&buf);
+                match ins.decoded {
+                    DecodedInsn::X86(x) => {
+                        buf.clear();
+                        Self::pic_signature_into(&x.iced, &mut buf);
+                        hasher.update(&buf);
+                    }
+                    DecodedInsn::Aarch64(a) => {
+                        // Mask bits [25:10] — covers imm26 / imm19 / imm12
+                        // slots so PC-relative displacements drop out.
+                        let masked = a.opcode & !0x03FF_FC00;
+                        hasher.update(masked.to_le_bytes());
+                    }
+                }
             }
         }
         let out = hasher.finalize();
@@ -657,8 +661,6 @@ impl Function {
 
     /// (0.4.2 N16) Mnemonic-only hash — broadest clustering granularity.
     /// First 8 bytes of SHA-256 over the function's `Mnemonic` sequence.
-    /// Collides on any two instructions with the same mnemonic regardless
-    /// of operand kinds. Mirrors `SmdaFunction.getOpcHash` upstream.
     #[must_use]
     pub fn opcode_hash(&self) -> u64 {
         use sha2::{Digest, Sha256};
@@ -668,8 +670,20 @@ impl Function {
         for off in block_offsets {
             let block = &self.blocks[&off];
             for ins in block {
-                let m = ins.iced.mnemonic() as u32;
-                hasher.update(m.to_le_bytes());
+                match ins.decoded {
+                    DecodedInsn::X86(x) => {
+                        let m = x.iced.mnemonic() as u32;
+                        hasher.update(m.to_le_bytes());
+                    }
+                    DecodedInsn::Aarch64(a) => {
+                        // Mnemonic is `#[repr(?)]` without a stable
+                        // discriminant guarantee — use the Debug string,
+                        // which is the variant name and therefore stable
+                        // across disarm64 v0.1.x.
+                        let dbg = format!("{:?}", a.decoded.mnemonic);
+                        hasher.update(dbg.as_bytes());
+                    }
+                }
             }
         }
         let out = hasher.finalize();
@@ -678,8 +692,8 @@ impl Function {
         u64::from_le_bytes(bytes)
     }
 
-    /// Internal — write the PIC signature of one decoded instruction into
-    /// `out`. See [`Function::pic_hash`] for the rationale.
+    /// Internal — write the PIC signature of one decoded x86 instruction
+    /// into `out`. See [`Function::pic_hash`] for the rationale.
     fn pic_signature_into(iced: &iced_x86::Instruction, out: &mut Vec<u8>) {
         out.extend_from_slice(&(iced.code() as u32).to_le_bytes());
         let count = iced.op_count();
@@ -695,11 +709,8 @@ impl Function {
                     out.extend_from_slice(&(iced.memory_base() as u16).to_le_bytes());
                     out.extend_from_slice(&(iced.memory_index() as u16).to_le_bytes());
                     out.push(iced.memory_index_scale() as u8);
-                    // Displacement intentionally omitted (PIC).
                 }
-                OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
-                    // Branch target intentionally omitted (PIC).
-                }
+                OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {}
                 OpKind::Immediate8 => out.push(iced.immediate8()),
                 OpKind::Immediate16 => out.extend_from_slice(&iced.immediate16().to_le_bytes()),
                 OpKind::Immediate32 => out.extend_from_slice(&iced.immediate32().to_le_bytes()),
@@ -713,28 +724,6 @@ impl Function {
                 _ => {}
             }
         }
-    }
-}
-
-/// Internal carrier type. The analyzer stashes one per decoded instruction
-/// into `FunctionAnalysisState` / `DisassemblyResult`, then `Function::new`
-/// transforms them into public `Instruction` values.
-///
-/// 0.4.0 dropped the per-instruction `bytes: Vec<u8>` field — the bytes
-/// are looked up via [`DecodedInsn::bytes_in`] against the owning
-/// `BinaryInfo` on demand. For a 100k-instruction binary this avoids
-/// ~4 MB of per-instruction `Vec<u8>` allocation.
-#[derive(Debug, Clone, Copy)]
-pub struct DecodedInsn {
-    pub offset: u64,
-    pub length: u32,
-    pub iced: iced_x86::Instruction,
-}
-
-impl DecodedInsn {
-    /// Look up the raw instruction bytes in `binary_info`. Zero-copy.
-    pub fn bytes_in<'b>(&self, binary_info: &'b BinaryInfo<'_>) -> Result<&'b [u8]> {
-        binary_info.bytes_at(self.offset, self.length)
     }
 }
 

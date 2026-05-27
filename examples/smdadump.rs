@@ -44,6 +44,13 @@ fn main() -> ExitCode {
     println!("architecture : {:?}", report.architecture);
     println!("bitness      : {}", report.bitness);
     println!("base addr    : 0x{:x}", report.base_addr);
+    println!("entry point  : 0x{:x}", report.binary_info.entry_point);
+    println!("oep          : 0x{:x}", report.oep);
+    println!("exports      : {}", report.binary_info.exports.len());
+    println!("code areas   : {}", report.binary_info.code_areas.len());
+    for (i, (start, end)) in report.binary_info.code_areas.iter().enumerate().take(5) {
+        println!("  [{i}] 0x{start:x} .. 0x{end:x}  ({} bytes)", end - start);
+    }
     println!("functions    : {}", report.functions.len());
 
     if !report.binary_info.imports.is_empty() {

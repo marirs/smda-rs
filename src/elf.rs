@@ -8,7 +8,9 @@ pub fn get_bitness(binary: &[u8]) -> Result<u32> {
         _ => return Err(Error::UnsupportedFormatError),
     };
     let machine_type = elffile.header.e_machine;
-    if machine_type == goblin::elf::header::EM_X86_64 {
+    if machine_type == goblin::elf::header::EM_X86_64
+        || machine_type == goblin::elf::header::EM_AARCH64
+    {
         return Ok(64);
     } else if machine_type == goblin::elf::header::EM_386
         || machine_type == goblin::elf::header::EM_ARM

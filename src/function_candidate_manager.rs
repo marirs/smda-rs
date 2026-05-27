@@ -1,6 +1,6 @@
-use crate::function::DecodedInsn;
+use crate::disassembler::DecodedInsn;
 use crate::{
-    DisassemblyResult, FunctionAnalysisState, Result, error::Error,
+    DisassemblyResult, FileArchitecture, FunctionAnalysisState, Result, error::Error,
     function_candidate::FunctionCandidate,
 };
 use iced_x86::{Decoder, DecoderOptions, Mnemonic};
@@ -333,6 +333,16 @@ impl FunctionCandidateManager {
         disassembly: &DisassemblyResult,
     ) -> Result<()> {
         if self.bitness != 64 {
+            return Ok(());
+        }
+        // 0.6.0: the `.pdata` layout we walk below is the x64 SEH
+        // `RUNTIME_FUNCTION` / `UNWIND_INFO` format. ARM64 Windows PE
+        // uses a different `.pdata` schema (packed unwind data). Skip
+        // for now; ARM64 .pdata support lands in 0.6.1.
+        if matches!(
+            disassembly.binary_info.file_architecture,
+            FileArchitecture::Aarch64
+        ) {
             return Ok(());
         }
         let base_addr = disassembly.binary_info.base_addr;
@@ -677,9 +687,9 @@ impl FunctionCandidateManager {
     ) -> Result<bool> {
         let mut is_alignment_sequence = false;
         if !instruction_sequence.is_empty() {
-            let mut current_offset = instruction_sequence[0].offset;
+            let mut current_offset = instruction_sequence[0].offset();
             for instruction in instruction_sequence {
-                let len = instruction.length as usize;
+                let len = instruction.length();
                 // 0.4.0: bytes are looked up on demand from BinaryInfo
                 // instead of being owned by the DecodedInsn.
                 let Ok(bytes) = instruction.bytes_in(&disassembly.binary_info) else {
@@ -796,8 +806,14 @@ impl FunctionCandidateManager {
                 continue;
             }
             // Try to find a single instruction at the current gap that's a
-            // NOP encoding; if so, skip it and continue looking.
-            {
+            // NOP encoding; if so, skip it and continue looking. x86
+            // only — the iced Decoder is used directly here. AArch64
+            // NOP detection (a 4-byte `1f 20 03 d5` word) lands in
+            // 0.6.1 alongside the rest of the gap-scan AArch64 work.
+            if !matches!(
+                disassembly.binary_info.file_architecture,
+                FileArchitecture::Aarch64
+            ) {
                 let buf = disassembly.get_raw_bytes(gap_offset, 15)?;
                 let mut decoder =
                     Decoder::with_ip(self.bitness, buf, gap_offset, DecoderOptions::NONE);
@@ -808,6 +824,8 @@ impl FunctionCandidateManager {
                         continue;
                     }
                 }
+            }
+            {
                 //# try to find effective NOPs and skip them.
                 let mut found_multi_byte_nop = false;
                 // Iterate widest → narrowest so we match the longest

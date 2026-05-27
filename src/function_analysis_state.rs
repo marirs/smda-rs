@@ -1,4 +1,4 @@
-use crate::{DisassemblyResult, Result, error::Error, function::DecodedInsn};
+use crate::{DisassemblyResult, Result, disassembler::DecodedInsn, error::Error};
 use iced_x86::{FlowControl, Mnemonic};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -155,7 +155,7 @@ impl FunctionAnalysisState {
     ) -> Result<Vec<DecodedInsn>> {
         let mut backtracked = vec![];
         for instruction in &self.instructions {
-            if instruction.offset < addr_from {
+            if instruction.offset() < addr_from {
                 backtracked.push(*instruction);
             }
         }
@@ -183,8 +183,8 @@ impl FunctionAnalysisState {
     }
 
     pub fn add_instruction(&mut self, ins: DecodedInsn) -> Result<()> {
-        let i_address = ins.offset;
-        let i_size = ins.length as u64;
+        let i_address = ins.offset();
+        let i_size = ins.length() as u64;
         self.instructions.push(ins);
         self.instruction_start_bytes.insert(i_address);
         self.current_block.push(ins);
@@ -209,23 +209,42 @@ impl FunctionAnalysisState {
         disassembly: &mut DisassemblyResult,
     ) -> Result<bool> {
         if as_gap && !self.is_sanely_ending {
-            // sane case: stub-jmp that is just a `EB <rel8>` short jump
-            if self.instructions.len() == 1
-                && matches!(self.instructions[0].iced.mnemonic(), Mnemonic::Jmp)
-            {
-                let byte = disassembly.get_byte(self.instructions[0].offset)?;
+            // sane case: stub-jmp that is just a `EB <rel8>` short jump.
+            let first_is_x86_jmp = self
+                .instructions
+                .first()
+                .and_then(|i| i.mnemonic_enum_x86())
+                .is_some_and(|m| matches!(m, Mnemonic::Jmp));
+            // 0.6.0: AArch64 analog — a single-instruction stub thunk
+            // (`b <import>`) is a legitimate function end too. Detect
+            // via the arch-agnostic `is_jump()` (which matches the
+            // disarm64 `b` mnemonic on AArch64).
+            let first_is_aarch64_b = self
+                .instructions
+                .first()
+                .is_some_and(|i| matches!(i, DecodedInsn::Aarch64(_)) && i.is_jump());
+            if self.instructions.len() == 1 && first_is_x86_jmp {
+                let byte = disassembly.get_byte(self.instructions[0].offset())?;
                 if byte == 0xEB {
                     return Ok(false);
                 }
+            } else if self.instructions.len() == 1 && first_is_aarch64_b {
+                // Accept the AArch64 single-instruction stub as a real
+                // function (its body is just the tail-call branch).
             }
             // sane case: single-block tailcall (jmp/call as last)
             else if self.num_blocks_analyzed == 1 {
                 let Some(last) = self.instructions.last() else {
                     return Ok(false);
                 };
-                if matches!(last.iced.mnemonic(), Mnemonic::Jmp | Mnemonic::Call) {
-                    // tailcall-like; accept
-                } else {
+                let is_tailcall_like = match last.mnemonic_enum_x86() {
+                    Some(m) => matches!(m, Mnemonic::Jmp | Mnemonic::Call),
+                    // AArch64: b / bl are the analogous tail-call forms.
+                    // Use the arch-agnostic `is_call` / `is_jump` so we
+                    // don't pay for the per-call mnemonic-string alloc.
+                    None => last.is_call() || last.is_jump(),
+                };
+                if !is_tailcall_like {
                     return Ok(false);
                 }
             } else {
@@ -241,7 +260,7 @@ impl FunctionAnalysisState {
     pub fn get_blocks(&self) -> Result<Vec<Vec<DecodedInsn>>> {
         let mut ins = HashMap::new();
         for (cc, i) in self.instructions.iter().enumerate() {
-            ins.insert(i.offset, cc);
+            ins.insert(i.offset(), cc);
         }
         let mut potential_starts = self.jump_targets.clone();
         potential_starts.push(self.start_addr);
@@ -257,15 +276,13 @@ impl FunctionAnalysisState {
                 block.push(*current);
 
                 // If one code reference is to another address than the next
-                if self.code_refs_from.contains_key(&current.offset)
-                    && !matches!(
-                        current.iced.flow_control(),
-                        FlowControl::Call | FlowControl::IndirectCall
-                    )
+                let cur_off = current.offset();
+                if self.code_refs_from.contains_key(&cur_off)
+                    && !current.is_call()
                     && i != self.instructions.len() - 1
                 {
-                    for r in &self.code_refs_from[&current.offset] {
-                        if *r != self.instructions[i + 1].offset {
+                    for r in &self.code_refs_from[&cur_off] {
+                        if *r != self.instructions[i + 1].offset() {
                             break;
                         }
                     }
@@ -274,14 +291,14 @@ impl FunctionAnalysisState {
                 if i != self.instructions.len() - 1
                     && self
                         .code_refs_to
-                        .contains_key(&self.instructions[i + 1].offset)
-                    && (self.code_refs_to[&self.instructions[i + 1].offset].len() > 1
-                        || potential_starts.contains(&self.instructions[i + 1].offset))
+                        .contains_key(&self.instructions[i + 1].offset())
+                    && (self.code_refs_to[&self.instructions[i + 1].offset()].len() > 1
+                        || potential_starts.contains(&self.instructions[i + 1].offset()))
                 {
                     break;
                 }
 
-                if is_end_instruction(current.iced.mnemonic(), current.iced.flow_control()) {
+                if is_end_decoded(current) {
                     break;
                 }
             }
@@ -295,14 +312,14 @@ impl FunctionAnalysisState {
     pub fn finalize_regular_analysis(&mut self, disassembly: &mut DisassemblyResult) -> Result<()> {
         let mut fn_min: u64 = 0xFFFFFFFFFFFFFFFF;
         for s in &self.instructions {
-            if s.offset < fn_min {
-                fn_min = s.offset;
+            if s.offset() < fn_min {
+                fn_min = s.offset();
             }
         }
         let mut fn_max: u64 = 0;
         for s in &self.instructions {
-            if s.offset + s.length as u64 > fn_max {
-                fn_max = s.offset + s.length as u64;
+            if s.offset() + s.length() as u64 > fn_max {
+                fn_max = s.offset() + s.length() as u64;
             }
         }
         // 0.4.2 (N1): don't overwrite a pre-populated function symbol
@@ -320,20 +337,22 @@ impl FunctionAnalysisState {
             .insert(self.start_addr, (fn_min, fn_max));
         for ins in &self.instructions {
             // Note: we no longer store the mnemonic string per instruction
-            // (it's available via iced enum). The legacy `instructions`
-            // map kept a (mnemonic_str, length) pair; for compatibility we
-            // store length-only with an empty string. Real consumers should
-            // walk `functions` instead and read the DecodedInsn.iced.
+            // (it's available via the DecodedInsn typed surface). The
+            // legacy `instructions` map kept a (mnemonic_str, length)
+            // pair; for compatibility we store length-only with an empty
+            // string. Real consumers should walk `functions` instead.
+            let ins_off = ins.offset();
+            let ins_len = ins.length() as u32;
             disassembly
                 .instructions
-                .insert(ins.offset, (String::new(), ins.length));
-            for offset in 0..ins.length {
+                .insert(ins_off, (String::new(), ins_len));
+            for offset in 0..ins_len {
                 disassembly
                     .code_map
-                    .insert(ins.offset + offset as u64, ins.offset);
+                    .insert(ins_off + offset as u64, ins_off);
                 disassembly
                     .ins2fn
-                    .insert(ins.offset + offset as u64, self.start_addr);
+                    .insert(ins_off + offset as u64, self.start_addr);
             }
         }
         for cref in &self.code_refs {
@@ -390,6 +409,19 @@ impl FunctionAnalysisState {
 
 /// Replaces the prior `END_INS` `&[Option<&str>]` constant. Returns true if
 /// the instruction is a "block-ending" instruction (return, hlt, int3).
+#[allow(dead_code)]
 fn is_end_instruction(mnem: Mnemonic, fc: FlowControl) -> bool {
     matches!(fc, FlowControl::Return) || matches!(mnem, Mnemonic::Hlt | Mnemonic::Int3)
+}
+
+/// Arch-agnostic block-ending check used by `get_blocks`. On x86 this
+/// is true for `ret` / `hlt` / `int3`; on AArch64 for `ret` (other
+/// terminators — `b`, `b.cond`, `cbz`, etc. — are caught upstream via
+/// the analyser's branch detection).
+fn is_end_decoded(ins: &DecodedInsn) -> bool {
+    if let Some(iced) = ins.as_iced() {
+        is_end_instruction(iced.mnemonic(), iced.flow_control())
+    } else {
+        ins.is_return()
+    }
 }

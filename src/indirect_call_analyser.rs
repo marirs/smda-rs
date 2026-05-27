@@ -1,8 +1,8 @@
 #![allow(clippy::too_many_arguments)]
 use crate::{
     Disassembler, FunctionAnalysisState, Result,
+    disassembler::{DecodedInsn, capstone_compat_formatter},
     error::Error,
-    function::{DecodedInsn, capstone_compat_formatter},
     label_providers::ApiEntry,
 };
 use iced_x86::{Formatter, Mnemonic};
@@ -28,12 +28,19 @@ static LEA_REG_DWORD: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 fn op_str_of(ins: &DecodedInsn) -> String {
-    if ins.iced.op_count() == 0 {
+    // x86 only — the indirect-call analyser's regex driver depends on the
+    // capstone-compatible string layout. On AArch64 we return an empty
+    // string so the regex pipeline below short-circuits (full register
+    // tracking on ARM64 lands in 0.6.1).
+    let Some(iced) = ins.as_iced() else {
+        return String::new();
+    };
+    if iced.op_count() == 0 {
         return String::new();
     }
     let mut fmt = capstone_compat_formatter();
     let mut out = String::new();
-    fmt.format_all_operands(&ins.iced, &mut out);
+    fmt.format_all_operands(iced, &mut out);
     out
 }
 
@@ -61,7 +68,7 @@ impl IndirectCallAnalyser {
         for calling_addr in &calling_addr_vec {
             let mut start_block = vec![];
             for ins in self.search_block(analysis_state, calling_addr)? {
-                if ins.offset <= *calling_addr {
+                if ins.offset() <= *calling_addr {
                     start_block.push(ins);
                 }
             }
@@ -93,7 +100,7 @@ impl IndirectCallAnalyser {
     ) -> Result<Vec<DecodedInsn>> {
         for block in &analysis_state.get_blocks()? {
             for i in block {
-                if address == &i.offset {
+                if address == &i.offset() {
                     return Ok(block.clone());
                 }
             }
@@ -119,7 +126,7 @@ impl IndirectCallAnalyser {
         if block.is_empty() {
             return Ok(false);
         }
-        let block_start = block[0].offset;
+        let block_start = block[0].offset();
         if processed.contains(&block_start) {
             return Ok(false);
         }
@@ -127,7 +134,13 @@ impl IndirectCallAnalyser {
 
         let mut abs_value_found = false;
         for ins in block.iter().rev() {
-            let mnem = ins.iced.mnemonic();
+            // x86 only: AArch64 register tracking lands in 0.6.1. The
+            // regex driver below already short-circuits to empty
+            // operand strings via `op_str_of` for AArch64 — bail early
+            // here too so we don't waste cycles.
+            let Some(mnem) = ins.mnemonic_enum_x86() else {
+                continue;
+            };
             let op_str = op_str_of(ins);
             if matches!(mnem, Mnemonic::Mov) {
                 // mov <reg>, <reg>
@@ -164,7 +177,7 @@ impl IndirectCallAnalyser {
                 }
                 // mov <reg>, qword ptr [rip + <addr>]
                 for match4 in MOV_REG_QWORD.captures_iter(&op_str) {
-                    let rip = ins.offset + ins.length as u64;
+                    let rip = ins.offset() + ins.length() as u64;
                     if let Ok(dword) = self.get_dword(
                         rip + u64::from_str_radix(&match4["addr"][2..], 16)?,
                         disassembler,
@@ -224,9 +237,9 @@ impl IndirectCallAnalyser {
             // block — used to filter back-references.
             let mut all_processed_offsets: HashSet<u64> = HashSet::new();
             for blk in analysis_state.get_blocks()? {
-                if !blk.is_empty() && processed.contains(&blk[0].offset) {
+                if !blk.is_empty() && processed.contains(&blk[0].offset()) {
                     for ins in &blk {
-                        all_processed_offsets.insert(ins.offset);
+                        all_processed_offsets.insert(ins.offset());
                     }
                 }
             }

@@ -26,10 +26,11 @@ use goblin::mach::{Mach, MachO};
 
 const CPU_TYPE_X86: u32 = 7;
 const CPU_TYPE_X86_64: u32 = 7 | 0x0100_0000; // CPU_ARCH_ABI64
+/// 0.6.0 — CPU_TYPE_ARM64 = 12 | CPU_ARCH_ABI64.
+pub(crate) const CPU_TYPE_ARM64: u32 = 12 | 0x0100_0000;
 
-/// Pull the Intel Mach-O out of `binary`. For fat binaries, prefers
-/// x86_64 over i386; returns `Error::UnsupportedFormatError` if neither
-/// is present.
+/// Pull the Intel Mach-O out of `binary`. Retained for source compat;
+/// new callers should prefer [`extract_macho`] (Intel + ARM64).
 pub fn extract_intel(binary: &[u8]) -> Result<MachO<'_>> {
     let mach = goblin::mach::Mach::parse(binary)?;
     match mach {
@@ -42,7 +43,6 @@ pub fn extract_intel(binary: &[u8]) -> Result<MachO<'_>> {
             }
         }
         Mach::Fat(fat) => {
-            // Prefer x86_64, fall back to i386.
             for want in [CPU_TYPE_X86_64, CPU_TYPE_X86] {
                 for (i, arch) in fat.iter_arches().enumerate() {
                     let arch = arch?;
@@ -56,6 +56,93 @@ pub fn extract_intel(binary: &[u8]) -> Result<MachO<'_>> {
             Err(Error::UnsupportedFormatError)
         }
     }
+}
+
+/// 0.6.0 — pull a supported Mach-O slice out of `binary`. Accepts
+/// `CPU_TYPE_ARM64`, `CPU_TYPE_X86_64`, and `CPU_TYPE_X86`.
+///
+/// Thin (single-arch) binaries return that slice if its `cputype` is
+/// supported. Fat (universal) binaries pick the slice matching the
+/// `prefer` order, falling back to other supported slices.
+///
+/// Returns `Error::UnsupportedFormatError` if no supported slice
+/// exists.
+///
+/// Compatibility shim — new callers should prefer
+/// [`extract_macho_with_offset`] which also returns the slice's
+/// offset in the fat file (needed to translate slice-relative
+/// `fileoff` fields into whole-buffer indices).
+pub fn extract_macho(binary: &[u8], prefer: crate::MachoArchPreference) -> Result<MachO<'_>> {
+    extract_macho_with_offset(binary, prefer).map(|(m, _)| m)
+}
+
+/// 0.6.0 fix — like [`extract_macho`] but also returns the byte
+/// offset of the chosen slice within the input `binary`. For thin
+/// Mach-O this is always 0; for fat (universal) Mach-O the load
+/// commands record `fileoff` values RELATIVE TO THE SLICE START,
+/// which `map_binary` has to combine with this offset to produce
+/// correct indices into the input buffer. Without this adjustment,
+/// reads at `bytes_at(va)` on a fat binary land in the wrong slice
+/// (or the fat header padding) and the analyser silently decodes
+/// garbage — see the 0.6.0 debugging note where /bin/ls's ARM64
+/// entry was reading as `udf #0` (4 bytes of zeros) because we were
+/// indexing the x86_64 slice's bytes.
+pub fn extract_macho_with_offset(
+    binary: &[u8],
+    prefer: crate::MachoArchPreference,
+) -> Result<(MachO<'_>, u64)> {
+    let mach = goblin::mach::Mach::parse(binary)?;
+    match mach {
+        Mach::Binary(m) => {
+            let ct = m.header.cputype();
+            if ct == CPU_TYPE_ARM64 || ct == CPU_TYPE_X86_64 || ct == CPU_TYPE_X86 {
+                Ok((m, 0))
+            } else {
+                Err(Error::UnsupportedFormatError)
+            }
+        }
+        Mach::Fat(fat) => {
+            for want in fat_arch_order(prefer) {
+                for (i, arch) in fat.iter_arches().enumerate() {
+                    let arch = arch?;
+                    if arch.cputype == want
+                        && let Ok(goblin::mach::SingleArch::MachO(m)) = fat.get(i)
+                    {
+                        // The slice starts at `arch.offset` bytes into
+                        // the fat file. Every fileoff in `m.segments`
+                        // is relative to that.
+                        return Ok((m, arch.offset as u64));
+                    }
+                }
+            }
+            Err(Error::UnsupportedFormatError)
+        }
+    }
+}
+
+/// 0.6.0 — return the preferred-to-least-preferred cputype iteration
+/// order for fat-Mach-O slice selection. Hosts other than ARM64 /
+/// x86_64 / x86 default to ARM64-first for `HostNative` because that
+/// matches the modern-Mac-malware use case.
+fn fat_arch_order(prefer: crate::MachoArchPreference) -> [u32; 3] {
+    use crate::MachoArchPreference;
+    match prefer {
+        MachoArchPreference::HostNative => match std::env::consts::ARCH {
+            "aarch64" | "arm64" => [CPU_TYPE_ARM64, CPU_TYPE_X86_64, CPU_TYPE_X86],
+            "x86_64" => [CPU_TYPE_X86_64, CPU_TYPE_ARM64, CPU_TYPE_X86],
+            "x86" | "i686" => [CPU_TYPE_X86, CPU_TYPE_X86_64, CPU_TYPE_ARM64],
+            _ => [CPU_TYPE_ARM64, CPU_TYPE_X86_64, CPU_TYPE_X86],
+        },
+        MachoArchPreference::Aarch64First => [CPU_TYPE_ARM64, CPU_TYPE_X86_64, CPU_TYPE_X86],
+        MachoArchPreference::X86_64First => [CPU_TYPE_X86_64, CPU_TYPE_ARM64, CPU_TYPE_X86],
+        MachoArchPreference::X86First => [CPU_TYPE_X86, CPU_TYPE_X86_64, CPU_TYPE_ARM64],
+    }
+}
+
+/// 0.6.0 — true if the resolved Mach-O slice is ARM64.
+#[must_use]
+pub fn is_arm64(mach: &MachO) -> bool {
+    mach.header.cputype() == CPU_TYPE_ARM64
 }
 
 /// Image base = vmaddr of the first non-`__PAGEZERO` segment.
@@ -140,10 +227,20 @@ pub fn get_code_areas(mach: &MachO) -> Vec<(u64, u64)> {
 
 /// Mirror of `pe::map_binary` / `elf::map_binary`. `base_addr` is
 /// accepted for API symmetry; Mach-O segments already carry absolute
-/// VAs so it isn't added in.
-pub fn map_binary(binary: &[u8], base_addr: u64) -> Result<Vec<SectionMap>> {
+/// VAs so it isn't added in. `prefer` selects which slice to walk on
+/// fat (universal) binaries; ignored for thin Mach-O.
+pub fn map_binary(
+    binary: &[u8],
+    base_addr: u64,
+    prefer: crate::MachoArchPreference,
+) -> Result<Vec<SectionMap>> {
     let _ = base_addr;
-    let mach = extract_intel(binary)?;
+    // 0.6.0 fix — use `extract_macho_with_offset` so we get the
+    // slice's offset in the fat file. Segment fileoffs are slice-
+    // relative; we add `slice_offset` to translate to whole-buffer
+    // indices. For thin Mach-O `slice_offset` is 0 (unchanged).
+    let (mach, slice_offset) = extract_macho_with_offset(binary, prefer)?;
+    let slice_offset = usize::try_from(slice_offset).map_err(|_| Error::UnsupportedFormatError)?;
     let mut section_maps = Vec::with_capacity(mach.segments.len());
     for seg in &mach.segments {
         let name = std::str::from_utf8(&seg.segname).unwrap_or("");
@@ -159,7 +256,13 @@ pub fn map_binary(binary: &[u8], base_addr: u64) -> Result<Vec<SectionMap>> {
         // 0.5.1 security: u64 -> usize casts on attacker-controlled
         // fileoff / filesize. 32-bit hosts would silently truncate;
         // try_from rejects oversized values instead.
-        let Ok(file_offset) = usize::try_from(seg.fileoff) else {
+        let Ok(seg_fileoff) = usize::try_from(seg.fileoff) else {
+            continue;
+        };
+        // 0.6.0 fix — combine slice-relative seg.fileoff with the
+        // slice's offset in the fat file. For thin Mach-O this is
+        // a no-op (slice_offset = 0).
+        let Some(file_offset) = slice_offset.checked_add(seg_fileoff) else {
             continue;
         };
         let Ok(declared_size) = usize::try_from(seg.filesize) else {
@@ -255,8 +358,26 @@ pub fn get_exports(mach: &MachO) -> Vec<(String, usize, Option<String>)> {
 /// modern macOS / iOS); otherwise return 0.
 #[must_use]
 pub fn get_entry_point(mach: &MachO, base_addr: u64) -> u64 {
+    // 0.6.0 fix: goblin's `MachO.entry` returns the absolute VA for
+    // LC_MAIN binaries (the Apple-silicon / modern Intel default —
+    // entryoff is parsed and combined with the __TEXT segment vmaddr
+    // by goblin before exposure). For older LC_UNIXTHREAD binaries
+    // it returns the thread-state PC, which is also absolute.
+    //
+    // The pre-0.6.0 path added `base_addr` unconditionally, which
+    // double-counted: for /bin/ls (base 0x1_0000_0000, real entry
+    // 0x1_0000_0960) we ended up at 0x2_0000_0960 — outside
+    // `code_areas`, silently rejected by `passes_code_filter`.
+    // The bug was invisible until AArch64 work made the entry the
+    // primary function-discovery seed.
+    //
+    // Treat values that already look like absolute VAs (i.e.
+    // >= base_addr) as VAs; treat smaller values (which would only
+    // happen on degenerate Mach-Os with base_addr == 0 or a very
+    // old format) as offsets to be added in.
     match mach.entry {
         0 => 0,
+        e if e >= base_addr => e,
         off => base_addr.saturating_add(off),
     }
 }

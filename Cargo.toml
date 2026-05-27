@@ -1,9 +1,9 @@
 [package]
 name = "smda"
-description = "Recursive x86/x64 disassembler library for control-flow recovery from memory dumps. Iced-x86-backed; zero-copy."
-version = "0.5.2"
+description = "Recursive x86/x64/AArch64 disassembler library for control-flow recovery from memory dumps. Iced-x86 + disarm64-backed; zero-copy."
+version = "0.6.0"
 authors = ["Marirs <marirs@gmail.com>", "Andrey Mnatsakanov <andrey@3ig.kiev.ua>", "Jorge Alejandro Durán Royo<jorge.duran.royo@gmail.com>"]
-keywords = ["smda", "disassembler", "cfg", "iced", "x86"]
+keywords = ["smda", "disassembler", "cfg", "iced", "aarch64"]
 categories = ["parsing", "development-tools::debugging"]
 license = "MIT"
 readme = "README.md"
@@ -39,6 +39,20 @@ sha2 = { version = "0.10", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+
+# 0.6.0: disarm64 is now the AArch64 backend behind the Decoder trait.
+# Pure Rust, MIT-licensed, table-generated from the ARM ISA JSON. The
+# probe under examples/aarch64_probe.rs validated >95% clean memory-
+# operand recovery on real Apple-silicon and Linux ARM64 binaries before
+# we committed to the integration.
+disarm64 = "0.1"
+# Trait crate shared by disarm64's variant tables. Imported so we can
+# reach `InsnOpcode::bits()` — the raw 32-bit instruction word — for
+# AArch64 branch-target resolution in `disassembler::mod`. Already a
+# transitive dep of disarm64; pinning it here keeps the import direct
+# and resolver-stable. `default-features = false` matches disarm64's
+# own dep so we don't pull in the no_std-incompatible features.
+disarm64_defn = { version = "0.1", default-features = false }
 
 [lib]
 name = "smda"

@@ -1,7 +1,7 @@
 use crate::{
     Result,
+    disassembler::{DecodedInsn, capstone_compat_formatter},
     error::Error,
-    function::{DecodedInsn, capstone_compat_formatter},
 };
 use iced_x86::Formatter;
 use std::collections::HashMap;
@@ -48,11 +48,20 @@ impl MnemonicTfIdf {
         let mut fmt = capstone_compat_formatter();
         for block in blocks.values() {
             for ins in block {
-                // Format mnemonic via the capstone-compatible formatter so
+                // x86: format via the capstone-compatible formatter so
                 // the IDF table (whose keys are capstone-format strings)
-                // still matches.
-                let mut mnem = String::new();
-                fmt.format_mnemonic(&ins.iced, &mut mnem);
+                // still matches. AArch64: use disarm64's mnemonic name
+                // directly. (The IDF weights table is x86-only — AArch64
+                // instructions miss in lookup and fall back to
+                // `max_idf` in `get_frequency`, which is conservative.)
+                let mnem = match ins.as_iced() {
+                    Some(iced) => {
+                        let mut m = String::new();
+                        fmt.format_mnemonic(iced, &mut m);
+                        m
+                    }
+                    None => ins.mnemonic_aarch64().unwrap_or_default(),
+                };
                 *term_counts.entry(mnem).or_insert(0) += 1;
             }
         }

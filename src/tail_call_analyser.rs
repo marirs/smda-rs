@@ -220,13 +220,13 @@ impl TailCallAnalyser {
         let mut first_instruction = &instructions[0];
         let mut last_instruction = first_instruction;
         for instruction in instructions {
-            if instruction.offset > last_instruction.offset + last_instruction.length as u64 {
-                intervals.push((first_instruction.offset, last_instruction.offset));
+            if instruction.offset() > last_instruction.offset() + last_instruction.length() as u64 {
+                intervals.push((first_instruction.offset(), last_instruction.offset()));
                 first_instruction = instruction;
             }
             last_instruction = instruction;
         }
-        intervals.push((first_instruction.offset, last_instruction.offset));
+        intervals.push((first_instruction.offset(), last_instruction.offset()));
         Ok(intervals)
     }
 }

@@ -1,8 +1,8 @@
 #![allow(clippy::invalid_regex)]
 use crate::{
     Disassembler, DisassemblyResult, FunctionAnalysisState, Result,
+    disassembler::{DecodedInsn, capstone_compat_formatter},
     error::Error,
-    function::{DecodedInsn, capstone_compat_formatter},
 };
 use iced_x86::{Formatter, Mnemonic};
 use regex::{Regex, bytes::Regex as BytesRegex};
@@ -25,12 +25,18 @@ static X86_BONUS_OFFSET: LazyLock<Regex> =
 /// Format the operands string for a DecodedInsn using the capstone-compatible
 /// formatter — used here so the legacy regex-based heuristics keep matching.
 fn op_str_of(ins: &DecodedInsn) -> String {
-    if ins.iced.op_count() == 0 {
+    // x86 only — the jump-table analyser is regex-driven; on AArch64
+    // we return empty so the regex pipeline short-circuits. Full
+    // AArch64 jump-table analysis lands in 0.6.1.
+    let Some(iced) = ins.as_iced() else {
+        return String::new();
+    };
+    if iced.op_count() == 0 {
         return String::new();
     }
     let mut fmt = capstone_compat_formatter();
     let mut out = String::new();
-    fmt.format_all_operands(&ins.iced, &mut out);
+    fmt.format_all_operands(iced, &mut out);
     out
 }
 
@@ -82,7 +88,11 @@ impl JumpTableAnalyser {
         disassembler: &Disassembler,
         state: &mut FunctionAnalysisState,
     ) -> Result<Vec<u64>> {
-        let jump_instruction_address = jump_instruction.offset;
+        // x86-only heuristic — no-op on AArch64 in 0.6.0.
+        if jump_instruction.as_iced().is_none() {
+            return Ok(vec![]);
+        }
+        let jump_instruction_address = jump_instruction.offset();
         let mut table_offsets = vec![];
         let backtracked = state.backtrack_instructions(jump_instruction_address, 50)?;
         let backtracked_sequence = ""; // "-".join([mnemonic ...]) — leave as-is for parity
@@ -157,7 +167,9 @@ impl JumpTableAnalyser {
             return Ok(jumptable_size);
         }
         for instr in &backtracked[..backtracked.len() - 1] {
-            let mnem = instr.iced.mnemonic();
+            let Some(mnem) = instr.mnemonic_enum_x86() else {
+                continue;
+            };
             // skip ret-family
             if matches!(
                 mnem,
@@ -233,11 +245,13 @@ impl JumpTableAnalyser {
         let register = jump_instruction_op_str.to_lowercase();
         let mut off_jumptable = None;
         for instr in backtracked.iter().rev() {
-            let mnem = instr.iced.mnemonic();
+            let Some(mnem) = instr.mnemonic_enum_x86() else {
+                continue;
+            };
             let op_str = op_str_of(instr);
             if matches!(mnem, Mnemonic::Mov) {
                 if DIRECT_HANDLER.is_match(&op_str) {
-                    let data_ref_instruction_addr = instr.offset;
+                    let data_ref_instruction_addr = instr.offset();
                     off_jumptable = Some(disassembler.get_referenced_addr(&op_str)?);
                     state.add_data_ref(
                         data_ref_instruction_addr,
@@ -247,7 +261,7 @@ impl JumpTableAnalyser {
                     break;
                 }
             } else if matches!(mnem, Mnemonic::Add) && op_str.starts_with(&register) {
-                let data_ref_instruction_addr = instr.offset;
+                let data_ref_instruction_addr = instr.offset();
                 off_jumptable = Some(disassembler.get_referenced_addr(&op_str)?);
                 state.add_data_ref(
                     data_ref_instruction_addr,
@@ -306,7 +320,9 @@ impl JumpTableAnalyser {
     ) -> Result<u64> {
         let mut off_jumptable = None;
         for instr in backtracked.iter().rev() {
-            let mnem = instr.iced.mnemonic();
+            let Some(mnem) = instr.mnemonic_enum_x86() else {
+                continue;
+            };
             let op_str = op_str_of(instr);
             if matches!(mnem, Mnemonic::Lea) && X86_HANDLER.is_match(&op_str) {
                 if let Some(target_register_) = &target_register
@@ -314,13 +330,13 @@ impl JumpTableAnalyser {
                 {
                     continue;
                 }
-                let data_ref_instruction_addr = instr.offset;
+                let data_ref_instruction_addr = instr.offset();
                 let mut offset = disassembler.get_referenced_addr(&op_str)? as i64;
                 let rip_sign = if op_str.contains('+') { "+" } else { "-" };
                 if rip_sign == "-" {
                     offset *= -1;
                 }
-                off_jumptable = Some(instr.offset as i64 + instr.length as i64 + offset);
+                off_jumptable = Some(instr.offset() as i64 + instr.length() as i64 + offset);
                 state.add_data_ref(
                     data_ref_instruction_addr,
                     *off_jumptable.as_ref().unwrap() as u64,
@@ -416,7 +432,7 @@ impl JumpTableAnalyser {
         {
             let op_str = op_str_of(instr);
             if i < 3
-                && matches!(instr.iced.mnemonic(), Mnemonic::Mov)
+                && matches!(instr.mnemonic_enum_x86(), Some(Mnemonic::Mov))
                 && X86_BONUS_OFFSET.is_match(&op_str)
             {
                 bonus_offset = disassembler.get_referenced_addr(&op_str)?;

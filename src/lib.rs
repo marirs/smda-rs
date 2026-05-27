@@ -5,6 +5,7 @@ extern crate maplit;
 
 mod delphi;
 mod demangle;
+pub mod disassembler;
 mod dwarf;
 pub mod elf;
 pub mod function;
@@ -24,12 +25,12 @@ mod statistics;
 mod tail_call_analyser;
 pub mod xmetadata;
 
-use function::{DecodedInsn, capstone_compat_formatter};
+use disassembler::{Aarch64Decoder, DecodedInsn, X86Decoder, capstone_compat_formatter};
 use function_analysis_state::FunctionAnalysisState;
 use function_candidate::FunctionCandidate;
 use function_candidate_manager::FunctionCandidateManager;
 use goblin::Object;
-use iced_x86::{Decoder, DecoderOptions, FlowControl, Formatter, Mnemonic};
+use iced_x86::{FlowControl, Formatter, Mnemonic};
 use indirect_call_analyser::IndirectCallAnalyser;
 use jump_table_analyser::JumpTableAnalyser;
 use label_provider::LabelProvider;
@@ -98,6 +99,47 @@ pub struct SmdaConfig {
     /// `Error::AnalysisTimeout` if exceeded mid-flight. `None` =
     /// unbounded. Useful for batch-processing untrusted samples.
     pub timeout: Option<std::time::Duration>,
+    /// 0.6.0 — which slice to pick when the input is a fat Mach-O
+    /// (universal binary carrying multiple architectures). Defaults
+    /// to [`MachoArchPreference::HostNative`] — the slice matching
+    /// the host architecture is preferred, falling back to other
+    /// slices if the native one isn't present.
+    ///
+    /// Override when:
+    /// - You're always analysing modern Mac malware → `Aarch64First`.
+    /// - You're processing older campaigns that targeted Intel Macs
+    ///   from a host where you don't care → `X86_64First`.
+    /// - You're on an unusual host (e.g. Linux on a non-x86 server
+    ///   analysing Apple-silicon malware) and want explicit control.
+    pub macho_arch_preference: MachoArchPreference,
+}
+
+/// 0.6.0 — fat Mach-O slice preference. See
+/// [`SmdaConfig::macho_arch_preference`].
+///
+/// Thin (single-arch) Mach-O binaries ignore this — there's only one
+/// slice to pick. ELF and PE never carry multiple architectures, so
+/// this is a Mach-O-only knob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum MachoArchPreference {
+    /// Prefer the slice matching the host architecture
+    /// (`std::env::consts::ARCH`). Apple-silicon → ARM64 first,
+    /// Intel/AMD Linux/Windows → x86_64 first. Falls back to the
+    /// other available slices. Default — matches the "I'm analysing
+    /// on this machine" intuition for most users.
+    #[default]
+    HostNative,
+    /// Prefer ARM64, then x86_64, then x86. Right call when
+    /// analysing modern Mac malware regardless of analyst host
+    /// (Apple-silicon dominates deployed Mac targets in 2024+).
+    Aarch64First,
+    /// Prefer x86_64, then ARM64, then x86. Right call for older
+    /// campaigns or legacy Mac samples.
+    X86_64First,
+    /// Prefer x86 (32-bit Intel), then x86_64, then ARM64. Niche —
+    /// only useful for archaic Mac binaries.
+    X86First,
 }
 
 impl SmdaConfig {
@@ -134,6 +176,14 @@ impl SmdaConfig {
     #[must_use]
     pub fn timeout(mut self, t: std::time::Duration) -> Self {
         self.timeout = Some(t);
+        self
+    }
+
+    /// 0.6.0 — override the fat-Mach-O slice preference. See
+    /// [`MachoArchPreference`]. No effect on thin Mach-O, ELF, or PE.
+    #[must_use]
+    pub fn macho_arch_preference(mut self, p: MachoArchPreference) -> Self {
+        self.macho_arch_preference = p;
         self
     }
 }
@@ -176,6 +226,13 @@ impl std::fmt::Display for FileFormat {
 pub enum FileArchitecture {
     I386,
     AMD64,
+    /// 0.6.0 — ARM 64-bit (AArch64). Decoded via the `disarm64` backend.
+    /// In 0.6.0 only the linear decode + report surface is populated;
+    /// the x86-only heuristics (jump tables, indirect calls, tail
+    /// calls, function-candidate alignment, exit-syscall recognition)
+    /// are no-ops on this variant. Full analyser support arrives in
+    /// 0.6.1.
+    Aarch64,
 }
 
 impl std::fmt::Display for FileArchitecture {
@@ -183,6 +240,7 @@ impl std::fmt::Display for FileArchitecture {
         match self {
             FileArchitecture::I386 => write!(f, "i386"),
             FileArchitecture::AMD64 => write!(f, "amd64"),
+            FileArchitecture::Aarch64 => write!(f, "aarch64"),
         }
     }
 }
@@ -565,7 +623,7 @@ impl<'a> DisassemblyResult<'a> {
 
         for block in blocks {
             for ins in block {
-                let ins_absolute_addr = self.binary_info.base_addr + ins.offset;
+                let ins_absolute_addr = self.binary_info.base_addr + ins.offset();
 
                 // Direct lookup
                 if let Some((dll, api)) = self.addr_to_api.get(&ins_absolute_addr) {
@@ -574,7 +632,7 @@ impl<'a> DisassemblyResult<'a> {
                 }
 
                 // If it's a call, follow the target
-                if matches!(ins.iced.flow_control(), FlowControl::Call)
+                if matches!(ins.flow_control_x86(), Some(FlowControl::Call))
                     && let Some(target_addr) =
                         Self::extract_call_target(ins, self.binary_info.base_addr)
                 {
@@ -598,15 +656,15 @@ impl<'a> DisassemblyResult<'a> {
 
     fn extract_call_target(instruction: &DecodedInsn, _base_addr: u64) -> Option<u64> {
         use iced_x86::OpKind;
-        if matches!(instruction.iced.flow_control(), FlowControl::Call)
-            && instruction.iced.op_count() >= 1
-        {
-            match instruction.iced.op_kind(0) {
+        // x86 only: AArch64 bl/blr resolution lands in 0.6.1.
+        let iced = instruction.as_iced()?;
+        if matches!(iced.flow_control(), FlowControl::Call) && iced.op_count() >= 1 {
+            match iced.op_kind(0) {
                 OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
-                    return Some(instruction.iced.near_branch_target());
+                    return Some(iced.near_branch_target());
                 }
                 OpKind::Memory => {
-                    let target = instruction.iced.memory_displacement64();
+                    let target = iced.memory_displacement64();
                     if target != 0 {
                         return Some(target);
                     }
@@ -748,7 +806,7 @@ impl<'a> DisassemblyResult<'a> {
             if block.is_empty() {
                 continue;
             }
-            blocks.insert(block[0].offset, block.clone());
+            blocks.insert(block[0].offset(), block.clone());
         }
         Ok(blocks)
     }
@@ -761,14 +819,14 @@ impl<'a> DisassemblyResult<'a> {
         };
         for block in blocks {
             for ins in block {
-                ins_addrs.insert(ins.offset);
+                ins_addrs.insert(ins.offset());
             }
         }
         for block in blocks {
             if block.is_empty() {
                 continue;
             }
-            let last_ins_addr = block[block.len() - 1].offset;
+            let last_ins_addr = block[block.len() - 1].offset();
             if self.code_refs_from.contains_key(&last_ins_addr) {
                 let mut code_refs_from_a = HashSet::new();
                 for dd in &self.code_refs_from[&last_ins_addr] {
@@ -779,7 +837,7 @@ impl<'a> DisassemblyResult<'a> {
                     verified_refs.push(*dd);
                 }
                 if !verified_refs.is_empty() {
-                    block_refs.insert(block[0].offset, verified_refs);
+                    block_refs.insert(block[0].offset(), verified_refs);
                 }
             }
         }
@@ -802,7 +860,7 @@ impl<'a> DisassemblyResult<'a> {
         };
         for block in blocks {
             for ins in block {
-                let ins_addr = ins.offset;
+                let ins_addr = ins.offset();
                 ins_addrs.insert(ins_addr);
                 if self.code_refs_from.contains_key(&ins_addr) {
                     for to_addr in &self.code_refs_from[&ins_addr] {
@@ -835,7 +893,6 @@ impl<'a> DisassemblyResult<'a> {
     }
 }
 
-#[derive(Debug)]
 pub struct Disassembler<'a> {
     common_start_bytes: HashMap<u32, HashMap<u8, u32>>,
     tailcall_analyzer: TailCallAnalyser,
@@ -845,13 +902,24 @@ pub struct Disassembler<'a> {
     tfidf: MnemonicTfIdf,
     pub disassembly: DisassemblyResult<'a>,
     label_providers: Vec<LabelProvider>,
-    /// (0.4.1 N14) Optional per-disassembly wall-clock budget. `None`
-    /// means "no timeout, run to completion". When set, the analyse loop
-    /// checks `Instant::now()` periodically and returns an
-    /// `Error::AnalysisTimeout` once exceeded — letting batch processors
-    /// of untrusted samples bound their per-sample cost.
+    /// (0.6.0) Per-arch decoder backend. Picked in `with_binary` based
+    /// on `binary_info.file_architecture`. `Box<dyn Decoder>` because
+    /// the analyser doesn't statically know which backend it will get,
+    /// and the trait object cost is negligible vs the per-instruction
+    /// decode work.
+    decoder: Box<dyn disassembler::Decoder>,
+    /// (0.4.1 N14) Optional per-disassembly wall-clock budget.
     analysis_timeout: Option<std::time::Duration>,
     analysis_started: Option<std::time::Instant>,
+}
+
+impl std::fmt::Debug for Disassembler<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Disassembler")
+            .field("disassembly", &self.disassembly)
+            .field("analysis_timeout", &self.analysis_timeout)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'a> Disassembler<'a> {
@@ -863,6 +931,11 @@ impl<'a> Disassembler<'a> {
     /// the `BinaryInfo` has been populated. Public callers should use
     /// `Disassembler::parse(&buf, ...)` instead.
     fn with_binary(binary_info: BinaryInfo<'a>) -> Result<Disassembler<'a>> {
+        let decoder: Box<dyn disassembler::Decoder> = match binary_info.file_architecture {
+            FileArchitecture::Aarch64 => Box::new(Aarch64Decoder::new()),
+            // I386 / AMD64 (and anything else x86-shaped) → iced.
+            _ => Box::new(X86Decoder::new(binary_info.bitness.max(32))),
+        };
         let mut res = Disassembler {
             common_start_bytes: HashMap::new(),
             tailcall_analyzer: TailCallAnalyser::new(),
@@ -872,6 +945,7 @@ impl<'a> Disassembler<'a> {
             tfidf: MnemonicTfIdf::new(),
             disassembly: DisassemblyResult::new(binary_info),
             label_providers: label_providers::init()?,
+            decoder,
             analysis_timeout: None,
             analysis_started: None,
         };
@@ -884,6 +958,21 @@ impl<'a> Disassembler<'a> {
             0x8d => 566,
             0x83 => 558,
             0x53 => 548},
+        );
+        // 0.6.0 — minimal AArch64 prologue start-byte table. ARM64
+        // instructions are little-endian 4-byte words; the FIRST byte
+        // of `stp x29, x30, [sp, #-N]!` (the canonical Apple-silicon /
+        // Linux ARM64 prologue) is 0xfd — the low byte of the encoded
+        // word. Sized similarly to the x86 weights so the vote
+        // converges. AArch64 prologue detection lands more fully in
+        // 0.6.1; this table exists so `determine_bitness` doesn't
+        // erroneously vote 32 on an ARM64 binary that somehow falls
+        // through the file-format routing.
+        res.common_start_bytes.insert(
+            128, // sentinel key — AArch64 is always 64-bit but we use a
+            // distinct key so the iter doesn't collide with the x86
+            // 64-bit table.
+            hashmap! {0xfd => 1000, 0xff => 500},
         );
         res.common_start_bytes.insert(
             64,
@@ -913,6 +1002,14 @@ impl<'a> Disassembler<'a> {
     }
 
     fn determine_bitness(&mut self) -> Result<u32> {
+        // 0.6.0: AArch64 is always 64-bit and the E8-call scan below is
+        // x86-specific. Short-circuit before walking the input bytes.
+        if matches!(
+            self.disassembly.binary_info.file_architecture,
+            FileArchitecture::Aarch64
+        ) {
+            return Ok(64);
+        }
         // Scan the raw input bytes for E8 call patterns. In 0.3.x this
         // walked the mapped image; the raw input version is equivalent
         // for bitness detection — we only need the relative-offset
@@ -1008,6 +1105,7 @@ impl<'a> Disassembler<'a> {
             config.high_accuracy,
             config.resolve_tailcalls,
             config.timeout,
+            config.macho_arch_preference,
         )
     }
 
@@ -1094,6 +1192,7 @@ impl<'a> Disassembler<'a> {
         high_accuracy: bool,
         resolve_tailcalls: bool,
         timeout: Option<std::time::Duration>,
+        macho_arch_preference: MachoArchPreference,
     ) -> Result<DisassemblyReport<'b>> {
         let mut binary_info = BinaryInfo::from_buffer(raw)?;
         if let Some(p) = path {
@@ -1105,10 +1204,16 @@ impl<'a> Disassembler<'a> {
                 binary_info.base_addr = elf::get_base_address(raw)?;
                 binary_info.bitness = elf::get_bitness(raw)?;
                 binary_info.entry_point = elf.header.e_entry;
-                binary_info.file_architecture = match binary_info.bitness {
-                    64 => FileArchitecture::AMD64,
-                    _ => FileArchitecture::I386,
-                };
+                // 0.6.0: EM_AARCH64 == 183 → AArch64 (64-bit fixed).
+                binary_info.file_architecture =
+                    if elf.header.e_machine == goblin::elf::header::EM_AARCH64 {
+                        binary_info.bitness = 64;
+                        FileArchitecture::Aarch64
+                    } else if binary_info.bitness == 64 {
+                        FileArchitecture::AMD64
+                    } else {
+                        FileArchitecture::I386
+                    };
                 binary_info.code_areas = elf::get_code_areas(raw, &elf)?;
                 binary_info.sections = elf
                     .section_headers
@@ -1129,11 +1234,19 @@ impl<'a> Disassembler<'a> {
             Object::PE(pe) => {
                 binary_info.file_format = FileFormat::PE;
                 binary_info.base_addr = pe::get_base_address(raw)?;
-                binary_info.bitness = pe::get_bitness(raw)?;
-                binary_info.file_architecture = match binary_info.bitness {
-                    64 => FileArchitecture::AMD64,
-                    _ => FileArchitecture::I386,
-                };
+                // 0.6.0: IMAGE_FILE_MACHINE_ARM64 == 0xAA64. `pe::get_bitness`
+                // would error on ARM64; recognise the machine field here
+                // and bypass the x86 bitness probe.
+                if pe.header.coff_header.machine == 0xAA64 {
+                    binary_info.bitness = 64;
+                    binary_info.file_architecture = FileArchitecture::Aarch64;
+                } else {
+                    binary_info.bitness = pe::get_bitness(raw)?;
+                    binary_info.file_architecture = match binary_info.bitness {
+                        64 => FileArchitecture::AMD64,
+                        _ => FileArchitecture::I386,
+                    };
+                }
                 // PE entry is an RVA — add image base to get the VA.
                 binary_info.entry_point = binary_info.base_addr.saturating_add(pe.entry as u64);
                 binary_info.code_areas = pe::get_code_areas(raw, &pe)?;
@@ -1172,24 +1285,28 @@ impl<'a> Disassembler<'a> {
                 binary_info.section_maps = pe::map_binary(raw, binary_info.base_addr)?;
             }
             Object::Mach(_) => {
-                // 0.5.0: Mach-O loader (Intel only). Re-extract via
-                // macho::extract_intel to get the right slice from fat
-                // binaries; goblin's Object::Mach gives us the wrapper but
-                // we want the parsed Intel MachO directly.
-                let mach = macho::extract_intel(raw)?;
+                // 0.5.0: Mach-O loader for Intel; 0.6.0 adds AArch64 via
+                // `macho::extract_macho` which returns either an Intel or
+                // ARM64 MachO slice. Routing by cputype follows.
+                let mach = macho::extract_macho(raw, macho_arch_preference)?;
                 binary_info.file_format = FileFormat::MachO;
                 binary_info.base_addr = macho::get_base_address(&mach);
                 binary_info.bitness = macho::get_bitness(&mach);
-                binary_info.file_architecture = match binary_info.bitness {
-                    64 => FileArchitecture::AMD64,
-                    _ => FileArchitecture::I386,
+                binary_info.file_architecture = if macho::is_arm64(&mach) {
+                    binary_info.bitness = 64;
+                    FileArchitecture::Aarch64
+                } else if binary_info.bitness == 64 {
+                    FileArchitecture::AMD64
+                } else {
+                    FileArchitecture::I386
                 };
                 binary_info.entry_point = macho::get_entry_point(&mach, binary_info.base_addr);
                 binary_info.code_areas = macho::get_code_areas(&mach);
                 binary_info.sections = macho::get_sections(&mach);
                 binary_info.imports = macho::get_imports(&mach);
                 binary_info.exports = macho::get_exports(&mach);
-                binary_info.section_maps = macho::map_binary(raw, binary_info.base_addr)?;
+                binary_info.section_maps =
+                    macho::map_binary(raw, binary_info.base_addr, macho_arch_preference)?;
             }
             _ => return Err(Error::UnsupportedFormatError),
         }
@@ -1282,16 +1399,40 @@ impl<'a> Disassembler<'a> {
         // load time but pre-0.4.1 only surfaced in the public report.
         // For PE samples (especially stripped DLLs) the export table is
         // often the only reliable list of public-facing function entries.
+        //
+        // 0.6.0: same seeding extended to Mach-O so AArch64 binaries
+        // (and Intel Mach-O) get function-candidate coverage from
+        // their export tables. Without this, ARM64 binaries return
+        // zero functions because the x86 prologue-scan analysers are
+        // gated off and AArch64 has no equivalent yet (lands in 0.6.1).
         let base_addr = self.disassembly.binary_info.base_addr;
-        if self.disassembly.binary_info.file_format == FileFormat::PE {
+        let format = self.disassembly.binary_info.file_format;
+        if format == FileFormat::PE || format == FileFormat::MachO {
             for (_name, rva, _forward) in &self.disassembly.binary_info.exports {
                 if *rva == 0 {
                     continue;
                 }
-                if let Some(va) = base_addr.checked_add(*rva as u64) {
-                    symbol_offsets.insert(va);
-                }
+                // Mach-O exports already store absolute VAs (set in
+                // macho::get_exports), so adding base_addr would
+                // double-count. PE stores RVAs relative to image
+                // base. Branch on format to handle each correctly.
+                let va = match format {
+                    FileFormat::MachO => *rva as u64,
+                    FileFormat::PE => match base_addr.checked_add(*rva as u64) {
+                        Some(v) => v,
+                        None => continue,
+                    },
+                    _ => continue,
+                };
+                symbol_offsets.insert(va);
             }
+        }
+        // 0.6.0: seed the entry point as a candidate too. The entry
+        // is always a real function start; seeding it directly gives
+        // arch-agnostic minimum coverage (one function guaranteed)
+        // even on binaries where every other seeding heuristic fails.
+        if self.disassembly.binary_info.entry_point != 0 {
+            symbol_offsets.insert(self.disassembly.binary_info.entry_point);
         }
         Ok(symbol_offsets.iter().copied().collect())
     }
@@ -1487,8 +1628,8 @@ impl<'a> Disassembler<'a> {
         op_str: &str,
         state: &mut FunctionAnalysisState,
     ) -> Result<()> {
-        let i_address = ins.offset;
-        let i_size = ins.length;
+        let i_address = ins.offset();
+        let i_size = ins.length() as u32;
         state.set_leaf(false)?;
 
         if op_str.starts_with("dword ptr [") {
@@ -1593,8 +1734,8 @@ impl<'a> Disassembler<'a> {
         state: &mut FunctionAnalysisState,
     ) -> Result<Vec<(u64, u64)>> {
         let mut tailcall_jumps = vec![];
-        let i_address = ins.offset;
-        let i_size = ins.length;
+        let i_address = ins.offset();
+        let i_size = ins.length() as u32;
 
         if op_str.contains(':') {
             // long-jmp
@@ -1656,8 +1797,8 @@ impl<'a> Disassembler<'a> {
         op_str: &str,
         state: &mut FunctionAnalysisState,
     ) -> Result<()> {
-        let i_address = ins.offset;
-        let i_size = ins.length;
+        let i_address = ins.offset();
+        let i_size = ins.length() as u32;
         // Use the already-parsed jump_destination rather than re-parsing
         // `op_str[2..]` (which previously panicked on `op_str.len() < 2`
         // or operands that didn't start with `0x`).
@@ -1676,8 +1817,8 @@ impl<'a> Disassembler<'a> {
         state: &mut FunctionAnalysisState,
     ) -> Result<Vec<(u64, u64)>> {
         let mut tailcall_jumps = vec![];
-        let i_address = ins.offset;
-        let i_size = ins.length;
+        let i_address = ins.offset();
+        let i_size = ins.length() as u32;
         state.add_block_to_queue(i_address.wrapping_add(i_size as u64))?;
         if let Ok(jump_destination) = self.get_referenced_addr(op_str) {
             tailcall_jumps.push((i_address, jump_destination));
@@ -1705,31 +1846,29 @@ impl<'a> Disassembler<'a> {
         Ok(())
     }
 
-    /// Decode a 15-byte window with iced. Returns owned DecodedInsn values.
+    /// Decode a small window through the per-arch [`disassembler::Decoder`]
+    /// backend. Returns owned `DecodedInsn` values. For x86 this walks
+    /// up to 15 bytes of variable-width decodes; for AArch64 it pulls
+    /// 4-byte fixed words.
     fn decode_window(&self, ip: u64) -> Vec<DecodedInsn> {
         let buf = self.get_disasm_window_buffer(ip);
         if buf.is_empty() {
             return vec![];
         }
-        let mut decoder = Decoder::with_ip(
-            self.disassembly.binary_info.bitness,
-            &buf,
-            ip,
-            DecoderOptions::NONE,
-        );
         let mut out = Vec::with_capacity(4);
-        while decoder.can_decode() {
-            let pos_before = decoder.position();
-            let insn = decoder.decode();
-            if insn.is_invalid() {
-                break;
+        let mut cursor = 0usize;
+        while cursor < buf.len() {
+            let address = ip.wrapping_add(cursor as u64);
+            match self.decoder.decode_at(&buf, cursor, address) {
+                Some((insn, consumed)) => {
+                    out.push(insn);
+                    cursor = cursor.saturating_add(consumed);
+                    if consumed == 0 {
+                        break;
+                    }
+                }
+                None => break,
             }
-            let len = decoder.position() - pos_before;
-            out.push(DecodedInsn {
-                offset: insn.ip(),
-                length: len as u32,
-                iced: insn,
-            });
         }
         out
     }
@@ -1747,12 +1886,288 @@ impl<'a> Disassembler<'a> {
         Ok(())
     }
 
+    /// (0.6.0) AArch64-specific function analyser. Linear walker
+    /// modelled after the x86 [`Self::analyse_function`] pass, but
+    /// dispatching on disarm64's `Mnemonic` + the direct-branch
+    /// target resolver in [`disassembler::aarch64_branch_target_raw`].
+    ///
+    /// Per-instruction control-flow taxonomy (ARM ARM §C6.2):
+    /// - `ret` / `eret` / `retaa` / `retab` / `drps`        — function end
+    /// - `bl <imm>`  (BL, BRANCH_IMM)                       — direct call:
+    ///   record the target as a function candidate so transitive call
+    ///   targets become functions on the next analysis pass; continue
+    ///   walking past the call (standard ABI: call returns to PC+4).
+    /// - `blr <reg>` (BLR, BRANCH_REG)                      — indirect
+    ///   call; track on `state.call_register_ins` for the indirect-call
+    ///   analyser (which only inspects x86 today, so this is a stub).
+    ///   Continue walking past it.
+    /// - `b <imm>`   (B,  BRANCH_IMM)                       — uncond
+    ///   direct jump. If the target is a known function start or a
+    ///   pending candidate, treat as tail call → function end. Else
+    ///   add the target to the block worklist and end the block.
+    /// - `br <reg>`  (BR, BRANCH_REG)                       — indirect
+    ///   jump (tail-call or jump-table). End the block. Without
+    ///   register tracking we can't follow it.
+    /// - `b.cond` / `cbz` / `cbnz` / `tbz` / `tbnz`         — conditional
+    ///   branch. Queue both the target and the fallthrough; end block.
+    /// - everything else                                    — pure
+    ///   straight-line code, continue.
+    ///
+    /// The MVP doesn't model PAC indirect calls (`blraa` / `blrab`),
+    /// jump tables, exit syscalls (`svc #0` with `x8 = 93/94`), stack-
+    /// string detection, or fancy tail-call deduplication; all deferred
+    /// to 0.6.1. Even so, a linear walk from each seeded candidate
+    /// fans out via `bl` transitive propagation and turns the
+    /// historical 0-function output on AArch64 binaries into the
+    /// expected dozens-to-thousands.
+    fn analyse_function_aarch64(
+        &mut self,
+        start_addr: u64,
+        as_gap: bool,
+        high_accuracy: bool,
+    ) -> Result<FunctionAnalysisState> {
+        use disassembler::{
+            aarch64_branch_target_raw, aarch64_is_conditional_branch, aarch64_is_direct_call,
+            aarch64_is_indirect_branch, aarch64_is_indirect_call, aarch64_is_return,
+            aarch64_is_trap, aarch64_is_unconditional_branch,
+        };
+        self.check_timeout()?;
+        self.tailcall_analyzer.init()?;
+        let mut state = FunctionAnalysisState::new(start_addr)?;
+        if state.is_processed_function(&self.disassembly) {
+            self.fc_manager.update_analysis_aborted(
+                &start_addr,
+                &format!(
+                    "collision with existing code of function 0x{:08x}",
+                    self.disassembly.ins2fn[&start_addr]
+                ),
+            )?;
+            return Err(Error::CollisionError(self.disassembly.ins2fn[&start_addr]));
+        }
+
+        while state.has_unprocessed_blocks() {
+            state.choose_next_block()?;
+            let start_block = state.block_start;
+            let mut cache_pos: usize = 0;
+            let mut cache = self.decode_window(start_block);
+
+            loop {
+                let mut exit_flag = false;
+                for ins in &cache {
+                    let i_address = ins.offset();
+                    let i_size = ins.length() as u32;
+                    cache_pos += i_size as usize;
+                    state.set_next_instruction_reachable(true)?;
+
+                    // Pull the disarm64 Opcode + raw word out of the
+                    // enum. Anything that isn't AArch64 here would be
+                    // a logic bug — this method is dispatched on
+                    // FileArchitecture::Aarch64.
+                    let (opcode, raw) = match ins {
+                        DecodedInsn::Aarch64(a) => (a.decoded, a.opcode),
+                        DecodedInsn::X86(_) => {
+                            // Defensive: skip — shouldn't happen.
+                            continue;
+                        }
+                    };
+
+                    if aarch64_is_return(&opcode) {
+                        self.analyze_end_instruction(&mut state)?;
+                    } else if aarch64_is_direct_call(&opcode) {
+                        // `bl <imm26>` — direct PC-relative call. Resolve
+                        // the target and add it as a function candidate;
+                        // the second `get_queue` pass picks it up.
+                        state.set_leaf(false)?;
+                        if let Some(target) = aarch64_branch_target_raw(&opcode, raw, i_address)
+                            && self.disassembly.is_addr_within_memory_image(target)?
+                        {
+                            state.add_code_ref(i_address, target, false)?;
+                            if state.start_addr == target {
+                                state.set_recursion(true)?;
+                            }
+                            // Seed as a reference candidate so the
+                            // outer analysis-loop picks the target up
+                            // as a new function on its next pass.
+                            self.fc_manager.add_reference_candidate(
+                                target,
+                                i_address,
+                                &self.disassembly,
+                            )?;
+                        }
+                        // BL doesn't end the block — the ABI says control
+                        // returns to PC+4. Fall through.
+                    } else if aarch64_is_indirect_call(&opcode) {
+                        // Indirect call via register: `blr <reg>` or any
+                        // PAC variant (`blraa`/`blraaz`/`blrab`/`blrabz`).
+                        // Track for the indirect-call analyser (x86-only
+                        // today; included here for forward compatibility).
+                        state.set_leaf(false)?;
+                        state.call_register_ins.push(i_address);
+                        // Falls through — `blr*` returns to PC+4.
+                    } else if aarch64_is_unconditional_branch(&opcode) {
+                        // `b <imm26>` — direct unconditional jump. If
+                        // the destination is a known/expected function,
+                        // treat as a tail call → function end. Otherwise
+                        // queue the target as another block of the same
+                        // function and end the current block.
+                        if let Some(target) = aarch64_branch_target_raw(&opcode, raw, i_address)
+                            && self.disassembly.is_addr_within_memory_image(target)?
+                        {
+                            // Only seed cross-references for targets we
+                            // can actually reach — otherwise we pollute
+                            // ins2fn / code_refs with phantom edges to
+                            // unmapped addresses.
+                            state.add_code_ref(i_address, target, true)?;
+                            let is_known_function =
+                                self.disassembly.functions.contains_key(&target);
+                            let is_candidate = self
+                                .fc_manager
+                                .get_function_start_candidates()?
+                                .contains(&target);
+                            if is_known_function {
+                                state.set_sanely_ending(true)?;
+                            } else if !is_candidate {
+                                if !state.is_first_instruction()? {
+                                    // Intra-function `b` — same-fn block.
+                                    state.add_block_to_queue(target)?;
+                                } else if target != i_address {
+                                    // Single-instruction stub thunk
+                                    // (`b <api>` as the whole function).
+                                    // Seed the target as a candidate so
+                                    // the resolver picks it up. Skip the
+                                    // degenerate `b .` self-jump (infinite
+                                    // loop sentinel / debugger trap) to
+                                    // avoid re-queueing the current
+                                    // function as a candidate of itself.
+                                    self.fc_manager.add_reference_candidate(
+                                        target,
+                                        i_address,
+                                        &self.disassembly,
+                                    )?;
+                                }
+                            }
+                            // else: target is already a pending candidate
+                            // — treat the `b` as a tail call and let the
+                            // candidate analyser walk it separately.
+                        }
+                        state.set_next_instruction_reachable(false)?;
+                        state.set_block_ending_instruction(true)?;
+                    } else if aarch64_is_indirect_branch(&opcode) {
+                        // Indirect jump: `br <reg>` or any PAC variant
+                        // (`braa`/`braaz`/`brab`/`brabz`). Without
+                        // register tracking we can't resolve it; treat
+                        // as a tail call / jump-table and end the block
+                        // (sane termination — we know the architecture
+                        // intends a control-flow transfer here).
+                        state.set_next_instruction_reachable(false)?;
+                        state.set_sanely_ending(true)?;
+                        state.set_block_ending_instruction(true)?;
+                    } else if aarch64_is_trap(&opcode) {
+                        // `udf` / `brk` / `hlt` — unconditional trap.
+                        // Compilers emit these after noreturn calls
+                        // (`abort`, `__stack_chk_fail`) or as bounds-
+                        // check poison. Whatever follows in the byte
+                        // stream is typically a constant-pool word or
+                        // padding, not real code. End the block and
+                        // mark it sane.
+                        state.set_next_instruction_reachable(false)?;
+                        state.set_sanely_ending(true)?;
+                        state.set_block_ending_instruction(true)?;
+                    } else if aarch64_is_conditional_branch(&opcode) {
+                        // `b.cond` / `cbz` / `cbnz` / `tbz` / `tbnz`.
+                        // Two-way fork: queue both the taken target
+                        // and the fallthrough.
+                        let fall_through = i_address.wrapping_add(i_size as u64);
+                        state.add_block_to_queue(fall_through)?;
+                        if let Some(target) = aarch64_branch_target_raw(&opcode, raw, i_address)
+                            && self.disassembly.is_addr_within_memory_image(target)?
+                        {
+                            // Only seed cross-references for targets we
+                            // can actually reach — out-of-image branches
+                            // (corrupted imm19/imm14 from data-in-code
+                            // or partial decode) would pollute ins2fn.
+                            let is_known_function =
+                                self.disassembly.functions.contains_key(&target);
+                            let is_candidate = self
+                                .fc_manager
+                                .get_function_start_candidates()?
+                                .contains(&target);
+                            if is_known_function {
+                                state.set_sanely_ending(true)?;
+                            } else if !is_candidate {
+                                state.add_block_to_queue(target)?;
+                            }
+                            // else: target is already a candidate — treat
+                            // the conditional branch as a tail call and
+                            // skip queueing it as another block of *this*
+                            // function.
+                            state.add_code_ref(i_address, target, true)?;
+                        }
+                        state.set_block_ending_instruction(true)?;
+                    }
+
+                    // Register the instruction itself (after the flow-
+                    // control bookkeeping above, matching the x86 path's
+                    // sequencing). Collisions with previously-mapped
+                    // code mean we ran into someone else's function —
+                    // stop and let the existing analysis stand.
+                    if !self.disassembly.code_map.contains_key(&i_address)
+                        && !self.disassembly.data_map.contains(&i_address)
+                        && !state.is_processed(&i_address)?
+                    {
+                        state.add_instruction(*ins)?;
+                    } else if self.disassembly.code_map.contains_key(&i_address) {
+                        state.set_block_ending_instruction(true)?;
+                        state.set_collision(true)?;
+                    } else {
+                        state.set_block_ending_instruction(true)?;
+                    }
+
+                    if state.is_block_ending_instruction()? {
+                        state.end_block()?;
+                        exit_flag = true;
+                        break;
+                    }
+                }
+                if !exit_flag {
+                    cache = self.decode_window(state.block_start + cache_pos as u64);
+                    if cache.is_empty() {
+                        break;
+                    }
+                    continue;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        state.label = self.resolve_symbol(state.start_addr)?;
+        let _ = state.finalize_analysis(as_gap, &mut self.disassembly);
+        self.fc_manager.update_analysis_finished(&start_addr)?;
+        if high_accuracy {
+            self.fc_manager.update_candidates(&state)?;
+        }
+        Ok(state)
+    }
+
     fn analyse_function(
         &mut self,
         start_addr: u64,
         as_gap: bool,
         high_accuracy: bool,
     ) -> Result<FunctionAnalysisState> {
+        // 0.6.0: dispatch on architecture. The x86 path below is
+        // packed with iced-specific assumptions (FlowControl
+        // taxonomy, `0xEB` short-jump byte, x86 mnemonic enum
+        // comparisons); AArch64 gets its own linear-walker that
+        // uses disarm64's mnemonic + the pre-computed direct-branch
+        // target resolver in `disassembler::aarch64_branch_target`.
+        if matches!(
+            self.disassembly.binary_info.file_architecture,
+            FileArchitecture::Aarch64
+        ) {
+            return self.analyse_function_aarch64(start_addr, as_gap, high_accuracy);
+        }
         self.check_timeout()?;
         self.tailcall_analyzer.init()?;
         let mut state = FunctionAnalysisState::new(start_addr)?;
@@ -1786,17 +2201,36 @@ impl<'a> Disassembler<'a> {
             loop {
                 let mut exit_flag = false;
                 for ins in &cache {
-                    let i_address = ins.offset;
-                    let i_size = ins.length;
-                    let mnemonic_enum = ins.iced.mnemonic();
+                    let i_address = ins.offset();
+                    let i_size = ins.length() as u32;
+                    // x86 mnemonic enum, or a no-op sentinel on AArch64.
+                    // The x86-specific match arms below gate on
+                    // `flow_control_x86().is_some()` (via the unwrap
+                    // default `FlowControl::Next`) so they no-op on
+                    // AArch64; arch-agnostic block-ending is handled
+                    // by the trailing branch on `DecodedInsn::is_*`.
+                    let mnemonic_enum = ins.mnemonic_enum_x86().unwrap_or(Mnemonic::INVALID);
                     let mut mnemonic_str = String::new();
-                    fmt.format_mnemonic(&ins.iced, &mut mnemonic_str);
-                    let op_str = if ins.iced.op_count() == 0 {
-                        String::new()
-                    } else {
-                        let mut s = String::new();
-                        fmt.format_all_operands(&ins.iced, &mut s);
-                        s
+                    let op_str = match ins.as_iced() {
+                        Some(iced) => {
+                            fmt.format_mnemonic(iced, &mut mnemonic_str);
+                            if iced.op_count() == 0 {
+                                String::new()
+                            } else {
+                                let mut s = String::new();
+                                fmt.format_all_operands(iced, &mut s);
+                                s
+                            }
+                        }
+                        None => {
+                            // AArch64: use disarm64's mnemonic + a debug
+                            // rendering of the operand bits for the
+                            // legacy regex-driven heuristics. They won't
+                            // match — the analyser falls through to the
+                            // arch-agnostic block-ending branch below.
+                            mnemonic_str = ins.format_mnemonic();
+                            ins.format_operands().unwrap_or_default()
+                        }
                     };
 
                     cache_pos += i_size as usize;
@@ -1823,7 +2257,11 @@ impl<'a> Disassembler<'a> {
                         }
                     }
 
-                    let fc = ins.iced.flow_control();
+                    // x86 control-flow taxonomy via iced FlowControl.
+                    // On AArch64 we default to FlowControl::Next so all
+                    // x86 arms fall through; the arch-agnostic call /
+                    // jump / return helpers handle block-ending below.
+                    let fc = ins.flow_control_x86().unwrap_or(FlowControl::Next);
                     if matches!(fc, FlowControl::Call | FlowControl::IndirectCall) {
                         self.analyze_call_instruction(ins, &op_str, &mut state)?;
                     } else if matches!(
@@ -1862,6 +2300,13 @@ impl<'a> Disassembler<'a> {
                         }
                     } else if matches!(mnemonic_enum, Mnemonic::Int3 | Mnemonic::Hlt) {
                         self.analyze_end_instruction(&mut state)?;
+                    } else if ins.as_iced().is_none() && ins.is_return() {
+                        // AArch64 ret — end the block. Other AArch64
+                        // branch families (b / bl / b.cond / cbz / tbz)
+                        // fall through with `Next` FlowControl and will
+                        // be picked up by the block-ending check at the
+                        // bottom of the per-instruction body.
+                        self.analyze_end_instruction(&mut state)?;
                     } else if Self::is_exit_syscall(ins, last_exit_reg_imm) {
                         // Linux exit syscall conventions:
                         //   x86_64: mov eax, 60 ; syscall          (exit)
@@ -1871,6 +2316,13 @@ impl<'a> Disassembler<'a> {
                         // Treat the syscall site as a function end so the
                         // analyser stops following past it.
                         self.analyze_end_instruction(&mut state)?;
+                    } else if ins.as_iced().is_none() && ins.is_branch() {
+                        // AArch64 generic branch path: any unconditional
+                        // jump (b / br) or conditional branch
+                        // (b.cond / cbz / cbnz / tbz / tbnz) ends the
+                        // current block. Full follow-the-target lands in
+                        // 0.6.1; for 0.6.0 we get a linear-block CFG.
+                        state.set_block_ending_instruction(true)?;
                     } else if let Some(prev) = previous_address
                         && prev != 0
                         && i_address != start_addr
@@ -2001,56 +2453,54 @@ impl<'a> Disassembler<'a> {
     /// syscall to be the actual call number).
     fn extract_exit_reg_imm(ins: &DecodedInsn, current: Option<u64>) -> Option<u64> {
         use iced_x86::Register;
-        if ins.iced.mnemonic() != Mnemonic::Mov
-            || ins.iced.op_count() != 2
-            || ins.iced.op_kind(0) != iced_x86::OpKind::Register
+        // x86 only — AArch64 exit-syscall recognition lands in 0.6.1.
+        let iced = ins.as_iced()?;
+        if iced.mnemonic() != Mnemonic::Mov
+            || iced.op_count() != 2
+            || iced.op_kind(0) != iced_x86::OpKind::Register
         {
-            // Conservative: any non-matching instruction resets the
-            // tracker so we don't carry a stale value across a basic
-            // block boundary.
             return None;
         }
-        let dst = ins.iced.op_register(0);
+        let dst = iced.op_register(0);
         if !matches!(
             dst,
             Register::EAX | Register::RAX | Register::AX | Register::AL
         ) {
             return None;
         }
-        match ins.iced.op_kind(1) {
-            iced_x86::OpKind::Immediate8 => Some(ins.iced.immediate8() as u64),
-            iced_x86::OpKind::Immediate16 => Some(ins.iced.immediate16() as u64),
-            iced_x86::OpKind::Immediate32 => Some(ins.iced.immediate32() as u64),
-            iced_x86::OpKind::Immediate64 => Some(ins.iced.immediate64()),
-            iced_x86::OpKind::Immediate8to32 => Some(ins.iced.immediate8to32() as u64),
-            iced_x86::OpKind::Immediate8to64 => Some(ins.iced.immediate8to64() as u64),
-            iced_x86::OpKind::Immediate32to64 => Some(ins.iced.immediate32to64() as u64),
-            _ => current, // keep prior value if dst was overwritten with non-immediate
+        match iced.op_kind(1) {
+            iced_x86::OpKind::Immediate8 => Some(iced.immediate8() as u64),
+            iced_x86::OpKind::Immediate16 => Some(iced.immediate16() as u64),
+            iced_x86::OpKind::Immediate32 => Some(iced.immediate32() as u64),
+            iced_x86::OpKind::Immediate64 => Some(iced.immediate64()),
+            iced_x86::OpKind::Immediate8to32 => Some(iced.immediate8to32() as u64),
+            iced_x86::OpKind::Immediate8to64 => Some(iced.immediate8to64() as u64),
+            iced_x86::OpKind::Immediate32to64 => Some(iced.immediate32to64() as u64),
+            _ => current,
         }
     }
 
     /// (0.4.1 M2) Recognise the Linux exit-syscall convention. Linux
     /// `exit` is 60 / `exit_group` is 231 on x86_64 (via `syscall`); 1 /
-    /// 252 respectively on x86 (via `int 0x80`).
+    /// 252 respectively on x86 (via `int 0x80`). x86 only — AArch64
+    /// equivalent (`svc #0` with x8 = 93/94) lands in 0.6.1.
     fn is_exit_syscall(ins: &DecodedInsn, last_eax_imm: Option<u64>) -> bool {
-        let mnem = ins.iced.mnemonic();
+        let Some(iced) = ins.as_iced() else {
+            return false;
+        };
+        let mnem = iced.mnemonic();
         let imm = match last_eax_imm {
             Some(v) => v,
             None => return false,
         };
         if matches!(mnem, Mnemonic::Syscall | Mnemonic::Sysenter) {
-            // x86_64: exit=60, exit_group=231; x86 syscall variants
-            // (rare): exit=252.
             return matches!(imm, 60 | 231 | 252);
         }
         if mnem == Mnemonic::Int
-            && ins.iced.op_count() == 1
-            && let iced_x86::OpKind::Immediate8 = ins.iced.op_kind(0)
-            && ins.iced.immediate8() == 0x80
+            && iced.op_count() == 1
+            && let iced_x86::OpKind::Immediate8 = iced.op_kind(0)
+            && iced.immediate8() == 0x80
         {
-            // x86: exit=1, exit_group=252; also accept 0x3c
-            // (some compilers emit the 64-bit number in 32-bit code
-            // by mistake / via intrinsics).
             return matches!(imm, 1 | 252 | 60);
         }
         false
