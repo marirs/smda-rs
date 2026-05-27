@@ -623,7 +623,7 @@ impl Function {
     /// Two signatures depending on the variant: x86 uses the iced
     /// structural surface (operand kinds, registers); AArch64 uses
     /// `(opcode_word & 0xFFC003FF)` — the bits with the PC-relative
-    /// displacement masked out (12-bit imm12 in bits [21:10] for
+    /// displacement masked out (12-bit imm12 in bits \[21:10\] for
     /// LDR/STR; 19-bit imm19 for b.cond / cbz / ldr literal; 26-bit
     /// imm26 for unconditional b/bl). The mask we use here zeroes the
     /// largest of those slots without touching the register / opcode

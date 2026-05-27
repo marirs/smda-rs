@@ -514,13 +514,13 @@ fn sign_extend(value: u64, bits: u32) -> i64 {
 /// and any non-branch opcode.
 ///
 /// Encodings (ARM ARM §C6.2):
-/// - `BRANCH_IMM` (B / BL): bits [25:0] are signed imm26;
+/// - `BRANCH_IMM` (B / BL): bits \[25:0\] are signed imm26;
 ///   `target = pc + sign_extend(imm26) << 2`.
-/// - `CONDBRANCH` (B.cond / BC.cond): bits [23:5] are signed imm19;
+/// - `CONDBRANCH` (B.cond / BC.cond): bits \[23:5\] are signed imm19;
 ///   `target = pc + sign_extend(imm19) << 2`.
-/// - `COMPBRANCH` (CBZ / CBNZ): bits [23:5] are signed imm19;
+/// - `COMPBRANCH` (CBZ / CBNZ): bits \[23:5\] are signed imm19;
 ///   `target = pc + sign_extend(imm19) << 2`.
-/// - `TESTBRANCH` (TBZ / TBNZ): bits [18:5] are signed imm14;
+/// - `TESTBRANCH` (TBZ / TBNZ): bits \[18:5\] are signed imm14;
 ///   `target = pc + sign_extend(imm14) << 2`.
 #[must_use]
 pub fn aarch64_branch_target(opcode: &disarm64::decoder::Opcode, pc: u64) -> Option<u64> {
@@ -537,7 +537,7 @@ pub fn aarch64_branch_target(opcode: &disarm64::decoder::Opcode, pc: u64) -> Opt
 /// Variant of [`aarch64_branch_target`] that takes the raw 32-bit
 /// instruction word explicitly. `ArmInsn` carries this on every
 /// decode, so analysers can use it directly without paying the
-/// trait-dispatch dance in [`aarch64_raw_word`].
+/// trait-dispatch dance in `aarch64_raw_word` (private helper).
 #[must_use]
 pub fn aarch64_branch_target_raw(
     opcode: &disarm64::decoder::Opcode,
