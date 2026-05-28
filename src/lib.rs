@@ -648,6 +648,38 @@ impl<'a> DisassemblyResult<'a> {
                         continue;
                     }
                 }
+
+                // (0.6.1) AArch64 branch follow: thunks use a direct
+                // `b <import>` (single-instruction function) and direct
+                // calls use `bl <import>` — both have a PC-relative
+                // immediate target resolvable via the disarm64 helper.
+                // Mirror the x86 call-follow above so single-`b` API
+                // thunks get classified by `is_api_thunk` and ordinary
+                // `bl` API calls populate `apirefs` for capa
+                // consumption.
+                if let DecodedInsn::Aarch64(a) = ins {
+                    use disassembler::{
+                        aarch64_branch_target_raw, aarch64_is_direct_call,
+                        aarch64_is_unconditional_branch,
+                    };
+                    if (aarch64_is_direct_call(&a.decoded)
+                        || aarch64_is_unconditional_branch(&a.decoded))
+                        && let Some(target_va) =
+                            aarch64_branch_target_raw(&a.decoded, a.opcode, a.offset)
+                    {
+                        if let Some((dll, api)) = self.addr_to_api.get(&target_va) {
+                            api_refs.insert(ins_absolute_addr, (dll.clone(), api.clone()));
+                            continue;
+                        }
+                        if let Some(api_entry) = self.apis.get(&target_va) {
+                            api_refs.insert(
+                                ins_absolute_addr,
+                                (api_entry.dll_name.clone(), api_entry.api_name.clone()),
+                            );
+                            continue;
+                        }
+                    }
+                }
             }
         }
 
@@ -1929,7 +1961,8 @@ impl<'a> Disassembler<'a> {
         use disassembler::{
             aarch64_branch_target_raw, aarch64_is_conditional_branch, aarch64_is_direct_call,
             aarch64_is_indirect_branch, aarch64_is_indirect_call, aarch64_is_return,
-            aarch64_is_trap, aarch64_is_unconditional_branch,
+            aarch64_is_svc, aarch64_is_trap, aarch64_is_unconditional_branch,
+            aarch64_ops::{MovWideKind, decode_mov_wide},
         };
         self.check_timeout()?;
         self.tailcall_analyzer.init()?;
@@ -1950,6 +1983,20 @@ impl<'a> Disassembler<'a> {
             let start_block = state.block_start;
             let mut cache_pos: usize = 0;
             let mut cache = self.decode_window(start_block);
+            // (0.6.1) AArch64 exit-syscall trackers. Two platforms,
+            // two ABIs:
+            //
+            //   Linux:  syscall number in x8,  entry via `svc #0`
+            //           — exit=93, exit_group=94.
+            //   macOS:  syscall number in x16, entry via `svc #0x80`
+            //           — _exit=1, exit_with_payload=472.
+            //
+            // We track the most recently MOVZ-loaded value for each
+            // register separately and key off the SVC's imm16 to pick
+            // the right convention. Reset per-block so a syscall in
+            // one block doesn't taint another.
+            let mut last_x8_imm: Option<u64> = None;
+            let mut last_x16_imm: Option<u64> = None;
 
             loop {
                 let mut exit_flag = false;
@@ -2018,6 +2065,11 @@ impl<'a> Disassembler<'a> {
                             // ins2fn / code_refs with phantom edges to
                             // unmapped addresses.
                             state.add_code_ref(i_address, target, true)?;
+                            // (0.6.1) Feed direct `b` jumps into the
+                            // tail-call analyser so off-function targets
+                            // get promoted to candidates by
+                            // `TailCallAnalyser::finalize_function`.
+                            self.tailcall_analyzer.add_jump(i_address, target)?;
                             let is_known_function =
                                 self.disassembly.functions.contains_key(&target);
                             let is_candidate = self
@@ -2054,11 +2106,25 @@ impl<'a> Disassembler<'a> {
                         state.set_block_ending_instruction(true)?;
                     } else if aarch64_is_indirect_branch(&opcode) {
                         // Indirect jump: `br <reg>` or any PAC variant
-                        // (`braa`/`braaz`/`brab`/`brabz`). Without
-                        // register tracking we can't resolve it; treat
-                        // as a tail call / jump-table and end the block
-                        // (sane termination — we know the architecture
-                        // intends a control-flow transfer here).
+                        // (`braa`/`braaz`/`brab`/`brabz`). Best-effort
+                        // jump-table resolution first (handles the
+                        // canonical Clang / GCC switch lowerings); if
+                        // the back-walk doesn't match, the BR ends the
+                        // block as a tail-call edge.
+                        let targets = self
+                            .jumptable_analyzer
+                            .get_jump_targets_aarch64(ins, self, &mut state)
+                            .unwrap_or_default();
+                        for target in targets {
+                            // is_addr_within_memory_image was already
+                            // checked inside the resolver; defensive
+                            // re-check just keeps the walker's contract
+                            // unchanged.
+                            if self.disassembly.is_addr_within_memory_image(target)? {
+                                state.add_code_ref(i_address, target, true)?;
+                                state.add_block_to_queue(target)?;
+                            }
+                        }
                         state.set_next_instruction_reachable(false)?;
                         state.set_sanely_ending(true)?;
                         state.set_block_ending_instruction(true)?;
@@ -2070,6 +2136,29 @@ impl<'a> Disassembler<'a> {
                         // stream is typically a constant-pool word or
                         // padding, not real code. End the block and
                         // mark it sane.
+                        state.set_next_instruction_reachable(false)?;
+                        state.set_sanely_ending(true)?;
+                        state.set_block_ending_instruction(true)?;
+                    } else if aarch64_is_svc(&opcode) && {
+                        // svc #imm16: imm16 lives at bits 20:5 of the
+                        // 32-bit encoding. 0x00 → Linux entry, 0x80 →
+                        // macOS BSD/Mach entry.
+                        let svc_imm = ((raw >> 5) & 0xFFFF) as u16;
+                        match svc_imm {
+                            //   mov w8, #93  ; svc #0  → exit
+                            //   mov w8, #94  ; svc #0  → exit_group
+                            0x00 => matches!(last_x8_imm, Some(93 | 94)),
+                            //   mov x16, #1   ; svc #0x80  → _exit (BSD)
+                            //   mov x16, #472 ; svc #0x80  → exit_with_payload
+                            0x80 => matches!(last_x16_imm, Some(1 | 472)),
+                            _ => false,
+                        }
+                    } {
+                        // Recognised exit syscall — end the function.
+                        // The kernel doesn't return for these. Non-exit
+                        // syscalls fall through to the next instruction
+                        // (correct behaviour: most syscalls return to
+                        // user space).
                         state.set_next_instruction_reachable(false)?;
                         state.set_sanely_ending(true)?;
                         state.set_block_ending_instruction(true)?;
@@ -2102,8 +2191,71 @@ impl<'a> Disassembler<'a> {
                             // skip queueing it as another block of *this*
                             // function.
                             state.add_code_ref(i_address, target, true)?;
+                            // (0.6.1) Feed conditional-branch jumps
+                            // into the tail-call analyser too — Rust
+                            // and Go in particular generate conditional
+                            // tail calls from `if x { panic() }` lowering.
+                            self.tailcall_analyzer.add_jump(i_address, target)?;
                         }
                         state.set_block_ending_instruction(true)?;
+                    }
+
+                    // (0.6.1) Exit-syscall tracker update for x8 (Linux
+                    // ABI) and x16 (macOS BSD/Mach ABI). We model the
+                    // full MOV-wide family:
+                    //
+                    //   MOVZ Rd, #imm, LSL #(hw*16)
+                    //     → tracker = imm << (hw*16) (zeroes other slots)
+                    //   MOVN Rd, #imm, LSL #(hw*16)
+                    //     → tracker = !(imm << (hw*16))
+                    //   MOVK Rd, #imm, LSL #(hw*16)
+                    //     → tracker[slot hw] = imm (keep other slots)
+                    //
+                    // Any other instruction writing the register clears
+                    // the tracker — the syscall recogniser then needs
+                    // a fresh MOV-wide before the next SVC.
+                    let update =
+                        |tracker: &mut Option<u64>, value: u64, kind: MovWideKind, hw_raw: u32| {
+                            match kind {
+                                MovWideKind::Movz | MovWideKind::Movn => *tracker = Some(value),
+                                MovWideKind::Movk => {
+                                    // value already has the LSL applied; we need to
+                                    // mask out the 16-bit slot at `hw` in the
+                                    // existing tracker value (or 0) and OR in the
+                                    // new bits.
+                                    //
+                                    // (0.6.1, M2) `hw_raw` is already masked with
+                                    // 0x3 at the call site below (bits 22:21 — 2
+                                    // bits, range 0..=3). The shift `hw * 16` is
+                                    // therefore provably 0/16/32/48, well within
+                                    // u64. Redundant `& 0x3` kept defensively.
+                                    let hw = hw_raw & 0x3;
+                                    let slot_mask: u64 = 0xFFFFu64 << (hw * 16);
+                                    let prev = tracker.unwrap_or(0);
+                                    *tracker = Some((prev & !slot_mask) | (value & slot_mask));
+                                }
+                            }
+                        };
+                    if let Some((rd, value, kind)) = decode_mov_wide(raw) {
+                        // `hw` lives at bits 22:21 — re-extract it directly
+                        // because `decode_mov_wide` only returns the
+                        // already-shifted value.
+                        let hw_raw = (raw >> 21) & 0x3;
+                        match rd {
+                            8 => update(&mut last_x8_imm, value, kind, hw_raw),
+                            16 => update(&mut last_x16_imm, value, kind, hw_raw),
+                            _ => {
+                                // MOV-wide to some other register — leave
+                                // the syscall trackers alone.
+                            }
+                        }
+                    } else {
+                        // Conservative: any other instruction *might* have
+                        // written x8 or x16 (we don't model the full ABI).
+                        // Reset so each tracker only fires on a prior
+                        // MOV-wide sequence.
+                        last_x8_imm = None;
+                        last_x16_imm = None;
                     }
 
                     // Register the instruction itself (after the flow-
@@ -2142,7 +2294,39 @@ impl<'a> Disassembler<'a> {
         }
 
         state.label = self.resolve_symbol(state.start_addr)?;
-        let _ = state.finalize_analysis(as_gap, &mut self.disassembly);
+        // (0.6.1) Mirror the x86 path: finalize analysis, then
+        // - resolve indirect calls (`BLR x16` through GOT thunks) so
+        //   imports surface as `apis` entries and recovered in-image
+        //   targets become new function candidates,
+        // - promote bare-`b`/`b.cond` jumps recorded during the walk
+        //   into tail-call candidates so off-function targets become
+        //   their own functions on the next analyser pass.
+        if state
+            .finalize_analysis(as_gap, &mut self.disassembly)
+            .is_ok()
+        {
+            // block_depth=4 mirrors the x86 path's resolve_register_calls
+            // call site — controls how many predecessor levels the
+            // back-walk descends through.
+            let (api_e, cand_e) = self
+                .indirect_call_analyser
+                .resolve_register_calls_aarch64(self, &mut state, 4)?;
+            for (addr, entry) in api_e {
+                match self.disassembly.apis.get_mut(&addr) {
+                    Some(s) => {
+                        s.referencing_addr.extend(entry.referencing_addr.clone());
+                    }
+                    None => {
+                        self.disassembly.apis.insert(addr, entry);
+                    }
+                }
+            }
+            for (target, source) in cand_e {
+                self.fc_manager
+                    .add_candidate(target, false, Some(source), &self.disassembly)?;
+            }
+            TailCallAnalyser::finalize_function(self, &state)?;
+        }
         self.fc_manager.update_analysis_finished(&start_addr)?;
         if high_accuracy {
             self.fc_manager.update_candidates(&state)?;
@@ -2454,30 +2638,76 @@ impl<'a> Disassembler<'a> {
     fn extract_exit_reg_imm(ins: &DecodedInsn, current: Option<u64>) -> Option<u64> {
         use iced_x86::Register;
         // x86 only — AArch64 exit-syscall recognition lands in 0.6.1.
-        let iced = ins.as_iced()?;
-        if iced.mnemonic() != Mnemonic::Mov
-            || iced.op_count() != 2
-            || iced.op_kind(0) != iced_x86::OpKind::Register
+        let Some(iced) = ins.as_iced() else {
+            return current;
+        };
+
+        // Path 1: `mov eax-family, <imm>` snapshots the tracker.
+        if iced.mnemonic() == Mnemonic::Mov
+            && iced.op_count() >= 2
+            && iced.op_kind(0) == iced_x86::OpKind::Register
+            && matches!(
+                iced.op_register(0),
+                Register::EAX | Register::RAX | Register::AX | Register::AL
+            )
+        {
+            return match iced.op_kind(1) {
+                iced_x86::OpKind::Immediate8 => Some(iced.immediate8() as u64),
+                iced_x86::OpKind::Immediate16 => Some(iced.immediate16() as u64),
+                iced_x86::OpKind::Immediate32 => Some(iced.immediate32() as u64),
+                iced_x86::OpKind::Immediate64 => Some(iced.immediate64()),
+                iced_x86::OpKind::Immediate8to32 => Some(iced.immediate8to32() as u64),
+                iced_x86::OpKind::Immediate8to64 => Some(iced.immediate8to64() as u64),
+                iced_x86::OpKind::Immediate32to64 => Some(iced.immediate32to64() as u64),
+                // `mov eax, mem` / `mov eax, ebx` — can't statically
+                // determine the value; clear conservatively.
+                _ => None,
+            };
+        }
+
+        // (0.6.1, upstream issue #119) Path 2: any instruction whose
+        // op0 is eax-family clobbers the tracker (add eax, …;
+        // xor eax, eax; lea eax, …; pop eax; etc.).
+        if iced.op_count() >= 1
+            && iced.op_kind(0) == iced_x86::OpKind::Register
+            && matches!(
+                iced.op_register(0),
+                Register::EAX | Register::RAX | Register::AX | Register::AL
+            )
         {
             return None;
         }
-        let dst = iced.op_register(0);
-        if !matches!(
-            dst,
-            Register::EAX | Register::RAX | Register::AX | Register::AL
+
+        // Path 3: instructions with implicit eax/rax side-effects.
+        // These don't have eax as op0 but still clobber it.
+        if matches!(
+            iced.mnemonic(),
+            Mnemonic::Cpuid
+                | Mnemonic::Rdtsc
+                | Mnemonic::Rdtscp
+                | Mnemonic::Rdrand
+                | Mnemonic::Rdseed
+                | Mnemonic::Xgetbv
+                | Mnemonic::Lahf
+                | Mnemonic::Xlatb
+                | Mnemonic::Cdq
+                | Mnemonic::Cwde
+                | Mnemonic::Cdqe
+                | Mnemonic::Cqo
+                | Mnemonic::Cbw
+                | Mnemonic::Mul
+                | Mnemonic::Div
+                | Mnemonic::Idiv
         ) {
             return None;
         }
-        match iced.op_kind(1) {
-            iced_x86::OpKind::Immediate8 => Some(iced.immediate8() as u64),
-            iced_x86::OpKind::Immediate16 => Some(iced.immediate16() as u64),
-            iced_x86::OpKind::Immediate32 => Some(iced.immediate32() as u64),
-            iced_x86::OpKind::Immediate64 => Some(iced.immediate64()),
-            iced_x86::OpKind::Immediate8to32 => Some(iced.immediate8to32() as u64),
-            iced_x86::OpKind::Immediate8to64 => Some(iced.immediate8to64() as u64),
-            iced_x86::OpKind::Immediate32to64 => Some(iced.immediate32to64() as u64),
-            _ => current,
-        }
+
+        // (0.6.1, upstream issue #119) Path 4: anything else preserves
+        // the tracker. Previously cleared on every non-mov-to-eax
+        // instruction, defeating multi-instruction `mov edi, arg0; mov
+        // eax, 60; syscall` patterns. The clobber checks above
+        // (op0 + implicit-side-effect mnemonics) keep us correct.
+        current
     }
 
     /// (0.4.1 M2) Recognise the Linux exit-syscall convention. Linux

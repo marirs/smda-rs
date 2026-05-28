@@ -279,22 +279,22 @@ impl FunctionCandidateManager {
     fn identify_alignment(&self) -> Result<u32> {
         let mut identified_alignment = 0;
         //        if self.config.USE_ALIGNMENT:
+        // (0.6.1) Collapsed the previous three sequential scans over
+        // `self.candidates.values()` (one each for total / 16-aligned /
+        // 4-aligned counts) into a single pass — mirrors upstream
+        // perf PR #109. ~3x reduction in iterator overhead on
+        // hot-path analyses.
         let mut num_candidates = 0;
+        let mut num_aligned_16_candidates = 0;
+        let mut num_aligned_4_candidates = 0;
         for candidate in self.candidates.values() {
             if candidate.call_ref_sources.len() > 1 {
                 num_candidates += 1;
-            }
-        }
-        let mut num_aligned_16_candidates = 0;
-        for candidate in self.candidates.values() {
-            if candidate.call_ref_sources.len() > 1 && candidate.alignment == 16 {
-                num_aligned_16_candidates += 1;
-            }
-        }
-        let mut num_aligned_4_candidates = 0;
-        for candidate in self.candidates.values() {
-            if candidate.call_ref_sources.len() > 1 && candidate.alignment == 4 {
-                num_aligned_4_candidates += 1;
+                match candidate.alignment {
+                    16 => num_aligned_16_candidates += 1,
+                    4 => num_aligned_4_candidates += 1,
+                    _ => {}
+                }
             }
         }
         if num_candidates > 0 {
@@ -335,15 +335,18 @@ impl FunctionCandidateManager {
         if self.bitness != 64 {
             return Ok(());
         }
-        // 0.6.0: the `.pdata` layout we walk below is the x64 SEH
-        // `RUNTIME_FUNCTION` / `UNWIND_INFO` format. ARM64 Windows PE
-        // uses a different `.pdata` schema (packed unwind data). Skip
-        // for now; ARM64 .pdata support lands in 0.6.1.
+        // 0.6.1: ARM64 Windows PE `.pdata` uses a structurally distinct
+        // schema from x64 SEH — each `RUNTIME_FUNCTION` entry is 8 bytes
+        // (`BeginAddress: u32`, `UnwindData: u32`) instead of x64's
+        // 12-byte (Begin, End, UnwindInfo) triple, and `UnwindData` is
+        // either a pointer-to-.xdata (bits 1:0 == 00) or a packed
+        // unwind record (bits 1:0 != 00). For function discovery we
+        // only need `BeginAddress`; UnwindData validation is deferred.
         if matches!(
             disassembly.binary_info.file_architecture,
             FileArchitecture::Aarch64
         ) {
-            return Ok(());
+            return self.locate_exception_handler_candidates_aarch64(disassembly);
         }
         let base_addr = disassembly.binary_info.base_addr;
         let bi = &disassembly.binary_info;
@@ -397,6 +400,127 @@ impl FunctionCandidateManager {
                 if let Some(addr) = base_addr.checked_add(begin_rva) {
                     self.add_exception_candidate(addr, disassembly)?;
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// (0.6.1) ARM64 PE `.pdata` walker. The schema per
+    /// Microsoft's ARM64 ABI doc:
+    ///
+    /// ```text
+    /// struct RUNTIME_FUNCTION_ARM64 {
+    ///     u32 BeginAddress;   // RVA of the function start (4-byte aligned)
+    ///     u32 UnwindData;     // either ptr-to-.xdata or packed unwind
+    /// }
+    /// ```
+    ///
+    /// `UnwindData` interpretation by low 2 bits:
+    ///   - `00`: pointer to `.xdata` UNWIND_INFO record (the full
+    ///     `.xdata` first u32 holds FunctionLength in bits 0:17).
+    ///   - non-zero: packed unwind inline. FunctionLength sits at
+    ///     bits 2:22 of the u32 (21 bits, in 4-byte units).
+    ///
+    /// We use `FunctionLength` to filter out garbage entries (where
+    /// the implied `EndAddress = BeginAddress + 4*FuncLen` falls
+    /// outside the image, or the function span exceeds a sane
+    /// upper bound). Real `.pdata` is dense and contiguous; stray
+    /// records past the end of the section tend to be all-zero
+    /// padding or unrelated bytes that decode to absurd lengths.
+    fn locate_exception_handler_candidates_aarch64(
+        &mut self,
+        disassembly: &DisassemblyResult,
+    ) -> Result<()> {
+        Self::parse_aarch64_pdata(disassembly, |addr, dis| {
+            self.add_exception_candidate(addr, dis)?;
+            Ok(())
+        })
+    }
+
+    /// Internal driver factored out so a unit test can exercise the
+    /// `.pdata` parser against a synthetic byte buffer without
+    /// constructing a full `DisassemblyResult`.
+    ///
+    /// `report` is a callback the test can override to capture the
+    /// emitted candidate addresses instead of pushing them into
+    /// `self.candidates`.
+    fn parse_aarch64_pdata<F>(disassembly: &DisassemblyResult, mut report: F) -> Result<()>
+    where
+        F: FnMut(u64, &DisassemblyResult) -> Result<()>,
+    {
+        const MAX_FUNC_SPAN_INSTRUCTIONS: u64 = 1 << 20; // 1M insns = 4 MiB
+        let base_addr = disassembly.binary_info.base_addr;
+        let bi = &disassembly.binary_info;
+        let image_end = base_addr.saturating_add(bi.binary_size);
+
+        for (section_name, section_va_start, section_va_end) in bi.get_sections()? {
+            if section_name != ".pdata" {
+                continue;
+            }
+            let mut va = section_va_start;
+            while va.checked_add(8).is_some_and(|e| e <= section_va_end) {
+                let Ok(packed) = bi.bytes_at(va, 8) else {
+                    break;
+                };
+                let begin_rva =
+                    u32::from_le_bytes(packed[0..4].try_into().unwrap_or([0; 4])) as u64;
+                let unwind_data = u32::from_le_bytes(packed[4..8].try_into().unwrap_or([0; 4]));
+
+                let Some(next) = va.checked_add(8) else {
+                    break;
+                };
+                va = next;
+
+                let Some((checked_begin, packed_len)) =
+                    decode_arm64_pdata_entry(begin_rva as u32, unwind_data)
+                else {
+                    continue;
+                };
+                let Some(addr) = base_addr.checked_add(checked_begin as u64) else {
+                    continue;
+                };
+                if !disassembly.is_addr_within_memory_image(addr)? {
+                    continue;
+                }
+
+                // FunctionLength: from packed unwind, or read from
+                // .xdata first u32 (bits 0:17) when pointer form.
+                let func_len_insns: Option<u64> = match packed_len {
+                    Some(n) => Some(n as u64),
+                    None => {
+                        // Pointer to .xdata at base + (unwind_data & !3).
+                        let xdata_rva = (unwind_data & !0x3) as u64;
+                        let xdata_va = base_addr.checked_add(xdata_rva);
+                        if let Some(xdata_va) = xdata_va
+                            && let Ok(hdr) = bi.bytes_at(xdata_va, 4)
+                            && let Ok(packed_hdr) = <&[u8; 4]>::try_from(hdr)
+                        {
+                            let first = u32::from_le_bytes(*packed_hdr);
+                            Some((first & 0x0003_FFFF) as u64)
+                        } else {
+                            None
+                        }
+                    }
+                };
+
+                if let Some(insns) = func_len_insns {
+                    // Sanity-check the function span. If we can't get
+                    // a length (.xdata unreachable / malformed),
+                    // accept the BeginAddress with the original
+                    // light-touch validation.
+                    if insns == 0 || insns > MAX_FUNC_SPAN_INSTRUCTIONS {
+                        continue;
+                    }
+                    let span_bytes = insns.saturating_mul(4);
+                    let Some(end_va) = addr.checked_add(span_bytes) else {
+                        continue;
+                    };
+                    if end_va > image_end {
+                        continue;
+                    }
+                }
+
+                report(addr, disassembly)?;
             }
         }
         Ok(())
@@ -598,6 +722,22 @@ impl FunctionCandidateManager {
     }
 
     fn ensure_candidate(&mut self, addr: u64, disassembly: &DisassemblyResult) -> Result<bool> {
+        // (0.6.1, upstream issue #85) Cap total candidate count.
+        // Pathological binaries (corrupted .pdata, dense prologue-
+        // pattern matches across all bytes, attacker-crafted section
+        // layouts) can otherwise drive `self.candidates` into
+        // unbounded growth. The cap is generous (a real PE/ELF rarely
+        // exceeds ~50k functions) but provides a hard upper bound so
+        // analysis fails gracefully rather than OOMs. Already-queued
+        // candidates keep being processed; only new insertions are
+        // refused.
+        //
+        // Checked before `.entry()` so we don't conflict with the
+        // mutable borrow that `entry()` takes.
+        const MAX_CANDIDATES: usize = 100_000;
+        if self.candidates.len() >= MAX_CANDIDATES && !self.candidates.contains_key(&addr) {
+            return Ok(false);
+        }
         if let std::collections::btree_map::Entry::Vacant(e) = self.candidates.entry(addr) {
             e.insert(FunctionCandidate::new(&disassembly.binary_info, addr)?);
             return Ok(true);
@@ -614,9 +754,11 @@ impl FunctionCandidateManager {
         if !self.passes_code_filter(Some(addr))? {
             return Ok(false);
         }
-        if self.ensure_candidate(addr, disassembly)? {
-            self.all_call_refs.insert(source_ref, addr);
+        if !self.ensure_candidate(addr, disassembly)? {
+            // (0.6.1) MAX_CANDIDATES cap reached — drop silently.
+            return Ok(false);
         }
+        self.all_call_refs.insert(source_ref, addr);
         self.candidates
             .get_mut(&addr)
             .ok_or(Error::LogicError(file!(), line!()))?
@@ -728,7 +870,13 @@ impl FunctionCandidateManager {
         if !self.passes_code_filter(Some(addr))? {
             return Err(Error::LogicError(file!(), line!()));
         }
-        self.ensure_candidate(addr, disassembly)?;
+        // (0.6.1) ensure_candidate returns Ok(false) when the
+        // MAX_CANDIDATES cap is hit. Silently drop instead of
+        // erroring — the caller treats this as "we ran out of
+        // budget for new candidates" rather than a hard failure.
+        if !self.ensure_candidate(addr, disassembly)? {
+            return Ok(());
+        }
         self.candidates
             .get_mut(&addr)
             .ok_or(Error::LogicError(file!(), line!()))?
@@ -806,14 +954,30 @@ impl FunctionCandidateManager {
                 continue;
             }
             // Try to find a single instruction at the current gap that's a
-            // NOP encoding; if so, skip it and continue looking. x86
-            // only — the iced Decoder is used directly here. AArch64
-            // NOP detection (a 4-byte `1f 20 03 d5` word) lands in
-            // 0.6.1 alongside the rest of the gap-scan AArch64 work.
-            if !matches!(
+            // NOP encoding; if so, skip it and continue looking.
+            //
+            // x86: iced Decoder identifies any of the multi-byte NOP
+            // encodings (90, 66 90, 0F 1F 00, …) — variable length.
+            // AArch64: the canonical NOP is a fixed 4-byte word
+            // `1f 20 03 d5` (i.e. u32 `0xd503201f` decoded LE). 0.6.0
+            // gated this off; 0.6.1 adds the direct word match.
+            if matches!(
                 disassembly.binary_info.file_architecture,
                 FileArchitecture::Aarch64
             ) {
+                // gap_offset + 4 must still be in-bounds for a NOP
+                // match. If not (e.g. last 3 bytes of the binary), fall
+                // through to the multi-byte gap scan below — gs[&4]
+                // already contains the same pattern as a defensive
+                // belt-and-suspenders.
+                if gap_offset + 4 <= disassembly.binary_info.binary_size {
+                    let buf = disassembly.get_raw_bytes(gap_offset, 4)?;
+                    if buf == [0x1F, 0x20, 0x03, 0xD5] {
+                        self.gap_pointer += 4;
+                        continue;
+                    }
+                }
+            } else {
                 let buf = disassembly.get_raw_bytes(gap_offset, 15)?;
                 let mut decoder =
                     Decoder::with_ip(self.bitness, buf, gap_offset, DecoderOptions::NONE);
@@ -997,5 +1161,98 @@ impl FunctionCandidateManager {
         }
         self.function_gaps = gaps;
         Ok(())
+    }
+}
+
+/// (0.6.1) Pure ARM64 `.pdata` entry decoder. Extracted from the
+/// I/O-bound walker so we can unit-test the field-layout + filter
+/// logic without constructing a `DisassemblyResult`.
+///
+/// Returns `None` for entries that should be skipped (zero
+/// `BeginAddress` / unaligned). Otherwise returns
+/// `(BeginAddress, packed_func_len)` where `packed_func_len` is
+/// `Some(n)` for inline-packed unwind (length in 4-byte units) and
+/// `None` for pointer-to-`.xdata` form — the caller is then
+/// responsible for following the pointer to read `FunctionLength`.
+#[must_use]
+pub(crate) fn decode_arm64_pdata_entry(
+    begin_rva: u32,
+    unwind_data: u32,
+) -> Option<(u32, Option<u32>)> {
+    if begin_rva == 0 {
+        return None; // terminator / hole
+    }
+    if (begin_rva & 0x3) != 0 {
+        return None; // misaligned — ARM64 functions are 4-byte aligned
+    }
+    let packed_len = if (unwind_data & 0x3) == 0 {
+        None // pointer to .xdata; caller follows
+    } else {
+        Some((unwind_data >> 2) & 0x001F_FFFF)
+    };
+    Some((begin_rva, packed_len))
+}
+
+#[cfg(test)]
+mod arm64_pdata_tests {
+    use super::decode_arm64_pdata_entry;
+
+    #[test]
+    fn skips_zero_begin_rva() {
+        // All-zero terminator entries are common at the end of .pdata.
+        assert_eq!(decode_arm64_pdata_entry(0, 0), None);
+    }
+
+    #[test]
+    fn skips_unaligned_begin_rva() {
+        // ARM64 instructions are 4-byte aligned. A misaligned
+        // BeginAddress is structurally impossible for a real function.
+        assert_eq!(decode_arm64_pdata_entry(0x1001, 0x15), None);
+        assert_eq!(decode_arm64_pdata_entry(0x1002, 0x15), None);
+        assert_eq!(decode_arm64_pdata_entry(0x1003, 0x15), None);
+    }
+
+    #[test]
+    fn decodes_packed_unwind_funclen() {
+        // FuncLen=10 insns, Flag=01 (full packed).
+        // Encoding: bits 0:1=01, bits 2:22=10.
+        let unwind = (10u32 << 2) | 0b01;
+        let result = decode_arm64_pdata_entry(0x1000, unwind);
+        assert_eq!(result, Some((0x1000, Some(10))));
+    }
+
+    #[test]
+    fn decodes_packed_unwind_max_funclen() {
+        // FuncLen at its 21-bit maximum: 0x1FFFFF insns.
+        let max = 0x001F_FFFF;
+        let unwind = (max << 2) | 0b01;
+        let result = decode_arm64_pdata_entry(0x1000, unwind);
+        assert_eq!(result, Some((0x1000, Some(max))));
+    }
+
+    #[test]
+    fn detects_xdata_pointer_form() {
+        // bits 1:0 == 00 → pointer to .xdata. Returns None for the
+        // packed length so the caller knows to follow.
+        let unwind = 0x0000_1000; // arbitrary aligned pointer
+        let result = decode_arm64_pdata_entry(0x1000, unwind);
+        assert_eq!(result, Some((0x1000, None)));
+    }
+
+    #[test]
+    fn full_pdata_entry_round_trip() {
+        // Synthetic 8-byte RUNTIME_FUNCTION_ARM64 entry:
+        //   BeginAddress = 0x1000
+        //   UnwindData   = packed, FuncLen = 5
+        let entry = [
+            0x00, 0x10, 0x00, 0x00, // BeginAddress = 0x1000
+            0x15, 0x00, 0x00, 0x00, // UnwindData = (5<<2)|1 = 0x15
+        ];
+        let begin = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
+        let unwind = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
+        assert_eq!(
+            decode_arm64_pdata_entry(begin, unwind),
+            Some((0x1000, Some(5)))
+        );
     }
 }

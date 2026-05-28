@@ -14,7 +14,17 @@ The output is a collection of functions, basic blocks, and instructions with the
 `smda-rs` is a Rust port of [danielplohmann/smda](https://github.com/danielplohmann/smda) (Python). It powers [capa-rs](https://github.com/marirs/capa-rs), the Rust port of Mandiant's capability extractor.
 
 ## Features
-
+- **Zero-copy disassembly.** `BinaryInfo<'a>` borrows the input bytes directly. No mapped-image allocation, no per-instruction byte clone, no `DisassemblyReport.buffer`.
+- **Modern Linux ELF coverage:** added GCC / clang `endbr64` (`F3 0F 1E FA`) plus the extended GCC AMD64 prologue family (`48 89 5C 24 ??`, `48 83 EC ??`, `41 57 41 56`)$
+- **Linux exit-syscall recognition:** `mov eax, 60; syscall` (and `exit_group` / `int 0x80` equivalents) now end the containing function correctly.
+- **PE exports as candidate seeds:** the export RVA list, previously only surfaced in the public report, now seeds the function-candidate scanner. Free coverage win on s$
+- **New report fields:** `report.oep` (original entry point VA), `function.is_exported` (PE only), `function.stringrefs` (VAs of stack-string writes — wires up the exist$
+- **New lookups:** `report.find_function_by_offset(addr)` / `find_block_by_offset(addr)`.
+- **Timeout support:** `Disassembler::parse_with_timeout(..., Duration)` + new `Error::AnalysisTimeout` for batch processors of untrusted samples.
+- **Section-table abstraction.** Byte access goes through `binary_info.bytes_at(va, len) -> Result<&[u8]>`, which looks up the VA in a small per-binary `SectionMap` tabl$
+- **`Instruction` slimmed down.** The 0.3.x per-instruction `mnemonic: String`, `operands: Option<String>`, and `bytes: String` (hex) fields are gone. Use the typed iced$
+- **Decoders are pure-Rust** — `iced-x86` for x86 (no C/C++ build dep, ~2–3× faster than capstone) and `disarm64` for AArch64 (table-generated from the ARM ISA JSON, MIT$
+- **Same security guards.** All the checked-arithmetic, allocation caps, and bounds checks added in 0.3.0 are preserved — the `pe::map_binary` and `elf::map_binary` rewr$
 - **Input formats**: PE (32 / 64-bit), ELF (32 / 64-bit), Mach-O (Intel + ARM64, thin and fat).
 - **Architectures**: x86, x86_64, AArch64 (0.6.0+).
 - **Function discovery**: prologue scan (MSVC + GCC / clang `endbr64` family + ARM64 `stp x29, x30, [sp, #-N]!`), call-target propagation, PE exception-handler (`.pdata`) seeding, PE export-table seeding.
@@ -37,20 +47,6 @@ The decoder lives behind a small `Decoder` trait with two backends:
 `DecodedInsn` is an enum (`X86(IcedInsn)` / `Aarch64(ArmInsn)`); the typed accessors on `function::Instruction` (`mnemonic_enum`, `op_kind`, `memory_base`, `flow_control`, `is_call`, `is_jmp`, `is_ret`, `format_mnemonic`, `format_operands`, `length`, `bytes_in`, `get_printable_len`) keep their 0.5.x signatures and dispatch internally.
 
 **ARM64 function-discovery depth in 0.6.0 is minimum-viable** — exports + entry point as candidate seeds, then the recursive call-target propagation does the rest. A typical ARM64 *executable* with no exports will surface 1 function (the entry point) and everything it calls; an ARM64 *dylib* with N exports surfaces N + transitively-reachable functions. The x86 prologue-scan analysers don't have ARM64 equivalents in this release — that, plus the deeper passes (jump-table walking, indirect-call register tracking, tail-call detection past `b`/`bl`, ARM64 PE `.pdata` packed unwind, typed AArch64 operand extraction for downstream `offset:` rules in capa-rs, AArch64 mnemonic IDF), is the 0.6.1 work. x86/x64 binaries are unaffected — same code, same output as 0.5.2.
-
-### Carried over from 0.5.x
-
-- **Zero-copy disassembly.** `BinaryInfo<'a>` borrows the input bytes directly. No mapped-image allocation, no per-instruction byte clone, no `DisassemblyReport.buffer`.
-- **Modern Linux ELF coverage:** added GCC / clang `endbr64` (`F3 0F 1E FA`) plus the extended GCC AMD64 prologue family (`48 89 5C 24 ??`, `48 83 EC ??`, `41 57 41 56`). On CET-enabled binaries (most modern distros) function discovery improves dramatically — one test ELF went from 3280 → 10106 functions. MSVC samples unchanged.
-- **Linux exit-syscall recognition:** `mov eax, 60; syscall` (and `exit_group` / `int 0x80` equivalents) now end the containing function correctly.
-- **PE exports as candidate seeds:** the export RVA list, previously only surfaced in the public report, now seeds the function-candidate scanner. Free coverage win on stripped DLLs.
-- **New report fields:** `report.oep` (original entry point VA), `function.is_exported` (PE only), `function.stringrefs` (VAs of stack-string writes — wires up the existing `Instruction::get_printable_len`).
-- **New lookups:** `report.find_function_by_offset(addr)` / `find_block_by_offset(addr)`.
-- **Timeout support:** `Disassembler::parse_with_timeout(..., Duration)` + new `Error::AnalysisTimeout` for batch processors of untrusted samples.
-- **Section-table abstraction.** Byte access goes through `binary_info.bytes_at(va, len) -> Result<&[u8]>`, which looks up the VA in a small per-binary `SectionMap` table and returns a borrowed slice into the input. Replaces the old contiguous mapped image.
-- **`Instruction` slimmed down.** The 0.3.x per-instruction `mnemonic: String`, `operands: Option<String>`, and `bytes: String` (hex) fields are gone. Use the typed iced accessors (`mnemonic_enum()`, `op_kind()`, `flow_control()`, …) for hot paths, or `format_mnemonic()` / `format_operands()` / `bytes_in(&binary_info)` for on-demand formatting.
-- **Decoders are pure-Rust** — `iced-x86` for x86 (no C/C++ build dep, ~2–3× faster than capstone) and `disarm64` for AArch64 (table-generated from the ARM ISA JSON, MIT-licensed, also no C dep).
-- **Same security guards.** All the checked-arithmetic, allocation caps, and bounds checks added in 0.3.0 are preserved — the `pe::map_binary` and `elf::map_binary` rewrites kept every defensive check, just changed the return type from `Vec<u8>` to `Vec<SectionMap>`.
 
 ## Quick start
 

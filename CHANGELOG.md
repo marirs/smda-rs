@@ -3,7 +3,48 @@
 All notable changes to **smda** are documented here.
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.1] — AArch64 analyser
+
+Closes the seven x86-only analysers that 0.6.0 gated off when
+`binary_info.file_architecture == Aarch64`. No API breaks — every
+addition lands behind the existing arch dispatch or as new
+`Function` / `Disassembler` methods that returned the
+no-architecture-support default in 0.6.0.
+
+### Added — AArch64 analyser ports
+
+- **Structured disarm64 operand walker.** Uniform
+  `{kind, reg, imm, mem}` operand surface on top of disarm64 so
+  analysers no longer have to parse formatted Intel-style operand
+  strings (the 0.6.0 stopgap). Mirrors the iced typed-operand walker
+  that landed in capa 0.5.0. Foundation for the jump-table and
+  indirect-call ports below.
+- **AArch64 jump-table heuristic.** Recognises the standard ARM64
+  switch-statement lowering — ADRP / ADD / LDR
+  (table-of-deltas or table-of-targets) feeding into BR — and
+  produces the corresponding jump targets as block-queue entries.
+  Previously the analyser short-circuited via empty operand strings.
+- **AArch64 indirect-call register tracking.** Small-window dataflow
+  backtracks register definitions before BLR / BR so calls through
+  GOT thunks or constant-loaded function pointers resolve. Mirrors
+  the x86 backtracking pipeline but matches on disarm64 mnemonics.
+- **AArch64 tail-call recognition past bare `b`.** The 0.6.0 walker
+  promoted `b` to a known function or pending candidate as a tail
+  call but left bare unresolved `b`-targets unclassified. The
+  `TailCallAnalyser` now feeds off the AArch64 walker's
+  `code_refs` and promotes off-function targets to candidates.
+- **PE `.pdata` exception-handler sweep for ARM64 PE.** Parses the
+  ARM64-flavoured `RUNTIME_FUNCTION` + packed UNWIND_INFO layout
+  (distinct from x64 SEH) and produces function-start candidates.
+- **AArch64 NOP detection in `next_gap_candidate`.** Adds the
+  4-byte word match on `1f 20 03 d5` so gap scans don't classify
+  ARM64 NOP padding as code-free data.
+- **AArch64 exit-syscall recognition.** Recognises `mov w8, #93`
+  (or `#94`) followed by `svc #0` as a function-terminating syscall;
+  marks the block sanely-ending. Linux exit / exit_group ABI.
+- **`Function::is_api_thunk` AArch64 patterns.** Adds single-`b`
+  to-import and ADRP+LDR+BR through GOT/.got.plt patterns so capa
+  folds thunks into their resolved API on ARM64 binaries.
 
 ## [0.6.0] — 2026-05-27 — AArch64 + Decoder-trait refactor
 

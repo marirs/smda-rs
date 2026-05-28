@@ -31,6 +31,12 @@ use crate::{BinaryInfo, Result};
 // inherent methods on the formatter struct.
 use iced_x86::{Formatter, IntelFormatter};
 
+// 0.6.1: minimal structured-operand decoders for the AArch64 families
+// the jump-table + indirect-call analysers care about. Lives in a
+// sibling file so the operand bit-extraction grows independently of
+// the trait/decoder plumbing in this module.
+pub mod aarch64_ops;
+
 /// Configure an `IntelFormatter` to emit capstone-compatible output:
 /// lowercase hex with `0x` prefix, `dword ptr` / `qword ptr` size prefixes,
 /// space around `+` / `-` in memory operands, and `, ` between operands.
@@ -667,4 +673,14 @@ pub fn aarch64_is_indirect_call(opcode: &disarm64::decoder::Opcode) -> bool {
 pub fn aarch64_is_trap(opcode: &disarm64::decoder::Opcode) -> bool {
     use disarm64::decoder::Mnemonic as M;
     matches!(opcode.mnemonic, M::udf | M::brk | M::hlt)
+}
+
+/// True iff the AArch64 instruction is a supervisor call (`SVC #imm16`,
+/// ARM ARM §C6.2.279) — the Linux syscall entry point on AArch64. The
+/// walker pairs this with prior-`x8`-immediate tracking to spot
+/// `exit` / `exit_group` (syscall numbers 93 / 94) and end the function.
+#[inline]
+#[must_use]
+pub fn aarch64_is_svc(opcode: &disarm64::decoder::Opcode) -> bool {
+    matches!(opcode.mnemonic, disarm64::decoder::Mnemonic::svc)
 }

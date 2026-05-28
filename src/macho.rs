@@ -29,6 +29,32 @@ const CPU_TYPE_X86_64: u32 = 7 | 0x0100_0000; // CPU_ARCH_ABI64
 /// 0.6.0 — CPU_TYPE_ARM64 = 12 | CPU_ARCH_ABI64.
 pub(crate) const CPU_TYPE_ARM64: u32 = 12 | 0x0100_0000;
 
+/// (0.6.1, upstream issue #118) Map a Mach-O `cputype` to bitness.
+/// Returns `None` for unsupported CPU types instead of silently
+/// falling through.
+#[must_use]
+pub fn bitness_from_cputype(cputype: u32) -> Option<u32> {
+    match cputype {
+        CPU_TYPE_X86 => Some(32),
+        CPU_TYPE_X86_64 | CPU_TYPE_ARM64 => Some(64),
+        _ => None,
+    }
+}
+
+/// (0.6.1, upstream issue #118) Map a Mach-O `cputype` to
+/// [`crate::FileArchitecture`]. Returns `None` for unsupported
+/// CPU types. Centralised here so the loader, the report writer,
+/// and any downstream consumer all agree on the same mapping.
+#[must_use]
+pub fn architecture_from_cputype(cputype: u32) -> Option<crate::FileArchitecture> {
+    match cputype {
+        CPU_TYPE_X86 => Some(crate::FileArchitecture::I386),
+        CPU_TYPE_X86_64 => Some(crate::FileArchitecture::AMD64),
+        CPU_TYPE_ARM64 => Some(crate::FileArchitecture::Aarch64),
+        _ => None,
+    }
+}
+
 /// Pull the Intel Mach-O out of `binary`. Retained for source compat;
 /// new callers should prefer [`extract_macho`] (Intel + ARM64).
 pub fn extract_intel(binary: &[u8]) -> Result<MachO<'_>> {

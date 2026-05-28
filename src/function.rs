@@ -356,14 +356,110 @@ impl Function {
             };
         let mut f = f;
         for block in f.blocks.values() {
+            // x86 path: per-instruction `get_printable_len` fires on
+            // any `mov [mem], imm` where the immediate is printable.
             for ins in block {
                 if ins.get_printable_len().unwrap_or(0) > 0 {
                     f.stringrefs.push(ins.offset);
                 }
             }
+            // (0.6.1) AArch64 path: stack strings on ARM64 are built
+            // by a MOVZ/MOVK chain into Wn/Xn followed by a STR to
+            // `[sp, #N]` or `[x29, #N]`. Track per-block register-to-
+            // value bindings; when a STR fires whose source register
+            // holds a printable value, surface the STR's offset as a
+            // stringref (mirrors the semantic the x86 path produces
+            // for the equivalent immediate-store-to-stack pattern).
+            Function::collect_aarch64_stack_strings(block, &mut f.stringrefs);
         }
         f.stringrefs.sort_unstable();
+        f.stringrefs.dedup();
         Ok(f)
+    }
+
+    /// (0.6.1) Walk a single basic block tracking MOVZ/MOVK chains
+    /// into the 32 GPRs, and push the offset of any `STR <reg>, [SP/X29, #N]`
+    /// where `<reg>` holds a printable ASCII/UTF-16 value at the time
+    /// of the store. Idempotent — the caller dedups `stringrefs`.
+    ///
+    /// This is intentionally a per-block (not cross-block) tracker:
+    /// most compiler-emitted stack strings live entirely inside the
+    /// block that does the store, and the dataflow we'd need across
+    /// blocks (phi-style merging across branch joins) doesn't pay for
+    /// itself for the stack-string use case.
+    fn collect_aarch64_stack_strings(block: &[Instruction], stringrefs: &mut Vec<u64>) {
+        use crate::disassembler::DecodedInsn;
+        use crate::disassembler::aarch64_ops::{MovWideKind, decode_ldr_str_uimm, decode_mov_wide};
+        use std::collections::HashMap;
+
+        // reg_num -> current materialised value (low 64 bits)
+        let mut reg_val: HashMap<u8, u64> = HashMap::new();
+
+        for ins in block {
+            let DecodedInsn::Aarch64(a) = &ins.decoded else {
+                return; // non-AArch64 block — bail entirely
+            };
+            let w = a.opcode;
+
+            // STR <reg>, [SP|X29, #imm12] — if the stored register is
+            // tracked AND its value is printable, this is a stack
+            // string write. SP and X29 (= R29, the frame pointer) are
+            // the only stack-relative bases compilers use.
+            if let Some(op) = decode_ldr_str_uimm(w)
+                && op.is_store
+                && (op.rn == 31 || op.rn == 29)
+                && let Some(&value) = reg_val.get(&op.rt)
+            {
+                let bytes = match op.size_bytes {
+                    1 => vec![value as u8],
+                    2 => (value as u16).to_le_bytes().to_vec(),
+                    4 => (value as u32).to_le_bytes().to_vec(),
+                    8 => value.to_le_bytes().to_vec(),
+                    _ => Vec::new(),
+                };
+                let ascii = is_printable_ascii(&bytes).unwrap_or(false);
+                let utf16 = bytes.len() >= 4
+                    && bytes.len().is_multiple_of(2)
+                    && is_printable_utf16le(&bytes).unwrap_or(false);
+                if ascii || utf16 {
+                    stringrefs.push(ins.offset);
+                }
+                // STR doesn't write Rt — leave the tracker alone.
+                continue;
+            }
+
+            // MOVZ / MOVN / MOVK update the per-register tracker.
+            // Mirrors the syscall-tracker logic in the walker: MOVZ
+            // overwrites, MOVN inverts, MOVK keeps non-targeted slots.
+            if let Some((rd, value, kind)) = decode_mov_wide(w) {
+                match kind {
+                    MovWideKind::Movz | MovWideKind::Movn => {
+                        reg_val.insert(rd, value);
+                    }
+                    MovWideKind::Movk => {
+                        // (0.6.1, M2 defensive) `hw` lives at bits 22:21,
+                        // so `& 0x3` already constrains it to 0..=3 — the
+                        // shift `hw * 16` can be at most 48, well within
+                        // u64 range. Belt-and-suspenders: skip the update
+                        // if `hw` somehow ends up out of range rather
+                        // than risking the shift becoming UB.
+                        let hw = (w >> 21) & 0x3;
+                        if hw >= 4 {
+                            continue;
+                        }
+                        let slot_mask: u64 = 0xFFFFu64 << (hw * 16);
+                        let prev = reg_val.get(&rd).copied().unwrap_or(0);
+                        reg_val.insert(rd, (prev & !slot_mask) | (value & slot_mask));
+                    }
+                }
+            }
+            // Any other instruction *might* clobber some register;
+            // we don't model the full ABI. The trade-off: we may
+            // over-track in rare cases, but stale-tracker entries
+            // only cause harm if (a) they happen to be printable AND
+            // (b) a subsequent STR uses them — both rare enough that
+            // a false positive in stringrefs is acceptable here.
+        }
     }
 
     fn parse_blocks(
@@ -421,15 +517,36 @@ impl Function {
             return Ok(false);
         }
         let first_ins = &self.blocks[&self.offset][0];
-        // x86 only: a single `jmp`/`call` with an API ref. AArch64 thunks
-        // (a `br` to a got slot) land in 0.6.1.
+        // The thunk shape is the same idea on both architectures —
+        // a single instruction that transfers control to an imported
+        // symbol — but the mnemonic set differs.
+        //
+        //   x86:     `jmp <api>` or `call <api>`.
+        //   AArch64: `b <api>` (the typical PLT thunk on Linux) or
+        //            `bl <api>` (rare — would mean call-then-fall-off,
+        //            still flagged because get_api_refs follows both
+        //            and the apirefs check below disambiguates).
+        //
+        // ADRP+LDR+BR multi-insn GOT thunks are >1 instruction so the
+        // count guard above already excludes them — they show up as
+        // ordinary functions with an imported call inside, which is
+        // the correct classification.
         match first_ins.decoded {
             DecodedInsn::X86(_) => {
                 if !matches!(first_ins.mnemonic_enum(), Mnemonic::Jmp | Mnemonic::Call) {
                     return Ok(false);
                 }
             }
-            DecodedInsn::Aarch64(_) => return Ok(false),
+            DecodedInsn::Aarch64(a) => {
+                use crate::disassembler::{
+                    aarch64_is_direct_call, aarch64_is_unconditional_branch,
+                };
+                if !(aarch64_is_direct_call(&a.decoded)
+                    || aarch64_is_unconditional_branch(&a.decoded))
+                {
+                    return Ok(false);
+                }
+            }
         }
         if self.apirefs.is_empty() {
             return Ok(false);

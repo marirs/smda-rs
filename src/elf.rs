@@ -1,4 +1,4 @@
-use crate::{Result, SectionMap, error::Error};
+use crate::{FileArchitecture, Result, SectionMap, error::Error};
 use goblin::elf::program_header::{PT_DYNAMIC, PT_LOAD};
 use std::collections::{HashMap, HashSet};
 
@@ -7,17 +7,51 @@ pub fn get_bitness(binary: &[u8]) -> Result<u32> {
         Ok(goblin::Object::Elf(elf)) => elf,
         _ => return Err(Error::UnsupportedFormatError),
     };
-    let machine_type = elffile.header.e_machine;
-    if machine_type == goblin::elf::header::EM_X86_64
-        || machine_type == goblin::elf::header::EM_AARCH64
-    {
-        return Ok(64);
-    } else if machine_type == goblin::elf::header::EM_386
-        || machine_type == goblin::elf::header::EM_ARM
-    {
-        return Ok(32);
+    bitness_from_machine(elffile.header.e_machine)
+}
+
+/// (0.6.1, upstream issue #120) Map `e_machine` → bitness with the
+/// same logic [`get_bitness`] uses, but takes the raw constant so
+/// internal callers that already parsed the ELF header don't re-parse.
+pub fn bitness_from_machine(e_machine: u16) -> Result<u32> {
+    if e_machine == goblin::elf::header::EM_X86_64 || e_machine == goblin::elf::header::EM_AARCH64 {
+        Ok(64)
+    } else if e_machine == goblin::elf::header::EM_386 || e_machine == goblin::elf::header::EM_ARM {
+        Ok(32)
+    } else {
+        Err(Error::UnsupportedPEBitnessIDError(11))
     }
-    Err(Error::UnsupportedPEBitnessIDError(11))
+}
+
+/// (0.6.1, upstream issue #120) Map an ELF `e_machine` constant to
+/// [`FileArchitecture`]. Returns `None` for non-x86 / non-ARM types
+/// — callers should treat that as "unsupported" rather than silently
+/// falling through to Intel.
+///
+/// Centralising this mapping here so all loader / report code agrees
+/// on the same architecture-detection logic instead of re-checking
+/// `e_machine` constants ad-hoc.
+#[must_use]
+pub fn architecture_from_machine(e_machine: u16) -> Option<FileArchitecture> {
+    use goblin::elf::header::{EM_386, EM_AARCH64, EM_ARM, EM_X86_64};
+    match e_machine {
+        EM_X86_64 => Some(FileArchitecture::AMD64),
+        EM_386 => Some(FileArchitecture::I386),
+        EM_AARCH64 => Some(FileArchitecture::Aarch64),
+        EM_ARM => None, // ARM32 not supported by smda-rs yet (disarm64 is ARM64-only)
+        _ => None,
+    }
+}
+
+/// Top-level convenience: parse the ELF and return its
+/// [`FileArchitecture`], `None` if unsupported.
+#[must_use]
+pub fn get_architecture(binary: &[u8]) -> Option<FileArchitecture> {
+    let elffile = match goblin::Object::parse(binary) {
+        Ok(goblin::Object::Elf(elf)) => elf,
+        _ => return None,
+    };
+    architecture_from_machine(elffile.header.e_machine)
 }
 
 pub fn get_base_address(binary: &[u8]) -> Result<u64> {
