@@ -73,6 +73,29 @@ impl TailCallAnalyser {
         state: &mut FunctionAnalysisState,
         high_accuracy: bool,
     ) -> Result<HashSet<u64>> {
+        // (0.6.3) Helper — `analyse_function` returns
+        // `Err(Error::CollisionError(_))` when the requested start
+        // address is already part of an existing function. For the
+        // tail-call resolver this is EXPECTED: the whole point of
+        // tail-call discovery is re-visiting addresses reached from
+        // multiple call sites, so most candidates are already known.
+        // The main candidate loop in `analyse_buffer` (lib.rs:1510,
+        // 1517, 1525) swallows the same Result via `.ok()`; pre-0.6.3
+        // the four `analyse_function(…)?` sites below propagated
+        // CollisionError fatally, aborting the WHOLE resolve_tailcalls
+        // pass — and via `?` in `analyse_buffer:1537` aborting the
+        // whole `Disassembler::parse` call. On Apple-Silicon /bin/ls
+        // this manifested as a 95 ms parse-error return from any
+        // consumer that set `resolve_tailcalls=true` (e.g. capa-rs).
+        // Other error variants (LogicError, NotEnoughBytesError, …)
+        // still propagate — only CollisionError is benign here.
+        fn try_analyse(d: &mut Disassembler, addr: u64, high_accuracy: bool) -> Result<()> {
+            match d.analyse_function(addr, false, high_accuracy) {
+                Ok(_) | Err(Error::CollisionError(_)) => Ok(()),
+                Err(e) => Err(e),
+            }
+        }
+
         let mut newly_created_functions = HashSet::new();
         for tailcall in disassembler.tailcall_analyzer.get_tailcalls()? {
             //# remove the information from the function-analysis state of the disassembly
@@ -82,11 +105,7 @@ impl TailCallAnalyser {
             {
                 Ok(f) => {
                     if disassembler.tailcall_analyzer.functions[&f].is_tailcall_function {
-                        disassembler.analyse_function(
-                            tailcall.destination_function,
-                            false,
-                            high_accuracy,
-                        )?;
+                        try_analyse(disassembler, tailcall.destination_function, high_accuracy)?;
                         continue;
                     }
                     disassembler
@@ -97,16 +116,12 @@ impl TailCallAnalyser {
                     state.revert_analysis()?;
                 }
                 _ => {
-                    disassembler.analyse_function(
-                        tailcall.destination_function,
-                        false,
-                        high_accuracy,
-                    )?;
+                    try_analyse(disassembler, tailcall.destination_function, high_accuracy)?;
                     continue;
                 }
             }
             //# analyze the tailcall destination as function
-            disassembler.analyse_function(tailcall.destination_addr, false, high_accuracy)?;
+            try_analyse(disassembler, tailcall.destination_addr, high_accuracy)?;
             newly_created_functions.insert(tailcall.destination_addr);
             if let Ok(addr) = disassembler
                 .tailcall_analyzer
@@ -116,11 +131,7 @@ impl TailCallAnalyser {
                     .contains(&tailcall.destination_function)
             {
                 //# analyze the (previously) broken function a second time
-                disassembler.analyse_function(
-                    tailcall.destination_function,
-                    false,
-                    high_accuracy,
-                )?;
+                try_analyse(disassembler, tailcall.destination_function, high_accuracy)?;
                 let addr_function = disassembler
                     .tailcall_analyzer
                     .get_function_by_start_addr(tailcall.destination_function)?;

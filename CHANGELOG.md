@@ -3,6 +3,35 @@
 All notable changes to **smda** are documented here.
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.3] — Tail-call resolver no longer aborts on benign collisions
+
+### Fixed
+
+- **`TailCallAnalyser::resolve_tailcalls` no longer fatally
+  propagates `Error::CollisionError`.** Four `analyse_function(…)?`
+  sites in `tail_call_analyser.rs` propagated the "address already
+  belongs to an existing function" sentinel as a hard error —
+  aborting the whole `resolve_tailcalls` pass and, because
+  `analyse_buffer:1537` propagates that via `?`, the WHOLE
+  `Disassembler::parse` call. The main candidate loop in
+  `analyse_buffer` (lib.rs:1510, 1517, 1525) had always swallowed
+  the same Result via `.ok()` for exactly this reason — collisions
+  during function discovery are expected, not fatal.
+
+  Concrete repro: any consumer calling
+  `SmdaConfig::new().resolve_tailcalls(true)` on Apple-Silicon
+  /bin/ls — `Disassembler::parse` returned
+  `Err(CollisionError(0x100003698))` after ~95 ms, with zero
+  functions analysed. capa-rs hit this whenever it ran ARM64
+  Mach-O input through the CLI (which sets `resolve_tailcalls=true`
+  by default).
+
+  Fix: a small `try_analyse` helper wraps the four call sites and
+  treats `CollisionError` as success (skip this candidate, continue
+  the loop). Other error variants — `LogicError`,
+  `NotEnoughBytesError`, etc. — still propagate, because those
+  signal real bugs.
+
 ## [0.6.2] — Code hygiene patch
 
 No behavioural changes — pure cleanup pass after the 0.6.0/0.6.1
