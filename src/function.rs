@@ -133,8 +133,10 @@ impl Instruction {
     }
 
     /// iced `OpKind` for the i-th operand. Returns `OpKind::Register`
-    /// on AArch64 (no-op sentinel — AArch64 operand walking is a 0.6.1
-    /// feature; analysers should gate on `arch` before calling this).
+    /// on AArch64 (no-op sentinel — analysers should gate on `arch`
+    /// before calling this). AArch64 analysers walk operands via the
+    /// dedicated `disassembler::aarch64_ops` decoders instead, which
+    /// work directly on the 32-bit instruction word.
     #[must_use]
     pub fn op_kind(&self, i: u32) -> OpKind {
         self.decoded.op_kind_x86(i).unwrap_or(OpKind::Register)
@@ -210,8 +212,11 @@ impl Instruction {
     /// Detects "`mov [stack], <imm>`"-style stack strings. Returns the
     /// printable length of the immediate if it is ASCII / UTF-16 LE, else 0.
     ///
-    /// x86 only — returns Ok(0) on AArch64 (the equivalent stack-string
-    /// pattern uses `mov` + `str` and lands in 0.6.1).
+    /// x86 only — returns Ok(0) on AArch64 because the ARM64 pattern
+    /// (MOVZ/MOVK into Rn followed by `STR Rn, \[sp, #N\]`) needs
+    /// multi-instruction state to recognise. That detection lives in
+    /// `Function::collect_aarch64_stack_strings` and runs separately
+    /// on the per-function stringrefs accumulator.
     pub fn get_printable_len(&self) -> Result<u64> {
         let Some(iced) = self.iced() else {
             return Ok(0);
@@ -239,9 +244,9 @@ impl Instruction {
     /// operands, filtered to addresses inside the mapped image. Skips
     /// control-flow / compare / test instructions.
     ///
-    /// x86 only in 0.6.0 — returns an empty Vec on AArch64. The
-    /// AArch64 equivalent walks `ldr literal` + `adrp/add` pairs and
-    /// lands in 0.6.1.
+    /// x86 only — returns an empty Vec on AArch64. An ARM64 equivalent
+    /// would need `ADR` / `ADRP` + immediate-offset resolution against
+    /// the analyser's section map; not yet implemented.
     pub fn get_data_refs(&self, report: &DisassemblyReport) -> Result<Vec<u64>> {
         let Some(iced) = self.iced() else {
             return Ok(vec![]);
@@ -281,6 +286,10 @@ impl Instruction {
     }
 }
 
+// `characteristics`, `confidence`, and `tfidf` (below) are populated
+// by `Function::new` for `Debug` print output and downstream tooling
+// inspection; no in-crate reader.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Function {
     pub arch: crate::FileArchitecture,

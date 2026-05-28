@@ -35,10 +35,11 @@ static LEA_REG_DWORD: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 fn op_str_of(ins: &DecodedInsn) -> String {
-    // x86 only — the indirect-call analyser's regex driver depends on the
-    // capstone-compatible string layout. On AArch64 we return an empty
-    // string so the regex pipeline below short-circuits (full register
-    // tracking on ARM64 lands in 0.6.1).
+    // x86 only — the regex-driven `process_block` below depends on the
+    // capstone-compatible string layout. AArch64 indirect-call
+    // resolution lives in `resolve_register_calls_aarch64` /
+    // `process_block_aarch64`, which work on the structurally typed
+    // disarm64 opcode stream instead and don't go through this helper.
     let Some(iced) = ins.as_iced() else {
         return String::new();
     };
@@ -141,10 +142,9 @@ impl IndirectCallAnalyser {
 
         let mut abs_value_found = false;
         for ins in block.iter().rev() {
-            // x86 only: AArch64 register tracking lands in 0.6.1. The
-            // regex driver below already short-circuits to empty
-            // operand strings via `op_str_of` for AArch64 — bail early
-            // here too so we don't waste cycles.
+            // x86-only path. AArch64 is handled by the sibling
+            // `process_block_aarch64` below. Skip non-x86 carriers
+            // so this regex pipeline doesn't waste cycles on them.
             let Some(mnem) = ins.mnemonic_enum_x86() else {
                 continue;
             };

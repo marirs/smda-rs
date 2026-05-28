@@ -24,6 +24,10 @@
 use std::collections::HashMap;
 
 /// Result of parsing a pclntab.
+///
+/// `version` and `pclntab_offset` are populated for downstream
+/// inspection (debug / diagnostic tooling); no in-crate reader.
+#[allow(dead_code)]
 #[derive(Debug, Default, Clone)]
 pub struct GoSymbols {
     /// Map of function-start VA → demangled Go function name.

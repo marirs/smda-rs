@@ -67,22 +67,3 @@ pub enum Error {
     #[error("analysis timeout exceeded ({0:?})")]
     AnalysisTimeout(std::time::Duration),
 }
-
-/// Cast a u64 from a parsed file field to usize, returning Err on truncation
-/// (only matters on 32-bit targets, but cheap and centralises the audit).
-#[inline]
-pub fn try_usize(label: &'static str, x: u64) -> Result<usize, Error> {
-    usize::try_from(x).map_err(|_| Error::IntegerOverflow(label, x, 0))
-}
-
-/// `a + b` returning Err on overflow.
-#[inline]
-pub fn safe_add(label: &'static str, a: u64, b: u64) -> Result<u64, Error> {
-    a.checked_add(b).ok_or(Error::IntegerOverflow(label, a, b))
-}
-
-/// `a - b` returning Err on underflow.
-#[inline]
-pub fn safe_sub(label: &'static str, a: u64, b: u64) -> Result<u64, Error> {
-    a.checked_sub(b).ok_or(Error::IntegerOverflow(label, a, b))
-}

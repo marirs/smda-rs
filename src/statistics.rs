@@ -1,5 +1,8 @@
 use crate::{DisassemblyResult, Result};
 
+// Statistics are computed once per report and printed via Debug —
+// no in-crate reader, but the values land in CLI / log output.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct DisassemblyStatistics {
     num_functions: usize,

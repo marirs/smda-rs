@@ -21,9 +21,11 @@
 //! [`DecodedInsn::is_return`], [`DecodedInsn::is_branch`]) dispatch
 //! internally.
 //!
-//! The x86-only heuristics (jump-table, indirect-call, tail-call,
-//! function-candidate alignment, exit-syscall) are gated to skip on
-//! AArch64 in 0.6.0; richer AArch64 analyser support arrives in 0.6.1.
+//! As of 0.6.1, AArch64 has its own sibling implementations of the
+//! heuristics that were originally x86-only (jump-table, indirect-
+//! call, tail-call, exit-syscall, stack-string, is_api_thunk).
+//! Function-candidate alignment is still x86-only and degrades
+//! gracefully on ARM64.
 
 use crate::{BinaryInfo, Result};
 // `Formatter` brings the `options_mut` / `format` trait methods into
@@ -594,8 +596,10 @@ pub fn aarch64_is_direct_call(opcode: &disarm64::decoder::Opcode) -> bool {
 }
 
 /// True iff the AArch64 instruction is an unconditional direct
-/// branch (B with PC-relative imm26). `BR <reg>` is excluded —
-/// indirect jumps need register tracking, deferred to 0.6.1.
+/// branch (B with PC-relative imm26). `BR <reg>` is excluded — it's
+/// matched by [`aarch64_is_indirect_branch`] instead, since the two
+/// require different walker handling (direct target vs. block-ending
+/// register-indirect jump).
 #[inline]
 #[must_use]
 pub fn aarch64_is_unconditional_branch(opcode: &disarm64::decoder::Opcode) -> bool {

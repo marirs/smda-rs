@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 #![allow(clippy::type_complexity)]
 #[macro_use]
 extern crate maplit;
@@ -502,7 +501,6 @@ impl<'a> BinaryInfo<'a> {
 pub struct DisassemblyResult<'a> {
     analysis_start_ts: SystemTime,
     analysis_end_ts: SystemTime,
-    analysis_timeout: bool,
     pub binary_info: BinaryInfo<'a>,
     identified_alignment: usize,
     pub code_map: HashMap<u64, u64>,
@@ -518,7 +516,6 @@ pub struct DisassemblyResult<'a> {
     function_borders: HashMap<u64, (u64, u64)>,
     instructions: HashMap<u64, (String, u32)>,
     pub ins2fn: HashMap<u64, u64>,
-    language: HashMap<i32, Vec<u8>>,
     data_refs_from: HashMap<u64, Vec<u64>>,
     data_refs_to: HashMap<u64, Vec<u64>>,
     pub code_refs_from: HashMap<u64, Vec<u64>>,
@@ -528,7 +525,6 @@ pub struct DisassemblyResult<'a> {
     pub function_symbols: HashMap<u64, String>,
     pub candidates: HashMap<u64, FunctionCandidate>,
     confidence_threshold: f32,
-    code_areas: Vec<u8>,
 }
 
 impl<'a> DisassemblyResult<'a> {
@@ -538,7 +534,6 @@ impl<'a> DisassemblyResult<'a> {
         DisassemblyResult {
             analysis_start_ts: SystemTime::now(),
             analysis_end_ts: SystemTime::now(),
-            analysis_timeout: false,
             binary_info,
             identified_alignment: 0,
             code_map: HashMap::new(),
@@ -551,7 +546,6 @@ impl<'a> DisassemblyResult<'a> {
             function_borders: HashMap::new(),
             instructions: HashMap::new(),
             ins2fn: HashMap::new(),
-            language: HashMap::new(),
             data_refs_from: HashMap::new(),
             data_refs_to: HashMap::new(),
             code_refs_from: HashMap::new(),
@@ -561,7 +555,6 @@ impl<'a> DisassemblyResult<'a> {
             function_symbols: HashMap::new(),
             candidates: HashMap::new(),
             confidence_threshold: 0.0,
-            code_areas: vec![],
         }
     }
 
@@ -688,7 +681,9 @@ impl<'a> DisassemblyResult<'a> {
 
     fn extract_call_target(instruction: &DecodedInsn, _base_addr: u64) -> Option<u64> {
         use iced_x86::OpKind;
-        // x86 only: AArch64 bl/blr resolution lands in 0.6.1.
+        // x86 only. `get_api_refs` handles the AArch64 `bl`/`b`
+        // branch-target follow inline via `aarch64_branch_target_raw`
+        // so this helper doesn't need an ARM64 path.
         let iced = instruction.as_iced()?;
         if matches!(iced.flow_control(), FlowControl::Call) && iced.op_count() >= 1 {
             match iced.op_kind(0) {
@@ -1432,11 +1427,11 @@ impl<'a> Disassembler<'a> {
         // For PE samples (especially stripped DLLs) the export table is
         // often the only reliable list of public-facing function entries.
         //
-        // 0.6.0: same seeding extended to Mach-O so AArch64 binaries
-        // (and Intel Mach-O) get function-candidate coverage from
-        // their export tables. Without this, ARM64 binaries return
-        // zero functions because the x86 prologue-scan analysers are
-        // gated off and AArch64 has no equivalent yet (lands in 0.6.1).
+        // Same seeding extended to Mach-O so AArch64 binaries (and
+        // Intel Mach-O) get function-candidate coverage from their
+        // export tables. Critical for ARM64 binaries because the x86
+        // prologue-scan analysers are gated off — without these seeds
+        // the candidate queue would start empty on Mach-O ARM64.
         let base_addr = self.disassembly.binary_info.base_addr;
         let format = self.disassembly.binary_info.file_format;
         if format == FileFormat::PE || format == FileFormat::MachO {
@@ -1640,18 +1635,6 @@ impl<'a> Disassembler<'a> {
             }
         }
         Ok((None, None))
-    }
-
-    fn is_plt_got_address(&self, addr: u64) -> Result<bool> {
-        for (section_name, section_start, section_size) in &self.disassembly.binary_info.sections {
-            if section_name.contains(".plt") || section_name.contains(".got") {
-                let section_end = section_start + *section_size as u64;
-                if addr >= *section_start && addr < section_end {
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
     }
 
     fn analyze_call_instruction(
@@ -1918,40 +1901,38 @@ impl<'a> Disassembler<'a> {
         Ok(())
     }
 
-    /// (0.6.0) AArch64-specific function analyser. Linear walker
-    /// modelled after the x86 [`Self::analyse_function`] pass, but
-    /// dispatching on disarm64's `Mnemonic` + the direct-branch
-    /// target resolver in [`disassembler::aarch64_branch_target_raw`].
+    /// AArch64-specific function analyser. Linear walker modelled
+    /// after the x86 [`Self::analyse_function`] pass, but dispatching
+    /// on disarm64's `Mnemonic` + the direct-branch target resolver
+    /// in [`disassembler::aarch64_branch_target_raw`].
     ///
     /// Per-instruction control-flow taxonomy (ARM ARM §C6.2):
-    /// - `ret` / `eret` / `retaa` / `retab` / `drps`        — function end
+    /// - `ret` / `eret` / `retaa` / `retab` / `drps`        — function end.
     /// - `bl <imm>`  (BL, BRANCH_IMM)                       — direct call:
-    ///   record the target as a function candidate so transitive call
-    ///   targets become functions on the next analysis pass; continue
-    ///   walking past the call (standard ABI: call returns to PC+4).
-    /// - `blr <reg>` (BLR, BRANCH_REG)                      — indirect
-    ///   call; track on `state.call_register_ins` for the indirect-call
-    ///   analyser (which only inspects x86 today, so this is a stub).
-    ///   Continue walking past it.
+    ///   seed the target as a candidate (so transitive call targets
+    ///   become functions on the next analysis pass); fall through to
+    ///   PC+4.
+    /// - `blr <reg>` / PAC variants (`blraa`/`blrab`/…)     — indirect
+    ///   call. Record on `state.call_register_ins`; the post-walk
+    ///   `IndirectCallAnalyser::resolve_register_calls_aarch64` pass
+    ///   back-walks to resolve GOT/PLT thunks. Fall through to PC+4.
     /// - `b <imm>`   (B,  BRANCH_IMM)                       — uncond
-    ///   direct jump. If the target is a known function start or a
-    ///   pending candidate, treat as tail call → function end. Else
-    ///   add the target to the block worklist and end the block.
-    /// - `br <reg>`  (BR, BRANCH_REG)                       — indirect
-    ///   jump (tail-call or jump-table). End the block. Without
-    ///   register tracking we can't follow it.
+    ///   direct jump. Tail call if target is a known function /
+    ///   pending candidate; otherwise queue as a block of this
+    ///   function. End block either way.
+    /// - `br <reg>` / PAC variants (`braa`/`brab`/…)         — indirect
+    ///   jump. Try `JumpTableAnalyser::get_jump_targets_aarch64`
+    ///   first (recognises Clang/GCC switch lowerings); on miss,
+    ///   end the block as a tail-call edge.
     /// - `b.cond` / `cbz` / `cbnz` / `tbz` / `tbnz`         — conditional
-    ///   branch. Queue both the target and the fallthrough; end block.
+    ///   branch. Queue both target and fallthrough; end block.
+    /// - `udf` / `brk` / `hlt`                              — trap.
+    ///   Mark sanely-ending; end block.
+    /// - `svc #0` (Linux, x8 = 93/94) /
+    ///   `svc #0x80` (macOS, x16 = 1/472)                   — exit
+    ///   syscall: end function.
     /// - everything else                                    — pure
     ///   straight-line code, continue.
-    ///
-    /// The MVP doesn't model PAC indirect calls (`blraa` / `blrab`),
-    /// jump tables, exit syscalls (`svc #0` with `x8 = 93/94`), stack-
-    /// string detection, or fancy tail-call deduplication; all deferred
-    /// to 0.6.1. Even so, a linear walk from each seeded candidate
-    /// fans out via `bl` transitive propagation and turns the
-    /// historical 0-function output on AArch64 binaries into the
-    /// expected dozens-to-thousands.
     fn analyse_function_aarch64(
         &mut self,
         start_addr: u64,
@@ -2046,8 +2027,10 @@ impl<'a> Disassembler<'a> {
                     } else if aarch64_is_indirect_call(&opcode) {
                         // Indirect call via register: `blr <reg>` or any
                         // PAC variant (`blraa`/`blraaz`/`blrab`/`blrabz`).
-                        // Track for the indirect-call analyser (x86-only
-                        // today; included here for forward compatibility).
+                        // Recorded for the post-walk
+                        // `resolve_register_calls_aarch64` pass, which
+                        // back-walks ADRP+LDR+BLR / ADRP+ADD+LDR+BLR
+                        // GOT thunks to recover the called API.
                         state.set_leaf(false)?;
                         state.call_register_ins.push(i_address);
                         // Falls through — `blr*` returns to PC+4.
@@ -2630,14 +2613,20 @@ impl<'a> Disassembler<'a> {
         Ok(String::new())
     }
 
-    /// (0.4.1 M2) Track `mov eax, IMM` / `mov rax, IMM` to feed the
-    /// exit-syscall recogniser. Returns the new "last exit reg imm"
-    /// state. Any non-mov-to-{e,r,a}ax instruction clears the tracker
-    /// (because the exit number must be set *immediately* before the
-    /// syscall to be the actual call number).
+    /// Track `mov eax/rax, IMM` to feed the exit-syscall recogniser.
+    /// Returns the updated "last exit reg imm" state.
+    ///
+    /// Snapshots on a `mov` to the eax-family with an immediate
+    /// source; preserves the prior value across instructions that
+    /// don't touch eax-family; clears on any instruction that
+    /// clobbers eax-family (op0 = eax-family, or implicit-clobber
+    /// mnemonics like `cpuid`/`mul`/`pop` — see the body for the
+    /// full list).
+    ///
+    /// x86 only — AArch64 has its own per-block tracker
+    /// (`last_x8_imm` / `last_x16_imm`) in `analyse_function_aarch64`.
     fn extract_exit_reg_imm(ins: &DecodedInsn, current: Option<u64>) -> Option<u64> {
         use iced_x86::Register;
-        // x86 only — AArch64 exit-syscall recognition lands in 0.6.1.
         let Some(iced) = ins.as_iced() else {
             return current;
         };
@@ -2710,10 +2699,14 @@ impl<'a> Disassembler<'a> {
         current
     }
 
-    /// (0.4.1 M2) Recognise the Linux exit-syscall convention. Linux
-    /// `exit` is 60 / `exit_group` is 231 on x86_64 (via `syscall`); 1 /
-    /// 252 respectively on x86 (via `int 0x80`). x86 only — AArch64
-    /// equivalent (`svc #0` with x8 = 93/94) lands in 0.6.1.
+    /// Recognise the Linux exit-syscall convention. Linux `exit` is 60
+    /// / `exit_group` is 231 on x86_64 (via `syscall`); 1 / 252
+    /// respectively on x86 (via `int 0x80`).
+    ///
+    /// x86 only — AArch64 has its own SVC recogniser inside
+    /// `analyse_function_aarch64` that handles both Linux (`svc #0`
+    /// with x8 = 93/94) and macOS (`svc #0x80` with x16 = 1/472)
+    /// conventions.
     fn is_exit_syscall(ins: &DecodedInsn, last_eax_imm: Option<u64>) -> bool {
         let Some(iced) = ins.as_iced() else {
             return false;

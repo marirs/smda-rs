@@ -3,6 +3,99 @@
 All notable changes to **smda** are documented here.
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.2] — Code hygiene patch
+
+No behavioural changes — pure cleanup pass after the 0.6.0/0.6.1
+AArch64 work settled. Removes dead skeleton code, prunes
+commented-out experiments, and corrects stale "lands in 0.6.X"
+forward-pointer comments now that those releases have shipped.
+
+### Removed
+
+- ~30 lines of commented-out relocation-parsing skeleton in
+  `label_providers::elf_symbol_provider::update`. The real
+  implementation lives in `elf::extract_elf_dynamic_apis` and has
+  since 0.4.x; the skeleton was misleading and confused an audit
+  pass. Replaced with a comment explaining the actual separation
+  of concerns.
+- Commented-out `parse_exports` stub in the same file.
+- Stale "0.5.0: positional bool args → SmdaConfig builder"
+  version-anchor in `examples/smdadump.rs` (now-historical).
+
+### Corrected
+
+- 10 "lands in 0.6.0/0.6.1" / "deferred to 0.6.1" forward-pointer
+  comments across `lib.rs`, `function.rs`, `disassembler/mod.rs`,
+  `jump_table_analyser.rs`, `indirect_call_analyser.rs` rewritten
+  to reflect the shipped state (or to point at the actual sibling
+  AArch64 implementation where one exists).
+- `analyse_function_aarch64` doc comment rewritten — previously
+  said "MVP doesn't model PAC indirect calls, jump tables, exit
+  syscalls, stack-string detection… deferred to 0.6.1", which has
+  long since happened. New version documents the actual per-mnemonic
+  control-flow taxonomy as it stands.
+- `extract_exit_reg_imm` doc comment rewritten — previously said
+  "any non-mov-to-eax-family instruction clears the tracker" but
+  0.6.1 changed it to preserve across non-clobbering instructions.
+- `Instruction::op_kind` doc comment now points readers at
+  `disassembler::aarch64_ops` for AArch64 operand walking instead
+  of misleadingly claiming it'd be added to this method "in 0.6.1".
+
+### Dead-code sweep
+
+Removed the crate-wide `#![allow(dead_code)]` from `lib.rs` and
+triaged every surfaced warning. 12 findings; 7 fields and 4 helpers
+deleted (truly dead), 4 structs annotated with explanatory
+`#[allow(dead_code)]` (fields populated for `Debug` output and
+downstream tooling, but no in-crate reader).
+
+Deleted:
+- `error::try_usize` / `safe_add` / `safe_sub` — unused arithmetic
+  helpers; live code uses `checked_add`/`checked_mul` directly.
+- `Disassembler::is_plt_got_address` — never called.
+- `DisassemblyResult::analysis_timeout` (`bool`) — superseded by
+  `Disassembler::analysis_timeout` (`Option<Duration>`).
+- `DisassemblyResult::language` — `HashMap` never populated.
+- `DisassemblyResult::code_areas` — duplicate of
+  `binary_info.code_areas`.
+- `FunctionAnalysisState::blocks` — Python-port leftover, never
+  written nor read.
+- `FunctionCandidate::rel_start_addr` — set in `new`, never read.
+- `FunctionCandidate::function_start_score` — same.
+- `TailCall::source_addr` — set in struct literal, never read.
+
+Annotated (kept for `Debug` print / downstream tooling
+inspection):
+- `DisassemblyReport` — `binary_size`, `binweight`, `code_areas`,
+  `empty_section`, `component`, `confidence_threshold`, `family`,
+  `filename`, `identified_alignment`, `is_library`, `is_buffer`,
+  `message`, `sha256`, `statistics`.
+- `DisassemblyStatistics` — all 8 fields.
+- `Function` — `characteristics`, `confidence`, `tfidf`.
+- `GoSymbols` — `version`, `pclntab_offset`.
+
+### Removed — skeleton modules
+
+- **`label_providers::elf_api_resolver`** (file deleted) — used
+  hardcoded `0x401700` start address + `0x10` stride to populate
+  its `api_map`, ignoring `reloc.r_offset`. Effectively returned
+  garbage on lookup and shadowed the real ELF API resolution that
+  `elf::extract_elf_dynamic_apis` does (correctly, via
+  `r_offset + base_addr`). The internal `api_map` was even keyed
+  by `"lief"` — surviving naming from the Python port. Removed
+  the `LabelProvider::ElfApi` variant + its arms.
+- **`label_providers::pdb_symbol_provider`** (file deleted) — stub
+  that did one thing on `update()`: insert
+  `entry_point → "original_entry_point"`. No actual PDB parsing
+  (the real PDB metadata work lives in `xmetadata::parse_pe` since
+  0.5.0). The OEP candidate seeding it provided is redundant with
+  the entry-point seeder in `analyse_buffer`. Removed the
+  `LabelProvider::PdbSymbol` variant + its arms.
+
+Net `LabelProvider` enum: 4 variants → 2 (`WinApi`, `ElfSymbol`).
+No public API impact — `LabelProvider` is not re-exported from
+the crate root.
+
 ## [0.6.1] — AArch64 analyser
 
 Closes the seven x86-only analysers that 0.6.0 gated off when

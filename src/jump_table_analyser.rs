@@ -39,9 +39,11 @@ static X86_BONUS_OFFSET: LazyLock<Regex> =
 /// Format the operands string for a DecodedInsn using the capstone-compatible
 /// formatter — used here so the legacy regex-based heuristics keep matching.
 fn op_str_of(ins: &DecodedInsn) -> String {
-    // x86 only — the jump-table analyser is regex-driven; on AArch64
-    // we return empty so the regex pipeline short-circuits. Full
-    // AArch64 jump-table analysis lands in 0.6.1.
+    // x86 only — the regex pipeline below depends on the
+    // capstone-compatible string layout. AArch64 jump-table resolution
+    // lives in `JumpTableAnalyser::get_jump_targets_aarch64`, which
+    // works on the structurally typed disarm64 opcode stream instead
+    // and doesn't go through this helper.
     let Some(iced) = ins.as_iced() else {
         return String::new();
     };
@@ -102,7 +104,8 @@ impl JumpTableAnalyser {
         disassembler: &Disassembler,
         state: &mut FunctionAnalysisState,
     ) -> Result<Vec<u64>> {
-        // x86-only heuristic — no-op on AArch64 in 0.6.0.
+        // x86-only entry point. Callers on the AArch64 path use the
+        // sibling `get_jump_targets_aarch64` method instead.
         if jump_instruction.as_iced().is_none() {
             return Ok(vec![]);
         }

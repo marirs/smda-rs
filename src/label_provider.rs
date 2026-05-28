@@ -1,18 +1,13 @@
 use crate::{
     BinaryInfo, Result,
     error::Error,
-    label_providers::{
-        elf_api_resolver::ElfApiResolver, elf_symbol_provider::ElfSymbolProvider,
-        pdb_symbol_provider::PdbSymbolProvider, win_api_resolver::WinApiResolver,
-    },
+    label_providers::{elf_symbol_provider::ElfSymbolProvider, win_api_resolver::WinApiResolver},
 };
 
 #[derive(Debug)]
 pub enum LabelProvider {
     WinApi(WinApiResolver),
-    ElfApi(ElfApiResolver),
     ElfSymbol(ElfSymbolProvider),
-    PdbSymbol(PdbSymbolProvider),
 }
 
 impl LabelProvider {
@@ -23,7 +18,6 @@ impl LabelProvider {
     ) -> Result<(Option<String>, Option<String>)> {
         match self {
             LabelProvider::WinApi(w) => w.get_api(to_addr, absolute_addr),
-            LabelProvider::ElfApi(w) => w.get_api(to_addr, absolute_addr),
             _ => Err(Error::InvalidRule(line!(), file!().to_string())),
         }
     }
@@ -31,14 +25,12 @@ impl LabelProvider {
     pub fn is_api_provider(&self) -> Result<bool> {
         match self {
             LabelProvider::WinApi(_) => Ok(true),
-            LabelProvider::ElfApi(_) => Ok(true),
             _ => Ok(false),
         }
     }
 
     pub fn is_symbol_provider(&self) -> Result<bool> {
         match self {
-            LabelProvider::PdbSymbol(_) => Ok(true),
             LabelProvider::ElfSymbol(_) => Ok(true),
             _ => Ok(false),
         }
@@ -46,7 +38,6 @@ impl LabelProvider {
 
     pub fn get_functions_symbols(&self) -> Result<&std::collections::HashMap<u64, String>> {
         match self {
-            LabelProvider::PdbSymbol(s) => s.get_functions_symbols(),
             LabelProvider::ElfSymbol(s) => s.get_functions_symbols(),
             _ => Err(Error::InvalidRule(line!(), file!().to_string())),
         }
@@ -60,8 +51,6 @@ impl LabelProvider {
         match self {
             LabelProvider::WinApi(w) => w.update(bin),
             LabelProvider::ElfSymbol(w) => w.update(bin),
-            LabelProvider::ElfApi(w) => w.update(bin),
-            LabelProvider::PdbSymbol(w) => w.update(bin),
         }
     }
 }

@@ -1,7 +1,7 @@
 [package]
 name = "smda"
 description = "Recursive x86/x64/AArch64 disassembler library for control-flow recovery from memory dumps. Iced-x86 + disarm64-backed; zero-copy."
-version = "0.6.1"
+version = "0.6.2"
 authors = ["Marirs <marirs@gmail.com>", "Andrey Mnatsakanov <andrey@3ig.kiev.ua>", "Jorge Alejandro Durán Royo<jorge.duran.royo@gmail.com>"]
 keywords = ["smda", "disassembler", "cfg", "iced", "aarch64"]
 categories = ["parsing", "development-tools::debugging"]

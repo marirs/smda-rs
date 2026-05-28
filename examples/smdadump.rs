@@ -29,7 +29,6 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    // 0.5.0: positional bool args → SmdaConfig builder.
     let cfg = smda::SmdaConfig::new().path(&path);
     let report = match smda::Disassembler::parse(&buf, &cfg) {
         Ok(r) => r,

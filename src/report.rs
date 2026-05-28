@@ -14,6 +14,11 @@ use std::collections::HashMap;
 /// breaking. Construct via `DisassemblyReport::new`; downstream crates
 /// should treat it as opaque-for-construction and read fields
 /// individually.
+// Some private fields are populated by `new()` purely for the
+// `Debug` print output (the report doubles as a CLI status dump).
+// They're not read by any method but kept so the Debug surface
+// stays informative for downstream consumers.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct DisassemblyReport<'a> {
