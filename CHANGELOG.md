@@ -3,6 +3,44 @@
 All notable changes to **smda** are documented here.
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.4] — Mach-O imports reach `disassembly.apis`
+
+### Added
+
+- **`macho::extract_macho_dynamic_apis`** — Mach-O peer of
+  `elf::extract_elf_dynamic_apis`. Walks `MachO::imports()`,
+  resolves each bound-pointer slot's file offset to a VA via the
+  existing `section_maps`, and returns a `HashMap<VA, (dylib,
+  symbol)>`. Handles fat binaries by deriving the slice offset
+  via `extract_macho_with_offset` and adding it before the
+  section-map lookup (thin binaries: slice_offset = 0, no-op).
+
+### Fixed
+
+- **Mach-O imports now flow into `DisassemblyResult::apis` +
+  `addr_to_api`.** Pre-0.6.4 `analyse_buffer` had an explicit
+  ELF→apis bridge (lib.rs:1479-1496) and the PE path was handled
+  by the WinApiResolver label provider, but Mach-O had neither.
+  Imports stopped at `binary_info.imports` (file-scope only) and
+  the per-function `apirefs` map was empty for every Mach-O
+  function. Concrete downstream impact: capa-rs's
+  `extract_insn_api_features` emitted zero `Feature::Api` for
+  Mach-O binaries, so almost no capa rule (which heavily lean on
+  `api:` clauses) matched — `/bin/ls` on Apple Silicon returned a
+  completely empty capability table. Now `analyse_buffer` has a
+  symmetric Mach-O block that calls
+  `extract_macho_dynamic_apis` and populates both `apis` and
+  `addr_to_api` directly.
+
+  Coverage: the registered VAs are the `__DATA,__got` /
+  `__DATA,__la_symbol_ptr` slot addresses. These are reached
+  by the canonical ARM64 PIC call patterns
+  (`adrp+ldr+blr` inlined, or the 3-instruction
+  `__TEXT,__stubs` thunks that themselves dereference the
+  slot). Direct stub-VA enumeration via
+  `LC_DYSYMTAB.indirectsymoff` is a follow-up — most
+  consumers chase the slot through their own apirefs walker.
+
 ## [0.6.3] — Tail-call resolver no longer aborts on benign collisions
 
 ### Fixed

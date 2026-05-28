@@ -1495,6 +1495,44 @@ impl<'a> Disassembler<'a> {
             }
         }
 
+        // 0.6.4: Mach-O peer of the ELF block above. Pre-0.6.4 Mach-O
+        // imports stopped at `binary_info.imports` (file-scope) and
+        // never reached `disassembly.apis` / `addr_to_api`, so
+        // downstream `Function::apirefs` was empty for every Mach-O
+        // function. Capa-rs's `extract_insn_api_features` therefore
+        // emitted zero `Feature::Api` for Mach-O binaries — and since
+        // most capa rules carry an `api:` clause, that meant /bin/ls
+        // (and every other macOS binary) matched zero rules. Symmetry
+        // with the ELF path restores import-based feature extraction.
+        if self.disassembly.binary_info.file_format == FileFormat::MachO {
+            let macho_apis = macho::extract_macho_dynamic_apis(
+                self.disassembly.binary_info.raw_data,
+                &self.disassembly.binary_info.section_maps,
+                // HostNative matches what `map_binary` used to choose
+                // the slice for this analysis pass; using anything else
+                // here would parse a different slice's imports than
+                // the one we actually disassembled.
+                MachoArchPreference::HostNative,
+            );
+            for (addr, (dll, api)) in macho_apis {
+                let api_entry = label_providers::ApiEntry {
+                    referencing_addr: HashSet::new(),
+                    dll_name: dll.clone(),
+                    api_name: api.clone(),
+                };
+                self.disassembly.apis.insert(addr, api_entry);
+                // Direct addr_to_api population (mirrors the ELF
+                // init_api_refs second-pass below). The first-loop in
+                // init_api_refs walks `referencing_addr` which is
+                // empty for these fresh entries — we have to populate
+                // addr_to_api explicitly or the API name never
+                // surfaces at the call site lookup.
+                if api.is_some() {
+                    self.disassembly.addr_to_api.insert(addr, (dll, api));
+                }
+            }
+        }
+
         if ![32u32, 64u32].contains(&self.disassembly.binary_info.bitness) {
             self.disassembly.binary_info.bitness = self.determine_bitness()?;
         }

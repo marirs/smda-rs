@@ -340,6 +340,98 @@ pub fn get_sections(mach: &MachO) -> Vec<(String, u64, usize)> {
     out
 }
 
+/// 0.6.4 — Mach-O API resolver, the missing peer of
+/// `elf::extract_elf_dynamic_apis`. Builds a `HashMap<VA, (dylib,
+/// name)>` that the analyser plumbs into
+/// `DisassemblyResult::addr_to_api`, so capa-rs (and any other
+/// consumer that asks "what API lives at this address?") can
+/// resolve Mach-O imports the same way it does ELF dynamic
+/// imports.
+///
+/// What address are we registering?
+/// goblin's `Import.offset` is the **file offset** of the bound
+/// pointer slot — the `__DATA,__got` or `__DATA,__la_symbol_ptr`
+/// (or `__DATA_CONST,__got` on modern macOS) entry that dyld
+/// fills in at load time. We translate that file offset to a
+/// virtual address via the binary's already-built `section_maps`,
+/// so the key in the returned map is the slot's VA.
+///
+/// Why the slot VA (and not the stub VA in `__TEXT,__stubs`)?
+/// On ARM64 PIC-compiled code — which is everything on Apple
+/// Silicon — direct `bl _printf` lowers to either:
+///   * `bl _printf_stub` where the stub is 3 instructions
+///     (`adrp x16, slot@PAGE; ldr x16, [x16, slot@PAGEOFF]; br x16`),
+///     so the BL target is the stub VA. The stub immediately
+///     dereferences the slot we register here — capa's
+///     instruction-walker can follow that one hop.
+///   * `adrp xN, slot@GOTPAGE; ldr xN, [xN, slot@GOTPAGEOFF];
+///     blr xN` inlined at the call site, where the BLR target
+///     register holds the slot value loaded by the LDR. Again
+///     dereferences the slot we registered.
+///
+/// Registering the slot VA is the single most useful key for
+/// modern macOS analysis; stub-VA enumeration via
+/// `LC_DYSYMTAB.indirectsymoff` is a follow-up
+/// (most analysers already chase the slot through the
+/// `apirefs` walker).
+///
+/// Fat binaries: import offsets goblin returns are SLICE-RELATIVE
+/// (inside the chosen ARM64 / x86_64 slice). The
+/// `section_maps[i].file_offset` field is WHOLE-FILE-RELATIVE
+/// (slice_offset already folded in by `map_binary`). We re-derive
+/// the slice offset via `extract_macho_with_offset` and add it to
+/// `import.offset` before looking up the section map. Thin
+/// Mach-O has `slice_offset = 0` so this is a no-op for the
+/// common case.
+///
+/// Returns an empty map on any failure (no panics) — the analyser
+/// continues without API resolution, which is the same
+/// graceful-degradation pattern as the ELF path.
+#[must_use]
+pub fn extract_macho_dynamic_apis(
+    binary: &[u8],
+    section_maps: &[SectionMap],
+    prefer: crate::MachoArchPreference,
+) -> std::collections::HashMap<u64, (Option<String>, Option<String>)> {
+    let mut api_map = std::collections::HashMap::new();
+    let Ok((mach, slice_offset)) = extract_macho_with_offset(binary, prefer) else {
+        return api_map;
+    };
+    let Ok(imports) = mach.imports() else {
+        return api_map;
+    };
+    let Ok(slice_off_usz) = usize::try_from(slice_offset) else {
+        return api_map;
+    };
+    for imp in &imports {
+        let Ok(slice_rel_off) = usize::try_from(imp.offset) else {
+            continue;
+        };
+        let Some(abs_file_off) = slice_rel_off.checked_add(slice_off_usz) else {
+            continue;
+        };
+        // Linear scan of section_maps to find the segment that
+        // contains the bound-pointer slot. Mach-O typically has <10
+        // segments — not worth a sorted-binary-search.
+        for sm in section_maps {
+            let seg_end = match sm.file_offset.checked_add(sm.file_size) {
+                Some(e) => e,
+                None => continue,
+            };
+            if abs_file_off >= sm.file_offset && abs_file_off < seg_end {
+                let intra_seg_off = (abs_file_off - sm.file_offset) as u64;
+                let va = sm.va_start.saturating_add(intra_seg_off);
+                api_map.insert(
+                    va,
+                    (Some(imp.dylib.to_string()), Some(imp.name.to_string())),
+                );
+                break;
+            }
+        }
+    }
+    api_map
+}
+
 /// Best-effort import list — `(dylib_name, symbol_name, _0)`. Pulled
 /// from `MachO::imports()` which walks the bind / lazy-bind opcode
 /// streams. Returns an empty Vec on parse failure.
