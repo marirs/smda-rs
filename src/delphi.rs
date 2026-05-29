@@ -230,6 +230,10 @@ mod tests {
             sections: vec![("test".to_string(), base, bytes.len())],
             imports: vec![],
             exports: vec![],
+            // (0.6.5) Mach-O slice preference plumbed through
+            // BinaryInfo; defaults are harmless for non-Mach-O
+            // formats like this PE test fixture.
+            macho_arch_preference: crate::MachoArchPreference::HostNative,
         };
 
         let result = parse(&bi);
@@ -293,6 +297,10 @@ mod tests {
             sections: vec![("test".to_string(), base, bytes.len())],
             imports: vec![],
             exports: vec![],
+            // (0.6.5) Mach-O slice preference plumbed through
+            // BinaryInfo; defaults are harmless for non-Mach-O
+            // formats like this PE test fixture.
+            macho_arch_preference: crate::MachoArchPreference::HostNative,
         };
 
         let result = parse(&bi);

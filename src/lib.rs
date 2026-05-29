@@ -298,6 +298,17 @@ pub struct BinaryInfo<'a> {
     pub sections: Vec<(String, u64, usize)>,
     pub imports: Vec<(String, String, usize)>,
     pub exports: Vec<(String, usize, Option<String>)>,
+    /// (0.6.5) The slice preference used at parse time for fat
+    /// Mach-O binaries. Stored so post-parse passes that need to
+    /// re-parse goblin's Mach-O view (e.g. the import-bridge in
+    /// `analyse_buffer`, which calls `extract_macho_dynamic_apis`)
+    /// pick the SAME slice as the one we actually disassembled.
+    /// Pre-0.6.5 this was hard-coded to `HostNative` downstream
+    /// and silently mismatched whenever the caller overrode the
+    /// preference (e.g. analysing an ARM64 slice on an Intel host
+    /// with `Aarch64First`). Defaults to `HostNative` for thin
+    /// Mach-O / non-Mach-O formats (the field is harmless there).
+    pub macho_arch_preference: MachoArchPreference,
 }
 
 impl<'a> BinaryInfo<'a> {
@@ -324,6 +335,7 @@ impl<'a> BinaryInfo<'a> {
             sections: vec![],
             imports: vec![],
             exports: vec![],
+            macho_arch_preference: MachoArchPreference::HostNative,
         }
     }
 
@@ -351,6 +363,7 @@ impl<'a> BinaryInfo<'a> {
             sections: vec![],
             imports: vec![],
             exports: vec![],
+            macho_arch_preference: MachoArchPreference::HostNative,
         })
     }
 
@@ -1334,6 +1347,12 @@ impl<'a> Disassembler<'a> {
                 binary_info.exports = macho::get_exports(&mach);
                 binary_info.section_maps =
                     macho::map_binary(raw, binary_info.base_addr, macho_arch_preference)?;
+                // (0.6.5) Stash the slice preference for post-parse
+                // re-walks (e.g. extract_macho_dynamic_apis inside
+                // analyse_buffer). Without this the import bridge
+                // would re-pick using HostNative and parse a
+                // different slice than the one we just disassembled.
+                binary_info.macho_arch_preference = macho_arch_preference;
             }
             _ => return Err(Error::UnsupportedFormatError),
         }
@@ -1508,11 +1527,12 @@ impl<'a> Disassembler<'a> {
             let macho_apis = macho::extract_macho_dynamic_apis(
                 self.disassembly.binary_info.raw_data,
                 &self.disassembly.binary_info.section_maps,
-                // HostNative matches what `map_binary` used to choose
-                // the slice for this analysis pass; using anything else
-                // here would parse a different slice's imports than
-                // the one we actually disassembled.
-                MachoArchPreference::HostNative,
+                // (0.6.5) Use the SAME slice preference that
+                // map_binary used, stashed in binary_info at parse
+                // time. Pre-0.6.5 this was hardcoded HostNative and
+                // silently parsed a different slice's imports when
+                // the caller overrode the preference.
+                self.disassembly.binary_info.macho_arch_preference,
             );
             for (addr, (dll, api)) in macho_apis {
                 let api_entry = label_providers::ApiEntry {

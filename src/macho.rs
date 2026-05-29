@@ -429,6 +429,258 @@ pub fn extract_macho_dynamic_apis(
             }
         }
     }
+
+    // (0.6.5) Second pass — walk `__TEXT,__stubs` (and the
+    // symbol-pointer sections) via `LC_DYSYMTAB.indirectsymoff` to
+    // register STUB VAs. Pre-0.6.5 we only registered __DATA bound-
+    // pointer slot VAs (covers ADRP+LDR+BLR patterns where the call
+    // target is the loaded register value); direct `bl _stub` calls
+    // — overwhelmingly the most common call form on ARM64 PIC code
+    // — were unresolved because the BL target is the stub address
+    // inside __TEXT,__stubs, not the slot.
+    //
+    // Algorithm (Apple `<mach-o/loader.h>` §indirect symbol table):
+    //   1. Find LC_DYSYMTAB → `(indirectsymoff, nindirectsyms)`.
+    //   2. Read `nindirectsyms` u32-LE entries from raw bytes at
+    //      `slice_offset + indirectsymoff`. Each entry is either a
+    //      symbol-table index OR the sentinel `INDIRECT_SYMBOL_LOCAL`
+    //      (`0x8000_0000`) / `INDIRECT_SYMBOL_ABS` (`0x4000_0000`).
+    //   3. Collect `mach.symbols()` into a Vec<String> so we can
+    //      look up symbol names by index.
+    //   4. For every section whose `flags & 0xff` is a stub /
+    //      symbol-pointer type, derive entry size & count, then for
+    //      each entry: `stub_va = section.addr + i * entry_size`,
+    //      `sym_idx = indirect_syms[section.reserved1 + i]`, look
+    //      up symbol name, register `(stub_va, name)`.
+    //
+    // Section types we cover (low byte of section.flags):
+    //   - S_SYMBOL_STUBS              (0x08) — __TEXT,__stubs /
+    //                                   __auth_stubs. Entry size in
+    //                                   section.reserved2.
+    //   - S_NON_LAZY_SYMBOL_POINTERS  (0x06) — __DATA,__got /
+    //                                   __DATA_CONST,__got. Entry =
+    //                                   pointer width (4 / 8).
+    //   - S_LAZY_SYMBOL_POINTERS      (0x07) — __DATA,__la_symbol_ptr.
+    //                                   Entry = pointer width.
+    //   - S_LAZY_DYLIB_SYMBOL_POINTERS(0x10) — __DATA,__ld_symbol_ptr
+    //                                   (older). Entry = pointer width.
+    //
+    // Bound-pointer entries we already added in the first pass are
+    // re-keyed at the same VA here (cheap HashMap re-insert with
+    // identical value, no behaviour change).
+    {
+        use goblin::mach::load_command::CommandVariant;
+        // S_* section type constants — Apple `<mach-o/loader.h>`.
+        const S_NON_LAZY_SYMBOL_POINTERS: u32 = 0x06;
+        const S_LAZY_SYMBOL_POINTERS: u32 = 0x07;
+        const S_SYMBOL_STUBS: u32 = 0x08;
+        const S_LAZY_DYLIB_SYMBOL_POINTERS: u32 = 0x10;
+        const SECTION_TYPE_MASK: u32 = 0xff;
+        // Indirect-symbol-table sentinel bits.
+        const INDIRECT_SYMBOL_LOCAL: u32 = 0x8000_0000;
+        const INDIRECT_SYMBOL_ABS: u32 = 0x4000_0000;
+        const INDIRECT_SYMBOL_SENTINEL_MASK: u32 = INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS;
+
+        // 1. Locate LC_DYSYMTAB.
+        let dysymtab = mach.load_commands.iter().find_map(|lc| match &lc.command {
+            CommandVariant::Dysymtab(ds) => Some(ds),
+            _ => None,
+        });
+        let Some(dysymtab) = dysymtab else {
+            return api_map;
+        };
+        if dysymtab.nindirectsyms == 0 {
+            return api_map;
+        }
+
+        // 2. Read the indirect symbol table. Each entry is a u32-LE.
+        // The on-disk offset is slice-relative; fold in slice_offset
+        // to index into the whole-buffer `binary` slice.
+        let Ok(indirectsymoff_usz) = usize::try_from(dysymtab.indirectsymoff) else {
+            return api_map;
+        };
+        let Some(table_start) = indirectsymoff_usz.checked_add(slice_off_usz) else {
+            return api_map;
+        };
+        let Ok(n_indirect_usz) = usize::try_from(dysymtab.nindirectsyms) else {
+            return api_map;
+        };
+        let Some(table_bytes_len) = n_indirect_usz.checked_mul(4) else {
+            return api_map;
+        };
+        let Some(table_end) = table_start.checked_add(table_bytes_len) else {
+            return api_map;
+        };
+        if table_end > binary.len() {
+            return api_map;
+        }
+        let table_slice = &binary[table_start..table_end];
+        let mut indirect_syms: Vec<u32> = Vec::with_capacity(n_indirect_usz);
+        for chunk in table_slice.chunks_exact(4) {
+            indirect_syms.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+
+        // 3. Collect symbol names indexed by position. goblin's
+        // `MachO::symbols()` yields `Result<(Cow<str>, Nlist)>`; we
+        // keep the name string (or empty on error so positional
+        // indexing stays aligned with the on-disk symbol table).
+        let symbol_names: Vec<String> = mach
+            .symbols()
+            .map(|res| match res {
+                Ok((name, _nlist)) => name.to_string(),
+                Err(_) => String::new(),
+            })
+            .collect();
+
+        // 4. Per-bitness pointer width for symbol-pointer sections
+        // (stub sections use `reserved2` directly so this is only
+        // for S_*_SYMBOL_POINTERS).
+        const CPU_ARCH_ABI64: u32 = 0x0100_0000;
+        let is_64 = mach.header.cputype() & CPU_ARCH_ABI64 != 0;
+        let ptr_size: u64 = if is_64 { 8 } else { 4 };
+
+        // 5. Walk segment load commands and parse each section
+        // header manually — goblin's generalised `Section` type
+        // drops the `reserved1` / `reserved2` fields we need
+        // (those live only on the format-specific `Section32` /
+        // `Section64` types behind the generic API). We re-derive
+        // the section-header file position from
+        // `slice_off_usz + lc.offset + sizeof(SegmentCommand{32,64})`
+        // and read the fields directly.
+        //
+        // Endianness: Apple has shipped exclusively little-endian
+        // (x86, x86_64, arm64) since the PowerPC retirement. We
+        // parse LE unconditionally. A big-endian PowerPC Mach-O
+        // would silently fail this pass — analysis continues, just
+        // without stub-VA resolution.
+        use goblin::mach::load_command::CommandVariant as CV;
+        // SegmentCommand{32,64} sizes (Apple <mach-o/loader.h>).
+        const SIZEOF_SEGMENT_COMMAND_32: usize = 56;
+        const SIZEOF_SEGMENT_COMMAND_64: usize = 72;
+        // Section{32,64} sizes (right after the segment command,
+        // contiguous in raw bytes).
+        const SIZEOF_SECTION_32: usize = 68;
+        const SIZEOF_SECTION_64: usize = 80;
+
+        for lc in &mach.load_commands {
+            let (nsects, lc_size, sect_size) = match &lc.command {
+                CV::Segment32(seg) => (
+                    seg.nsects as usize,
+                    SIZEOF_SEGMENT_COMMAND_32,
+                    SIZEOF_SECTION_32,
+                ),
+                CV::Segment64(seg) => (
+                    seg.nsects as usize,
+                    SIZEOF_SEGMENT_COMMAND_64,
+                    SIZEOF_SECTION_64,
+                ),
+                _ => continue,
+            };
+            let Some(seg_abs_off) = slice_off_usz.checked_add(lc.offset) else {
+                continue;
+            };
+            let Some(first_sect_off) = seg_abs_off.checked_add(lc_size) else {
+                continue;
+            };
+
+            for i_sect in 0..nsects {
+                let Some(sh_off) = first_sect_off.checked_add(i_sect.saturating_mul(sect_size))
+                else {
+                    break;
+                };
+                let Some(sh_end) = sh_off.checked_add(sect_size) else {
+                    break;
+                };
+                if sh_end > binary.len() {
+                    break;
+                }
+                let sh = &binary[sh_off..sh_end];
+
+                // Field offsets within Section{32,64}:
+                //   Section64 (80 bytes): sectname[16] segname[16]
+                //     addr u64 @32, size u64 @40, offset u32 @48,
+                //     align u32 @52, reloff u32 @56, nreloc u32 @60,
+                //     flags u32 @64, reserved1 u32 @68,
+                //     reserved2 u32 @72, reserved3 u32 @76.
+                //   Section32 (68 bytes): sectname[16] segname[16]
+                //     addr u32 @32, size u32 @36, offset u32 @40,
+                //     align u32 @44, reloff u32 @48, nreloc u32 @52,
+                //     flags u32 @56, reserved1 u32 @60,
+                //     reserved2 u32 @64.
+                let (addr, size, flags, reserved1, reserved2);
+                if sect_size == SIZEOF_SECTION_64 {
+                    addr = u64::from_le_bytes([
+                        sh[32], sh[33], sh[34], sh[35], sh[36], sh[37], sh[38], sh[39],
+                    ]);
+                    size = u64::from_le_bytes([
+                        sh[40], sh[41], sh[42], sh[43], sh[44], sh[45], sh[46], sh[47],
+                    ]);
+                    flags = u32::from_le_bytes([sh[64], sh[65], sh[66], sh[67]]);
+                    reserved1 = u32::from_le_bytes([sh[68], sh[69], sh[70], sh[71]]);
+                    reserved2 = u32::from_le_bytes([sh[72], sh[73], sh[74], sh[75]]);
+                } else {
+                    addr = u32::from_le_bytes([sh[32], sh[33], sh[34], sh[35]]) as u64;
+                    size = u32::from_le_bytes([sh[36], sh[37], sh[38], sh[39]]) as u64;
+                    flags = u32::from_le_bytes([sh[56], sh[57], sh[58], sh[59]]);
+                    reserved1 = u32::from_le_bytes([sh[60], sh[61], sh[62], sh[63]]);
+                    reserved2 = u32::from_le_bytes([sh[64], sh[65], sh[66], sh[67]]);
+                }
+
+                let stype = flags & SECTION_TYPE_MASK;
+                let entry_size: u64 = match stype {
+                    S_SYMBOL_STUBS => reserved2 as u64,
+                    S_NON_LAZY_SYMBOL_POINTERS
+                    | S_LAZY_SYMBOL_POINTERS
+                    | S_LAZY_DYLIB_SYMBOL_POINTERS => ptr_size,
+                    _ => continue,
+                };
+                if entry_size == 0 {
+                    // Defensive — `reserved2` of zero on a stub
+                    // section would loop forever. Apple stubs are
+                    // always 6, 10, 12, or 16 bytes; never 0.
+                    continue;
+                }
+                let n_entries = size / entry_size;
+                let reserved1_usz = reserved1 as usize;
+                for i in 0..n_entries {
+                    let Some(idx_in_table) = reserved1_usz.checked_add(i as usize) else {
+                        break;
+                    };
+                    let Some(&raw_sym) = indirect_syms.get(idx_in_table) else {
+                        break;
+                    };
+                    // Skip sentinels — these slots have no symbol
+                    // name (LOCAL = static function pointer, ABS =
+                    // resolved at link time to an absolute value).
+                    if raw_sym & INDIRECT_SYMBOL_SENTINEL_MASK != 0 {
+                        continue;
+                    }
+                    let sym_idx = raw_sym as usize;
+                    let Some(name) = symbol_names.get(sym_idx) else {
+                        continue;
+                    };
+                    if name.is_empty() {
+                        continue;
+                    }
+                    let stub_va = addr.saturating_add(i.saturating_mul(entry_size));
+                    // Mach-O symbol names are Apple-mangled with a
+                    // leading underscore (`_printf`). Strip it for
+                    // consistency with the ELF / PE paths and with
+                    // capa rule conventions (rules say `printf`,
+                    // not `_printf`).
+                    let clean = name.strip_prefix('_').unwrap_or(name).to_string();
+                    // Dylib name isn't on the indirect-symbol path
+                    // (that data lives in the bind opcode stream the
+                    // first pass already walked). Preserve any
+                    // existing dylib name registered for this VA in
+                    // the first pass.
+                    let dylib = api_map.get(&stub_va).and_then(|(d, _)| d.clone());
+                    api_map.insert(stub_va, (dylib, Some(clean)));
+                }
+            }
+        }
+    }
+
     api_map
 }
 

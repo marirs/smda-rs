@@ -3,6 +3,59 @@
 All notable changes to **smda** are documented here.
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.5] — Mach-O closeout: stub VAs + slice-pref plumbed
+
+This release closes the two deferred items from 0.6.4 that the
+0.6.4 CHANGELOG noted as follow-ups. Mach-O analysis is now
+fully wired end-to-end — every call form (direct `bl _stub`,
+`adrp+ldr+blr` indirect, `adrp+ldr+br` tail) resolves to its
+API name, and the slice preference set at parse time is
+honoured by every post-parse re-walk.
+
+### Added
+
+- **`BinaryInfo::macho_arch_preference`** — new (additive,
+  `#[non_exhaustive]` field). Stores the
+  `MachoArchPreference` used by `map_binary` at parse time so
+  post-parse passes that need to re-parse goblin's Mach-O view
+  (e.g. `extract_macho_dynamic_apis` inside `analyse_buffer`)
+  pick the SAME slice as the one we actually disassembled.
+  Pre-0.6.5 the import bridge hardcoded `HostNative`; on an
+  Intel host analysing an explicitly-overridden ARM64 slice
+  (or vice versa) the imports would be extracted from a
+  different slice than the disassembled code, producing
+  silently-wrong API resolution. Defaults to `HostNative` for
+  non-Mach-O / thin Mach-O — harmless there.
+
+- **`__TEXT,__stubs` walker in `extract_macho_dynamic_apis`.**
+  Second pass after the bind-opcode loop. Walks
+  `LC_DYSYMTAB.indirectsymoff` and per-section
+  `reserved1` / `reserved2` to register stub VAs against their
+  symbol names. Covers all four indirect-symbol section types:
+  - `S_SYMBOL_STUBS` (0x08) — `__TEXT,__stubs` and
+    `__TEXT,__auth_stubs` — entry size from `reserved2`.
+  - `S_NON_LAZY_SYMBOL_POINTERS` (0x06) — `__DATA*,__got`.
+  - `S_LAZY_SYMBOL_POINTERS` (0x07) — `__DATA,__la_symbol_ptr`.
+  - `S_LAZY_DYLIB_SYMBOL_POINTERS` (0x10) — legacy form.
+
+  Entry size for pointer sections is pointer-width
+  (4 / 8 bytes from `mach.header.cputype() & CPU_ARCH_ABI64`).
+  Sentinel entries (`INDIRECT_SYMBOL_LOCAL` / `_ABS`) are
+  skipped. Symbol names have their Mach-O underscore prefix
+  stripped (`_printf` → `printf`) to match capa rule
+  convention. Pre-0.6.5 only `__DATA,__got` slot VAs were
+  registered (catches `adrp+ldr+blr` register-indirect
+  patterns); direct `bl _stub` calls — the most common ARM64
+  PIC call form — were unresolved.
+
+### Fixed
+
+- **`analyse_buffer`'s Mach-O import bridge no longer
+  hardcodes `MachoArchPreference::HostNative`.** Uses the
+  preference stored in `BinaryInfo::macho_arch_preference`
+  (set by `parse_inner` at parse time). See "Added" above for
+  the failure mode this closes.
+
 ## [0.6.4] — Mach-O imports reach `disassembly.apis`
 
 ### Added
