@@ -46,7 +46,21 @@ The decoder lives behind a small `Decoder` trait with two backends:
 
 `DecodedInsn` is an enum (`X86(IcedInsn)` / `Aarch64(ArmInsn)`); the typed accessors on `function::Instruction` (`mnemonic_enum`, `op_kind`, `memory_base`, `flow_control`, `is_call`, `is_jmp`, `is_ret`, `format_mnemonic`, `format_operands`, `length`, `bytes_in`, `get_printable_len`) keep their 0.5.x signatures and dispatch internally.
 
-**ARM64 function-discovery depth in 0.6.0 is minimum-viable** — exports + entry point as candidate seeds, then the recursive call-target propagation does the rest. A typical ARM64 *executable* with no exports will surface 1 function (the entry point) and everything it calls; an ARM64 *dylib* with N exports surfaces N + transitively-reachable functions. The x86 prologue-scan analysers don't have ARM64 equivalents in this release — that, plus the deeper passes (jump-table walking, indirect-call register tracking, tail-call detection past `b`/`bl`, ARM64 PE `.pdata` packed unwind, typed AArch64 operand extraction for downstream `offset:` rules in capa-rs, AArch64 mnemonic IDF), is the 0.6.1 work. x86/x64 binaries are unaffected — same code, same output as 0.5.2.
+**ARM64 function-discovery depth (0.6.5).** What started as minimum-viable in 0.6.0 has been built out across 0.6.1–0.6.5 to feature parity with the x86 path on the analyser surfaces that matter:
+
+- **Function candidates:** entry point, PE exports, ELF dynamic symbols, ARM64 `stp x29, x30, [sp, #-N]!` prologue scan, PE `.pdata` packed-unwind sweep (RUNTIME_FUNCTION 32-bit + xdata pointer forms), Mach-O export trie.
+- **Edge resolution:** direct `b`/`bl` propagation, conditional branches (`b.cond`, `cbz`/`cbnz`, `tbz`/`tbnz`), `ret` / `br` block ends.
+- **Indirect-call register tracking:** multi-block backtrack across `adrp + ldr + blr` patterns including GOT-loaded jump-table bases.
+- **Jump-table heuristic:** A (Clang i32-delta), B (u64-absolute), C (JT8 byte-offset), D (JT16 halfword-offset).
+- **Tail-call recognition:** bare `b` to function-boundary addresses promoted via the tail-call analyser.
+- **Exit-syscall recognition:** Linux `svc #0; x8 = 93 / 94` (exit, exit_group); macOS `svc #0x80; x16 = 1 / 472` (\_exit, exit_with_payload). MOVN / MOVK syscall-number tracking included.
+- **NOP detection:** in `next_gap_candidate` — ARM64 `1f 20 03 d5` and the BTI / PAC NOP-aliases.
+- **`Function::is_api_thunk`:** 3-instruction `adrp + ldr + br` thunks identified.
+- **Stack-string detection:** AArch64 store-immediate sequences walked into `function.stringrefs`.
+
+**Mach-O API resolution (0.6.4 + 0.6.5).** Bind / lazy-bind opcode stream is walked for the `__DATA,__got` / `__DATA,__la_symbol_ptr` slot VAs (covers ADRP+LDR+BLR register-indirect patterns), and `LC_DYSYMTAB.indirectsymoff` is walked manually against the section-header table for `__TEXT,__stubs` (covers direct `bl _stub` calls, the most common ARM64 PIC call form). Both feed `disassembly.apis` and `addr_to_api` so consumers like capa-rs see API features on Mach-O input the same way they do on PE / ELF.
+
+x86 / x86_64 binaries are unaffected by all of the above — same code, same output as 0.5.x.
 
 ## Quick start
 
@@ -92,7 +106,7 @@ fn main() -> smda::Result<()> {
 }
 ```
 
-For raw memory dumps (shellcode, unpacked modules — **x86 / x64 only in 0.6.0**; ARM64 shellcode needs file-format wrapping until 0.6.1 ships an arch arg here):
+For raw memory dumps (shellcode, unpacked modules). `parse_buffer` is **x86 / x64 only** — the caller picks `bitness` (32 or 64) and the buffer is decoded with iced. ARM64 shellcode needs to be wrapped in an ELF / Mach-O / PE header so the existing file-format routing can pick the AArch64 decoder; a dedicated `parse_buffer_aarch64` is intentionally not in 0.6.x (it'd be a 1:1 wrapper around the same disarm64 decoder, and the file-format wrap is trivial enough that the duplicated surface didn't justify itself):
 
 ```rust
 use smda::{Disassembler, SmdaConfig};
@@ -156,7 +170,6 @@ fn classify(ins: &Instruction, bi: &BinaryInfo<'_>) {
 ## Requirements
 
 - Rust **1.95** or newer (2024 edition).
-- No C/C++ toolchain required — pure Rust.
 
 ## Why a Rust port?
 
