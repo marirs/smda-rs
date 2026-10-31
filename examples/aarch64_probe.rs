@@ -92,7 +92,7 @@ fn main() -> ExitCode {
     let mut form_counts = std::collections::HashMap::<&str, usize>::new();
     let mut sample = Vec::<String>::new();
 
-    for (i, chunk) in code_bytes.chunks_exact(4).enumerate().take(10000) {
+    for (i, chunk) in code_bytes.as_chunks::<4>().0.iter().enumerate().take(10000) {
         total += 1;
         let opcode = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
 

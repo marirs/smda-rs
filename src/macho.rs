@@ -516,7 +516,7 @@ pub fn extract_macho_dynamic_apis(
         }
         let table_slice = &binary[table_start..table_end];
         let mut indirect_syms: Vec<u32> = Vec::with_capacity(n_indirect_usz);
-        for chunk in table_slice.chunks_exact(4) {
+        for chunk in table_slice.as_chunks::<4>().0 {
             indirect_syms.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
         }
 
